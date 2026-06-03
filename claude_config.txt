@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "Secure-Runtime-Shield": {
+      "command": "C:\\Users\\Lenovo\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+      "args": [
+        "-u",
+        "C:\\Users\\Lenovo\\Desktop\\Runtime-shield- login\\Runtime-shield-for-agentic-systems\\bridge.py"
+      ],
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  }
+}

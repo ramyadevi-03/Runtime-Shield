@@ -1,0 +1,7 @@
+node_modules/
+.env
+venv/
+*.log
+dist/
+keycloak_data/
+telemetry.db*

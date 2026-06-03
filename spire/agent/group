@@ -1,0 +1,4 @@
+root:x:0:
+bridge:x:1001:
+llm-agent:x:1002:
+keycloak-mcp:x:1003:

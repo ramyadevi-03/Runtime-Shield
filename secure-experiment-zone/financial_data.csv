@@ -1,0 +1,4 @@
+ID,Name,Email,CreditCard,TransactionAmount,Status
+1001,John Doe,john.doe@bank-internal.com,4111-2222-3333-4444,125.50,Cleared
+1002,Jane Smith,jane.smith@corp-finance.org,5555-4444-3333-2222,10.00,Pending
+1003,Alice Brown,alice.brown@secret-corp.com,1234-5678-9012-3456,1500.00,Flagged

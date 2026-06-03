@@ -1,0 +1,47 @@
+version: "3.5.0"
+tenant_id: "autonomous-research-corp"
+
+# --- LAYER 1: IDENTITY LAYER (Keycloak Scopes) ---
+# Every tool call MUST possess the corresponding scope in the JWT token.
+# Even an Admin will be blocked if their token lacks the specific scope.
+scopes:
+  "files:list":
+    description: "Grant visibility into the protected workspace."
+    allow: ["shield_list_directory"]
+    tool_policies:
+      shield_list_directory:
+        allowed_paths: ["./secure-experiment-zone"] # Default fallback if attribute_paths missing
+
+  "files:read":
+    description: "Grant read-access to forensic logs."
+    allow: ["get_log"]
+    tool_policies:
+      get_log:
+        allowed_paths: ["bridge.log", "secure-experiment-zone/"]
+
+  "keycloak:admin":
+    description: "Full governance console access."
+    allow: ["*"] # Still subject to Layer 3 (AI Intent Audit)
+
+# --- LAYER 2: POLICY LAYER (Role-Based Access Control) ---
+roles:
+  admin:
+    description: "Security Auditor / Administrator"
+    # Admins get everything, but ONLY if they have the mandatory Scopes from Layer 1.
+    allow: ["*"]
+    deny: []
+
+  user:
+    description: "Standard Researcher"
+    # Restricted to basic operations.
+    allow: ["shield_list_directory"]
+    deny: ["get_log", "keycloak_*"] # Users can NEVER see logs or governance tools.
+    tool_policies:
+      shield_list_directory:
+        allowed_paths: ["./secure-experiment-zone"]
+
+# --- GLOBAL SECURITY OVERRIDES ---
+global_deny:
+  - "rm -rf"
+  - "sudo"
+  - ".ssh"

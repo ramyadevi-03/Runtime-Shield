@@ -1,0 +1,51 @@
+services:
+
+  keycloak:
+    container_name: keycloak_mcp
+    image: quay.io/keycloak/keycloak:26.5.3
+    command: ["start-dev", "--features=token-exchange"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: kavss
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./keycloak_data:/opt/keycloak/data
+    restart: always
+
+
+  spire-server:
+    container_name: spire-server
+    image: ghcr.io/spiffe/spire-server:1.8.0
+    command:
+      - "-config"
+      - "/run/spire/config/server.conf"
+    volumes:
+      - ./spire/server:/run/spire/config
+      - ./spire/certs:/run/spire/certs:ro
+      - spire-server-data:/opt/spire/data
+    ports:
+      - "8081:8081"
+    restart: always
+
+
+  spire-agent:
+    container_name: spire-agent
+    image: ghcr.io/spiffe/spire-agent:1.8.0
+    user: "0:0"
+    command:
+      - "-config"
+      - "/run/spire/config/agent.conf"
+    volumes:
+      - ./spire/agent:/run/spire/config
+      - ./spire/certs:/run/spire/certs:ro
+      - ./spire/agent/passwd:/etc/passwd:ro
+      - ./spire/agent/group:/etc/group:ro
+    depends_on:
+      - spire-server
+    restart: always
+
+
+volumes:
+  spire-server-data:
+  spire-agent-data:

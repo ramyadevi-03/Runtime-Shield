@@ -7,7 +7,17 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(PROJECT_DIR, "damn-vulnerable-llm-agent", "transactions.db")
 
 def log(msg):
-    print(f"[database-provider] {msg}", file=sys.stderr, flush=True)
+    import re
+    msg_str = str(msg)
+    # Match JWT tokens starting with eyJ and replace the middle part with a placeholder
+    jwt_pattern = r'\beyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\b'
+    def replace_token(match):
+        token = match.group(0)
+        if len(token) > 30:
+            return f"{token[:15]}...[TRUNCATED_JWT]...{token[-15:]}"
+        return token
+    msg_str = re.sub(jwt_pattern, replace_token, msg_str)
+    print(f"[database-provider] {msg_str}", file=sys.stderr, flush=True)
 
 def handle_request(req):
     method = req.get("method")

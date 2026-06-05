@@ -82,6 +82,36 @@ export async function verifyJitToken(
 
     // Decode token header to extract dynamic kid
     const decodedHeader: any = jwt.decode(token, { complete: true });
+    
+    // Developer Mode HS256 Support for Mock Login option
+    const isDev = process.env.LOCAL_DEV_MODE === "true";
+    if (isDev && decodedHeader?.header?.alg === "HS256") {
+        try {
+            const decoded: any = jwt.verify(token, "secret", {
+                algorithms: ["HS256"],
+            });
+            
+            // Scope verification
+            const scope = decoded.scope || "";
+            const scopes = typeof scope === "string" ? scope.split(" ") : [];
+            if (expectedScope && !scopes.includes(expectedScope)) {
+                throw new Error(`Token missing required scope: ${expectedScope}`);
+            }
+
+            // Role verification
+            if (expectedRole) {
+                const roles = decoded.realm_access?.roles || decoded.roles || [];
+                if (!roles.includes(expectedRole)) {
+                    throw new Error(`User does not possess required role: ${expectedRole}`);
+                }
+            }
+
+            return decoded;
+        } catch (err: any) {
+            console.error(`⚠️ [JIT Security Gateway] HS256 JIT mock verification failed: ${err.message}`);
+        }
+    }
+
     if (!decodedHeader || !decodedHeader.header || !decodedHeader.header.kid) {
         throw new Error("Invalid JWT token format or missing kid header");
     }

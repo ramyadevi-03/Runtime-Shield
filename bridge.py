@@ -1208,19 +1208,33 @@ def log_discovery(tool, args, agent):
         f.write(json.dumps(entry) + "\n")
 
 
+def sanitize_jwt_tokens(text: str) -> str:
+    import re
+    # Match JWT tokens starting with eyJ and replace the middle part with a placeholder
+    jwt_pattern = r'\beyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\b'
+    def replace_token(match):
+        token = match.group(0)
+        if len(token) > 30:
+            return f"{token[:15]}...[TRUNCATED_JWT]...{token[-15:]}"
+        return token
+    return re.sub(jwt_pattern, replace_token, text)
+
+
 def log(msg: str):
+    msg_str = str(msg)
+    msg_str = sanitize_jwt_tokens(msg_str)
     timestamp = time.strftime('%H:%M:%S')
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] {msg}\n")
+            f.write(f"[{timestamp}] {msg_str}\n")
     except Exception:
         pass
     
     try:
-        print(msg, file=sys.stderr, flush=True)
+        print(msg_str, file=sys.stderr, flush=True)
     except UnicodeEncodeError:
         # Fallback for terminals that don't support UTF-8
-        print(msg.encode('ascii', 'replace').decode('ascii'), file=sys.stderr, flush=True)
+        print(msg_str.encode('ascii', 'replace').decode('ascii'), file=sys.stderr, flush=True)
 
 
 def sanitize_llm_json(text: str) -> str:
@@ -1436,9 +1450,12 @@ class WindowsJailer(BaseJailer):
         kwargs = super().get_popen_kwargs(cmd)
         if sys.platform == 'win32':
             sandbox_script = os.path.join(PROJECT_DIR, "windows_sandbox.py")
-            new_cmd = ["python", sandbox_script, "--provider", self.provider_name, "--"] + cmd
-            cmd[:] = new_cmd
-            log(f"🪟 Sandboxing [{self.provider_name}]: Windows Restricted Process Group initialized (win32job + restricted token)")
+            if os.path.exists(sandbox_script):
+                new_cmd = ["python", sandbox_script, "--provider", self.provider_name, "--"] + cmd
+                cmd[:] = new_cmd
+                log(f"🪟 Sandboxing [{self.provider_name}]: Windows Restricted Process Group initialized (win32job + restricted token)")
+            else:
+                log(f"⚠️ [WARNING] Windows process jailer script not found at {sandbox_script}. Running '{self.provider_name}' without sandboxing.")
         return kwargs
 
 class JailFactory:

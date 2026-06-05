@@ -448,6 +448,9 @@ DASHBOARD_HTML = """
             const patterns = events.filter(e => (e.action || '').toLowerCase() === 'deny' && e.reason && e.reason.includes('S')).length;
             document.getElementById('risk-patterns').innerText = patterns;
 
+            // Calculate dynamic risk score based on denied requests (each deny event adds 25 risk points, max 100)
+            riskScore = Math.min(100, (displayStats.denied || 0) * 25);
+
             updateRiskUI();
             updateChartData(events);
         }

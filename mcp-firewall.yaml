@@ -170,7 +170,7 @@ threat_feed:
 mcp_servers:
   filesystem-provider:
     command: "node"
-    args: ["c:/Users/Lenovo/Desktop/Runtime-shield- login/Runtime-shield-for-agentic-systems/dist/index.js", "c:/Users/Lenovo/Desktop/Runtime-shield- login/Runtime-shield-for-agentic-systems"]
+    args: ["./dist/index.js", "."]
     tools:
       - name: "read_file"
         scope: "tool:read_file"
@@ -185,7 +185,7 @@ mcp_servers:
   
   keycloak-provider:
     command: "node"
-    args: ["c:/Users/Lenovo/Desktop/Runtime-shield- login/Runtime-shield-for-agentic-systems/dist/index.js"]
+    args: ["./dist/index.js"]
     tools:
       - name: "keycloak_list_users"
         scope: "tool:keycloak_read"
@@ -204,7 +204,7 @@ mcp_servers:
 
   database-provider:
     command: "python"
-    args: ["-u", "c:/Users/Lenovo/Desktop/Runtime-shield- login/Runtime-shield-for-agentic-systems/database_mcp.py"]
+    args: ["-u", "./database_mcp.py"]
     tools:
       - name: "GetCurrentUser"
         scope: "tool:keycloak_read"

@@ -86,7 +86,7 @@ function applyNodeRuntimeContainment() {
   }
 }
 
-applyNodeRuntimeContainment();
+// applyNodeRuntimeContainment() will be called in main() after attestation
 
 const mandatoryVars = ["KEYCLOAK_URL", "KEYCLOAK_REALM", "KEYCLOAK_CLIENT_ID", "KEYCLOAK_CLIENT_SECRET"];
 const missingVars = mandatoryVars.filter(v => !process.env[v]);
@@ -251,6 +251,9 @@ async function main() {
         process.exit(1);
     }
     console.error(`✅ SPIFFE Verification Active: Trusted Workload SVID verified: ${attestation.spiffe_id}`);
+
+    // Lock down child processes and networking now that SPIFFE attestation is complete
+    applyNodeRuntimeContainment();
 
     const transport = new StdioServerTransport();
 

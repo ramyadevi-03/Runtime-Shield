@@ -88,6 +88,74 @@ if st.sidebar.button("🧹 Clear Chat History"):
     st.session_state.steps = {}
     st.rerun()
 
+# --- User Session Authentication ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔐 User Authentication")
+
+if "keycloak_token" not in st.session_state:
+    st.session_state.keycloak_token = None
+if "role" not in st.session_state:
+    st.session_state.role = "user"
+if "username" not in st.session_state:
+    st.session_state.username = "Guest"
+
+# Sidebar Login Form (always show if not authenticated)
+if st.session_state.keycloak_token and st.session_state.username != "Guest":
+    st.sidebar.success(f"Logged in as: **{st.session_state.username}**")
+    st.sidebar.info(f"Role: **{st.session_state.role.upper()}**")
+    if st.sidebar.button("🚪 Logout"):
+        st.session_state.keycloak_token = None
+        st.session_state.role = "user"
+        st.session_state.username = "Guest"
+        msgs.clear()
+        msgs.add_ai_message(welcome_message)
+        st.session_state.steps = {}
+        st.rerun()
+else:
+    with st.sidebar.form("login_form"):
+        st.write("Sign in to Keycloak:")
+        username_input = st.text_input("Username")
+        password_input = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign In")
+        
+        if submitted:
+            # Call Keycloak Token API dynamically
+            kc_url = os.getenv("KEYCLOAK_URL", "http://127.0.0.1:8080")
+            realm = os.getenv("KEYCLOAK_REALM", "master")
+            client_id = os.getenv("KEYCLOAK_CLIENT_ID", "admin-cli")
+            client_secret = os.getenv("KEYCLOAK_CLIENT_SECRET")
+            
+            token_url = f"{kc_url}/realms/{realm}/protocol/openid-connect/token"
+            data = {
+                "grant_type": "password",
+                "client_id": client_id,
+                "username": username_input,
+                "password": password_input,
+                "scope": "openid profile email tool:read_file tool:write_file tool:list_directory tool:keycloak_read tool:keycloak_admin tool:keycloak_report tool:admin_internal"
+            }
+            if client_secret:
+                data["client_secret"] = client_secret
+                
+            try:
+                import requests
+                r = requests.post(token_url, data=data, timeout=5)
+                if r.status_code == 200:
+                    token_info = r.json()
+                    access_token = token_info["access_token"]
+                    st.session_state.keycloak_token = access_token
+                    
+                    import jwt
+                    claims = jwt.decode(access_token, options={"verify_signature": False})
+                    roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
+                    st.session_state.role = "admin" if "admin" in roles else "user"
+                    st.session_state.username = claims.get("preferred_username") or username_input
+                    st.success("Successfully authenticated!")
+                    st.rerun()
+                else:
+                    st.error("Authentication failed: invalid credentials.")
+            except Exception as e:
+                st.error(f"Error connecting to Keycloak: {e}")
+
 # --- SPIFFE Workload Status ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("🪪 SPIFFE Workload Identity")
@@ -191,14 +259,10 @@ for idx, msg in enumerate(msgs.messages):
 if prompt := st.chat_input(placeholder="Show my recent transactions"):
     st.chat_message("user").write(prompt)
     
-    # Dynamically reload .env to catch identity switch instantly
-    parent_dotenv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
-    load_dotenv(dotenv_path=parent_dotenv, override=True)
-    
-    # Extract sub and role from KEYCLOAK_TOKEN to pass explicitly to tools (no global environment variable usage)
-    token = os.getenv("KEYCLOAK_TOKEN")
+    # Extract sub and role from user session state token (truly multi-user isolated)
+    token = st.session_state.get("keycloak_token")
     keycloak_sub = ""
-    role = os.getenv("RUNTIME_ROLE", "user").strip().lower().replace("'", "").replace('"', '')
+    role = st.session_state.get("role", "user")
     debug_mode = True
 
     if token:
@@ -330,7 +394,7 @@ CRITICAL FORMATTING RULES:
     else:
         system_msg_to_use = system_msg
         
-    extra_headers = {"X-Shield-Token": os.getenv("KEYCLOAK_TOKEN")}
+    extra_headers = {"X-Shield-Token": token}
     if spiffe_svid and spiffe_svid.get("spiffe_id"):
         extra_headers["X-SPIFFE-ID"] = spiffe_svid["spiffe_id"]
         # Feature 3: attach PEM cert so the gateway can cryptographically verify the SVID
@@ -346,7 +410,7 @@ CRITICAL FORMATTING RULES:
     llm = ChatLiteLLM(
         model=model_name_to_use,
         api_base="http://127.0.0.1:5001/v1",
-        api_key=os.getenv("KEYCLOAK_TOKEN"),
+        api_key=token,
         custom_llm_provider="openai",
         model_kwargs={"extra_headers": extra_headers},
         temperature=0, streaming=True

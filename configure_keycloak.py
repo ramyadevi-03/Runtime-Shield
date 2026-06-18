@@ -76,18 +76,18 @@ def update_user(token: str, username: str, password: str):
         }
         r = requests.post(create_url, json=user_data, headers=headers, timeout=10)
         if r.status_code == 201:
-            print(f"✅ Created user '{username}'")
+            print(f"[OK] Created user '{username}'")
         else:
-            print(f"❌ Failed to create user '{username}': {r.status_code} {r.text}")
+            print(f"[ERROR] Failed to create user '{username}': {r.status_code} {r.text}")
         return
 
     pass_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/users/{user_id}/reset-password"
     pass_data = {"type": "password", "value": password, "temporary": False}
     r = requests.put(pass_url, json=pass_data, headers=headers, timeout=10)
     if r.status_code == 204:
-        print(f"✅ Password updated for '{username}'")
+        print(f"[OK] Password updated for '{username}'")
     else:
-        print(f"❌ Failed to update password for '{username}': {r.status_code} {r.text}")
+        print(f"[ERROR] Failed to update password for '{username}': {r.status_code} {r.text}")
 
 
 def main():
@@ -99,20 +99,20 @@ def main():
 
     token = get_admin_token()
     if not token:
-        print("❌ Could not acquire admin token. Aborting setup.")
+        print("[ERROR] Could not acquire admin token. Aborting setup.")
         sys.exit(1)
 
     # Set passwords for the configured realm users from environment
     # KEYCLOAK_USER_PASSWORD must be defined or this will abort.
     user_pass = os.getenv("KEYCLOAK_USER_PASSWORD")
     if not user_pass:
-        print("❌ KEYCLOAK_USER_PASSWORD is not set in .env — skipping user password updates.")
+        print("[ERROR] KEYCLOAK_USER_PASSWORD is not set in .env — skipping user password updates.")
         sys.exit(1)
 
     update_user(token, "admin", ADMIN_PASS)
     update_user(token, "user", user_pass)
 
-    print("\n✅ Keycloak setup complete.")
+    print("\n[OK] Keycloak setup complete.")
 
 
 if __name__ == "__main__":

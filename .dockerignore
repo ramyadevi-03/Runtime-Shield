@@ -1,0 +1,17 @@
+venv/
+node_modules/
+damn-vulnerable-llm-agent/venv/
+.git/
+.vscode/
+.qodo/
+*.db
+*.db-shm
+*.db-wal
+*.log
+bridge_demo_err.log
+bridge_demo_out.log
+streamlit_err.log
+streamlit_out.log
+bridge_demo.log
+telemetry.log
+dist/

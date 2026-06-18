@@ -46,10 +46,198 @@ nim_guard_instance = None
 fraud_engine_instance = None
 semantic_parser_instance = None
 
+import telemetry
+
 mcp_processes = {}
+mcp_remote_clients = {}
 tool_map = {}
 scope_map = {}
 pending_tool_futures = {}  # req_id -> asyncio.Future
+stdout_lock = threading.Lock()
+
+def reload_tool_mappings():
+    global tool_map, scope_map
+    try:
+        registered_tools = telemetry.get_registered_tools()
+        for t in registered_tools:
+            tool_map[t["tool_name"]] = t["provider_name"]
+            scope_map[t["tool_name"]] = t["scope"]
+        log(f"🔄 Reloaded tool mappings from database. Total tools in memory: {len(tool_map)}")
+    except Exception as e:
+        log(f"⚠️ Failed to reload tool mappings from DB: {e}")
+
+
+class RemoteSseMcpClient:
+    def __init__(self, provider_name: str, base_url: str):
+        self.provider_name = provider_name
+        self.base_url = base_url
+        self.post_url = None
+        self.client = None
+        self.is_connected = False
+        self.connection_task = None
+        self.pending_futures = {}
+
+    async def start(self):
+        self.client = httpx.AsyncClient(timeout=15.0)
+        self.connection_task = asyncio.create_task(self._connect_loop())
+
+    async def _connect_loop(self):
+        while True:
+            try:
+                log(f"🔌 RemoteSseMcpClient [{self.provider_name}]: Connecting to {self.base_url}...")
+                headers = {"Accept": "text/event-stream"}
+                try:
+                    spiffe_cfg = get_spiffe_config()
+                    if spiffe_cfg and spiffe_cfg.get("enabled"):
+                        headers.update(get_spiffe_headers())
+                except Exception as e:
+                    log(f"⚠️ RemoteSseMcpClient [{self.provider_name}]: Failed to get SPIFFE headers for connect: {e}")
+
+                async with self.client.stream("GET", self.base_url, headers=headers, timeout=None) as response:
+                    if response.status_code != 200:
+                        log(f"❌ RemoteSseMcpClient [{self.provider_name}]: GET {self.base_url} returned status code {response.status_code}")
+                        await asyncio.sleep(5)
+                        continue
+                    
+                    self.is_connected = True
+                    log(f"✅ RemoteSseMcpClient [{self.provider_name}]: SSE stream established")
+                    
+                    event_type = None
+                    async for line in response.aiter_lines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if line.startswith("event:"):
+                            event_type = line.split(":", 1)[1].strip()
+                        elif line.startswith("data:"):
+                            data = line.split(":", 1)[1].strip()
+                            await self._handle_event(event_type, data)
+                            event_type = None
+
+            except Exception as e:
+                log(f"⚠️ RemoteSseMcpClient [{self.provider_name}]: Connection error: {e}")
+                self.is_connected = False
+                self.post_url = None
+                await asyncio.sleep(5)
+
+    async def _handle_event(self, event_type: str, data: str):
+        try:
+            if event_type == "endpoint":
+                from urllib.parse import urljoin
+                self.post_url = urljoin(self.base_url, data)
+                log(f"🔗 RemoteSseMcpClient [{self.provider_name}]: Resolved POST endpoint to {self.post_url}")
+                asyncio.create_task(self.sync_tools())
+            elif event_type == "message":
+                msg = json.loads(data)
+                msg_id = msg.get("id")
+                
+                # Relay message to pending tool call futures
+                if msg_id is not None and msg_id in pending_tool_futures:
+                    loop = pending_tool_futures[msg_id]._loop
+                    loop.call_soon_threadsafe(pending_tool_futures[msg_id].set_result, data)
+                else:
+                    # Write response directly to stdout for stdio clients
+                    try:
+                        with stdout_lock:
+                            protocol_stdout.write(data + "\n")
+                            protocol_stdout.flush()
+                    except Exception as e:
+                        log(f"⚠️ Failed to write remote SSE response to stdout: {e}")
+                
+                # Relay tool lists to the aggregator if it is a list response
+                if "result" in msg and isinstance(msg["result"], dict) and "tools" in msg["result"]:
+                    global tools_list_aggregator
+                    if tools_list_aggregator is not None:
+                        tools_list = msg["result"]["tools"] or []
+                        is_complete, merged_tools = tools_list_aggregator.add_response(msg_id, self.provider_name, tools_list)
+                        if is_complete:
+                            msg["result"]["tools"] = merged_tools
+                            line_str = json.dumps(msg) + "\n"
+                            try:
+                                with stdout_lock:
+                                    protocol_stdout.write(line_str)
+                                    protocol_stdout.flush()
+                            except Exception as e:
+                                log(f"⚠️ Failed to write aggregated tools to stdout: {e}")
+        except Exception as e:
+            log(f"⚠️ RemoteSseMcpClient [{self.provider_name}]: Error handling event ({event_type}): {e}")
+
+    async def sync_tools(self):
+        try:
+            req_id = f"sync-tools-{int(time.time())}"
+            payload = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/list"
+            }
+            log(f"🔄 RemoteSseMcpClient [{self.provider_name}]: Syncing tools...")
+            res = await self.send_message(payload, timeout=5.0)
+            if res and "result" in res and "tools" in res["result"]:
+                tools = res["result"]["tools"] or []
+                log(f"✅ RemoteSseMcpClient [{self.provider_name}]: Found {len(tools)} tools. Saving to registry.")
+                telemetry.sync_mcp_tools(self.provider_name, tools)
+                reload_tool_mappings()
+        except Exception as e:
+            log(f"⚠️ RemoteSseMcpClient [{self.provider_name}]: Failed to sync tools: {e}")
+
+    async def send_message(self, payload: dict, timeout=10.0) -> dict:
+        if not self.post_url:
+            raise RuntimeError(f"POST endpoint for {self.provider_name} is not resolved yet")
+        
+        req_id = payload.get("id")
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        pending_tool_futures[req_id] = fut
+
+        try:
+            headers = {"Content-Type": "application/json"}
+            try:
+                spiffe_cfg = get_spiffe_config()
+                if spiffe_cfg and spiffe_cfg.get("enabled"):
+                    headers.update(get_spiffe_headers())
+            except Exception as e:
+                log(f"⚠️ RemoteSseMcpClient [{self.provider_name}]: Failed to get SPIFFE headers for message: {e}")
+
+            async with httpx.AsyncClient() as post_client:
+                resp = await post_client.post(self.post_url, json=payload, headers=headers, timeout=timeout)
+            if resp.status_code not in (200, 202):
+                raise RuntimeError(f"POST {self.post_url} returned {resp.status_code}: {resp.text}")
+            
+            response_str = await asyncio.wait_for(fut, timeout=timeout)
+            return json.loads(response_str)
+        except Exception as e:
+            log(f"⚠️ RemoteSseMcpClient [{self.provider_name}]: Error sending message: {e}")
+            raise
+        finally:
+            pending_tool_futures.pop(req_id, None)
+
+    async def stop(self):
+        if self.connection_task:
+            self.connection_task.cancel()
+        if self.client:
+            await self.client.aclose()
+        self.is_connected = False
+        self.post_url = None
+
+@dashboard_app.on_event("startup")
+async def start_remote_mcp_clients():
+    log("🔌 FastAPI Startup: Connecting to remote MCP servers...")
+    for provider, client in mcp_remote_clients.items():
+        try:
+            await client.start()
+        except Exception as e:
+            log(f"⚠️ Failed to start remote MCP client [{provider}]: {e}")
+
+@dashboard_app.on_event("shutdown")
+async def stop_remote_mcp_clients():
+    log("🔌 FastAPI Shutdown: Closing remote MCP connections...")
+    for provider, client in mcp_remote_clients.items():
+        try:
+            await client.stop()
+        except Exception as e:
+            log(f"⚠️ Failed to stop remote MCP client [{provider}]: {e}")
+
+
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
@@ -3783,7 +3971,11 @@ async def execute_tool_proxy(request: Request):
         "keycloakgetuserevents": "keycloak_get_user_events",
         "keycloaksecurityreport": "keycloak_security_report",
         "keycloakgeneratepolicy": "keycloak_generate_policy",
-        "keycloakquarantineuser": "keycloak_quarantine_user"
+        "keycloakquarantineuser": "keycloak_quarantine_user",
+        "scandependencies": "ScanDependencies",
+        "scansecrets": "ScanSecrets",
+        "getsystemmetrics": "GetSystemMetrics",
+        "getactiveconnections": "GetActiveConnections"
     }
     
     if raw_clean in canonical_mappings:
@@ -3853,12 +4045,13 @@ async def execute_tool_proxy(request: Request):
         except Exception as e:
             log(f"⚠️ Tool REST Proxy failed to decode JWT token: {e}")
 
-    # Fallback/Override role check matching env RUNTIME_ROLE in local dev
-    env_role = os.getenv("RUNTIME_ROLE", "user").strip().lower().replace("'", "").replace('"', '')
-    if user_role != "admin" and env_role == "admin":
-        user_role = "admin"
-        if user_id == "anonymous_user":
-            user_id = "admin"
+    # Fallback/Override role check matching env RUNTIME_ROLE in local dev (only if no token provided)
+    if not token:
+        env_role = os.getenv("RUNTIME_ROLE", "user").strip().lower().replace("'", "").replace('"', '')
+        if user_role != "admin" and env_role == "admin":
+            user_role = "admin"
+            if user_id == "anonymous_user":
+                user_id = "admin"
 
     # 3. SPIFFE WORKLOAD IDENTITY ENFORCEMENT
     spiffe_cfg = get_spiffe_config()
@@ -4005,30 +4198,54 @@ async def execute_tool_proxy(request: Request):
         "source": "bridge-rest"
     }
 
-    # 9. Sync JSON-RPC routing over StdIn/StdOut pipe
+    # 9. Sync JSON-RPC routing
     provider = tool_map.get(tool_name)
-    proc = mcp_processes.get(provider)
-    if not proc or not proc.stdin:
+    response_data = None
+    response_str = None
+
+    if provider in mcp_processes:
+        proc = mcp_processes[provider]
+        if not proc or not proc.stdin:
+            raise HTTPException(status_code=503, detail=f"MCP Provider '{provider}' not available or running")
+
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        pending_tool_futures[req_id] = fut
+
+        try:
+            line_to_send = json.dumps(body) + "\n"
+            log(f"🛤️ REST Proxy: Writing JSON-RPC payload to sandboxed '{provider}' stdin: {line_to_send.strip()[:100]}...")
+            proc.stdin.write(line_to_send)
+            proc.stdin.flush()
+            log(f"🛤️ REST routed '{tool_name}' to sandboxed '{provider}' (req_id={req_id}). Waiting for response...")
+
+            # Wait for the future with a strict 10 second timeout
+            response_str = await asyncio.wait_for(fut, timeout=10.0)
+            response_data = json.loads(response_str)
+        except asyncio.TimeoutError:
+            log(f"❌ Timeout waiting for sandboxed tool '{tool_name}' response (req_id={req_id})")
+            return JSONResponse(status_code=504, content={"error": "Tool execution timeout"})
+        except Exception as run_err:
+            log(f"❌ Error during sandboxed REST execution: {run_err}")
+            return JSONResponse(status_code=500, content={"error": str(run_err)})
+        finally:
+            pending_tool_futures.pop(req_id, None)
+            
+    elif provider in mcp_remote_clients:
+        client = mcp_remote_clients[provider]
+        log(f"🛤️ REST Proxy: Routing JSON-RPC payload to remote SSE provider '{provider}'...")
+        try:
+            response_data = await client.send_message(body, timeout=10.0)
+            response_str = json.dumps(response_data)
+        except Exception as run_err:
+            log(f"❌ Error during remote SSE REST execution: {run_err}")
+            return JSONResponse(status_code=500, content={"error": str(run_err)})
+            
+    else:
         raise HTTPException(status_code=503, detail=f"MCP Provider '{provider}' not available or running")
 
-    loop = asyncio.get_running_loop()
-    fut = loop.create_future()
-    pending_tool_futures[req_id] = fut
-
-    try:
-        line_to_send = json.dumps(body) + "\n"
-        log(f"🛤️ REST Proxy: Writing JSON-RPC payload to sandboxed '{provider}' stdin: {line_to_send.strip()[:100]}...")
-        proc.stdin.write(line_to_send)
-        proc.stdin.flush()
-        log(f"🛤️ REST routed '{tool_name}' to sandboxed '{provider}' (req_id={req_id}). Waiting for response...")
-
-        # Wait for the future with a strict 10 second timeout
-        response_str = await asyncio.wait_for(fut, timeout=10.0)
-        
-        # 10. Egress PII & Safety Redaction on tool result
-        response_data = json.loads(response_str)
-        
-        # Apply standard scans inside completions-response helper
+    # 10. Egress PII & Safety Redaction on tool result
+    if response_data is not None:
         if user_role != "admin" and is_tool_result_message(response_data):
             try:
                 # Perform the scans asynchronously in the thread pool without blocking the event loop
@@ -4044,15 +4261,8 @@ async def execute_tool_proxy(request: Request):
                 response_data = json.loads(response_str)
 
         return JSONResponse(content=response_data)
-        
-    except asyncio.TimeoutError:
-        log(f"❌ Timeout waiting for sandboxed tool '{tool_name}' response (req_id={req_id})")
-        return JSONResponse(status_code=504, content={"error": "Tool execution timeout"})
-    except Exception as run_err:
-        log(f"❌ Error during sandboxed REST execution: {run_err}")
-        return JSONResponse(status_code=500, content={"error": str(run_err)})
-    finally:
-        pending_tool_futures.pop(req_id, None)
+    else:
+        return JSONResponse(status_code=500, content={"error": "Empty response from tool provider"})
 
 
 # Structured JSON-RPC classification helper
@@ -4155,14 +4365,34 @@ def main():
         gw = Gateway(config_path=CONFIG_PATH)
         log("✅ Security Gateway initialized")
         
-        # Load MCP Server Registry from config
+        # Seed and Load MCP Server Registry from Database
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             full_config = yaml.safe_load(f)
         MCP_SERVERS = full_config.get("mcp_servers", {})
-        log(f"📦 Loaded {len(MCP_SERVERS)} MCP providers from config")
-        
+
+        registry = telemetry.get_mcp_registry()
+        if not registry:
+            log("💾 MCP Registry database is empty. Seeding from mcp-firewall.yaml...")
+            for idx, (provider, p_config) in enumerate(MCP_SERVERS.items()):
+                mcp_id = f"mcp-{int(time.time())}-{idx}"
+                telemetry.register_mcp(
+                    mcp_id=mcp_id,
+                    provider_name=provider,
+                    transport="stdio",
+                    command=p_config.get("command"),
+                    args=p_config.get("args"),
+                    url=None,
+                    active=1
+                )
+                tools_list = p_config.get("tools", [])
+                telemetry.sync_mcp_tools(provider, tools_list)
+            registry = telemetry.get_mcp_registry()
+
+        active_mcp_servers = [r for r in registry if r.get("active") == 1]
+        log(f"📦 Loaded {len(active_mcp_servers)} active MCP providers from database registry")
+
         global tools_list_aggregator
-        tools_list_aggregator = ToolsListAggregator(len(MCP_SERVERS))
+        tools_list_aggregator = ToolsListAggregator(len(active_mcp_servers))
 
         # Initialize NeMo NIM Guard
         NEMO_CONFIG = full_config.get("nemo_cloud", {})
@@ -4456,8 +4686,15 @@ setInterval(() => {
 
     # Start multiple MCP Servers
     mcp_processes.clear()
+    mcp_remote_clients.clear()
     tool_map.clear()
     scope_map.clear()
+
+    # Load tool mappings from DB registry
+    registered_tools = telemetry.get_registered_tools()
+    for t in registered_tools:
+        tool_map[t["tool_name"]] = t["provider_name"]
+        scope_map[t["tool_name"]] = t["scope"]
 
     # Strict base allowlist of safe system keys needed for Node/subprocesses on Windows
     base_safe_keys = {
@@ -4469,51 +4706,54 @@ setInterval(() => {
         "HOMEDRIVE", "HOMEPATH"
     }
 
-    for provider, p_config in MCP_SERVERS.items():
-        cmd = [p_config["command"]] + p_config.get("args", [])
-        log(f"🚀 Launching MCP Provider [{provider}]: {' '.join(cmd)}")
+    for r in active_mcp_servers:
+        provider = r["provider_name"]
+        transport = r.get("transport", "stdio")
         
-        # Build strict separate environment block for each child process (Phase 1)
-        provider_env = {}
-        for k in base_safe_keys:
-            if k in os.environ:
-                provider_env[k] = os.environ[k]
-            elif k.upper() in os.environ:
-                provider_env[k] = os.environ[k.upper()]
-                
-        provider_env["SPIFFE_ENABLED"] = "true" if spiffe_cfg["enabled"] else "false"
-        provider_env["RUNTIME_ROLE"] = DEFAULT_ROLE
-        provider_env["PROVIDER_NAME"] = provider
-        
-        if provider == "keycloak-provider":
-            # keycloak-provider gets ONLY specific Keycloak config vars
-            kc_keys = {
-                "KEYCLOAK_URL", "KEYCLOAK_REALM", "KEYCLOAK_CLIENT_ID", 
-                "KEYCLOAK_CLIENT_SECRET", "KEYCLOAK_JWKS_URL", "KEYCLOAK_TOKEN_URL",
-                "SPIFFE_BRIDGE_ID", "SPIFFE_SERVER_ID", "SPIFFE_SVID_PATH", "SPIFFE_BUNDLE_PATH"
-            }
-            for k in kc_keys:
-                val = os.getenv(k)
-                if val is not None:
-                    provider_env[k] = val
-        elif provider == "filesystem-provider":
-            # filesystem-provider gets NO Keycloak secrets and NO NVIDIA API keys!
-            pass
-        
-        proc = launch_sandboxed_node(
-            cmd,
-            cwd=PROJECT_DIR,
-            env=provider_env,
-            allowed_paths=[WORKSPACE_DIR],
-            provider_name=provider
-        )
-        mcp_processes[provider] = proc
-        
-        for t in p_config.get("tools", []):
-            tool_map[t["name"]] = provider
-            scope_map[t["name"]] = t.get("scope")
-
-    stdout_lock = threading.Lock()
+        if transport == "stdio":
+            cmd = [r["command"]] + (r.get("args") or [])
+            log(f"🚀 Launching Local MCP Provider [{provider}]: {' '.join(cmd)}")
+            
+            # Build strict separate environment block for each child process (Phase 1)
+            provider_env = {}
+            for k in base_safe_keys:
+                if k in os.environ:
+                    provider_env[k] = os.environ[k]
+                elif k.upper() in os.environ:
+                    provider_env[k] = os.environ[k.upper()]
+                    
+            provider_env["SPIFFE_ENABLED"] = "true" if spiffe_cfg["enabled"] else "false"
+            provider_env["RUNTIME_ROLE"] = DEFAULT_ROLE
+            provider_env["PROVIDER_NAME"] = provider
+            
+            if provider == "keycloak-provider":
+                # keycloak-provider gets ONLY specific Keycloak config vars
+                kc_keys = {
+                    "KEYCLOAK_URL", "KEYCLOAK_REALM", "KEYCLOAK_CLIENT_ID", 
+                    "KEYCLOAK_CLIENT_SECRET", "KEYCLOAK_JWKS_URL", "KEYCLOAK_TOKEN_URL",
+                    "SPIFFE_BRIDGE_ID", "SPIFFE_SERVER_ID", "SPIFFE_SVID_PATH", "SPIFFE_BUNDLE_PATH"
+                }
+                for k in kc_keys:
+                    val = os.getenv(k)
+                    if val is not None:
+                        provider_env[k] = val
+            elif provider == "filesystem-provider":
+                # filesystem-provider gets NO Keycloak secrets and NO NVIDIA API keys!
+                pass
+            
+            proc = launch_sandboxed_node(
+                cmd,
+                cwd=PROJECT_DIR,
+                env=provider_env,
+                allowed_paths=[WORKSPACE_DIR],
+                provider_name=provider
+            )
+            mcp_processes[provider] = proc
+        elif transport == "sse":
+            url = r.get("url")
+            log(f"🚀 Registered Remote SSE MCP Provider [{provider}] connected to {url}")
+            client = RemoteSseMcpClient(provider, url)
+            mcp_remote_clients[provider] = client
 
     # =========================
     # INPUT THREAD (Tool Filtering)
@@ -4557,7 +4797,11 @@ setInterval(() => {
                             "keycloakgetuserevents": "keycloak_get_user_events",
                             "keycloaksecurityreport": "keycloak_security_report",
                             "keycloakgeneratepolicy": "keycloak_generate_policy",
-                            "keycloakquarantineuser": "keycloak_quarantine_user"
+                            "keycloakquarantineuser": "keycloak_quarantine_user",
+                            "scandependencies": "ScanDependencies",
+                            "scansecrets": "ScanSecrets",
+                            "getsystemmetrics": "GetSystemMetrics",
+                            "getactiveconnections": "GetActiveConnections"
                         }
                         
                         if raw_clean in canonical_mappings:
@@ -4891,21 +5135,66 @@ setInterval(() => {
                         if target_proc.stdin:
                             target_proc.stdin.write(line)
                             target_proc.stdin.flush()
-                            log(f"🛤️ Routed '{tool_name}' to provider '{provider}'")
+                            log(f"🛤️ Routed '{tool_name}' to local provider '{provider}'")
+                    elif provider and provider in mcp_remote_clients:
+                        client = mcp_remote_clients[provider]
+                        if client.post_url:
+                            log(f"🛤️ Routing '{tool_name}' to remote provider '{provider}' via POST: {client.post_url}")
+                            def send_post_sync(c=client, d=data):
+                                try:
+                                    post_headers = {"Content-Type": "application/json"}
+                                    try:
+                                        spiffe_cfg_val = get_spiffe_config()
+                                        if spiffe_cfg_val and spiffe_cfg_val.get("enabled"):
+                                            post_headers.update(get_spiffe_headers())
+                                    except Exception as e:
+                                        pass
+                                    resp = requests.post(c.post_url, json=d, headers=post_headers, timeout=10.0)
+                                    if resp.status_code not in (200, 202):
+                                        log(f"⚠️ Remote provider {c.provider_name} POST returned {resp.status_code}: {resp.text}")
+                                except Exception as e:
+                                    log(f"⚠️ Error routing request to remote provider {c.provider_name}: {e}")
+                            threading.Thread(target=send_post_sync, daemon=True).start()
+                        else:
+                            log(f"⚠️ POST endpoint for remote provider '{provider}' is not active yet")
                     else:
                         # Fallback: if tool is not in map (e.g. list_tools), send to ALL or first one
-                        # For list_tools, we might want to aggregate, but for now let's send to all
                         if method in ("tools/list", "listTools", "notifications/initialized", "notifications/cancelled"):
                             for p_name, p_proc in mcp_processes.items():
                                 if p_proc.stdin:
                                     p_proc.stdin.write(line)
                                     p_proc.stdin.flush()
+                            for p_name, client in mcp_remote_clients.items():
+                                if client.post_url:
+                                    def send_post_sync_list(c=client, d=data):
+                                        try:
+                                            post_headers = {"Content-Type": "application/json"}
+                                            try:
+                                                spiffe_cfg_val = get_spiffe_config()
+                                                if spiffe_cfg_val and spiffe_cfg_val.get("enabled"):
+                                                    post_headers.update(get_spiffe_headers())
+                                            except Exception as e:
+                                                pass
+                                            requests.post(c.post_url, json=d, headers=post_headers, timeout=5.0)
+                                        except Exception as e:
+                                            pass
+                                    threading.Thread(target=send_post_sync_list, daemon=True).start()
                         elif method in ("initialize", "ping"):
                             # Send initialize to only ONE provider to prevent duplicate response IDs
-                            first_proc = next(iter(mcp_processes.values()))
-                            if first_proc.stdin:
-                                first_proc.stdin.write(line)
-                                first_proc.stdin.flush()
+                            if mcp_processes:
+                                first_proc = next(iter(mcp_processes.values()))
+                                if first_proc.stdin:
+                                    first_proc.stdin.write(line)
+                                    first_proc.stdin.flush()
+                            elif mcp_remote_clients:
+                                first_client = next(iter(mcp_remote_clients.values()))
+                                if first_client.post_url:
+                                    def send_init_sync(c=first_client, d=data):
+                                        try:
+                                            requests.post(c.post_url, json=d, timeout=5.0)
+                                        except Exception:
+                                            pass
+                                    threading.Thread(target=send_init_sync, daemon=True).start()
                         elif provider is None:
                             log(f"⚠️ No provider found for tool '{tool_name}'")
 

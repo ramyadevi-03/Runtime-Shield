@@ -84,3 +84,25 @@ CREATE TABLE IF NOT EXISTS security_incidents (
     description TEXT,
     affected_sessions TEXT -- Comma separated session IDs
 );
+
+-- 📦 MCP REGISTRY
+CREATE TABLE IF NOT EXISTS mcp_registry (
+    mcp_id TEXT PRIMARY KEY,
+    provider_name TEXT UNIQUE NOT NULL,
+    transport TEXT NOT NULL DEFAULT 'stdio', -- 'stdio' | 'sse'
+    command TEXT,                            -- Executable for stdio (e.g. 'node')
+    args TEXT,                               -- JSON array of arguments
+    url TEXT,                                -- Remote SSE base URL
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+-- 🛠️ MCP REGISTRY TOOLS
+CREATE TABLE IF NOT EXISTS mcp_registry_tools (
+    tool_name TEXT PRIMARY KEY,
+    provider_name TEXT NOT NULL REFERENCES mcp_registry(provider_name) ON DELETE CASCADE,
+    scope TEXT,
+    required_role TEXT DEFAULT 'user'
+);
+

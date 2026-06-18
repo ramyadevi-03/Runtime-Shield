@@ -104,6 +104,132 @@ async def receive_event(event: Dict[str, Any]):
     await manager.broadcast_event(event)
     return {"status": "ok"}
 
+@app.get("/api/registry/mcps")
+async def get_registry():
+    import telemetry
+    return {"status": "ok", "mcps": telemetry.get_mcp_registry()}
+
+@app.post("/api/registry/mcps")
+async def add_registry(payload: Dict[str, Any]):
+    import telemetry
+    import uuid
+    import sys
+    mcp_id = payload.get("mcp_id") or f"mcp-{str(uuid.uuid4())[:8]}"
+    provider_name = payload.get("provider_name")
+    transport = payload.get("transport", "stdio")
+    command = payload.get("command")
+    args = payload.get("args") or []
+    url = payload.get("url")
+    active = int(payload.get("active", 1))
+
+    if not provider_name:
+        return {"status": "error", "message": "provider_name is required"}
+
+    telemetry.register_mcp(
+        mcp_id=mcp_id,
+        provider_name=provider_name,
+        transport=transport,
+        command=command,
+        args=args,
+        url=url,
+        active=active
+    )
+
+    bridge = sys.modules.get('bridge') or sys.modules.get('__main__')
+    if bridge and hasattr(bridge, 'reload_tool_mappings'):
+        bridge.reload_tool_mappings()
+
+    if bridge and hasattr(bridge, 'mcp_remote_clients') and hasattr(bridge, 'mcp_processes'):
+        if transport == "sse" and url:
+            if provider_name in bridge.mcp_remote_clients:
+                try:
+                    await bridge.mcp_remote_clients[provider_name].stop()
+                except:
+                    pass
+            client = bridge.RemoteSseMcpClient(provider_name, url)
+            bridge.mcp_remote_clients[provider_name] = client
+            asyncio.create_task(client.start())
+        elif transport == "stdio" and command:
+            if provider_name in bridge.mcp_processes:
+                try:
+                    bridge.mcp_processes[provider_name].terminate()
+                except:
+                    pass
+            try:
+                base_safe_keys = {
+                    "SystemRoot", "SystemDrive", "TEMP", "TMP", "PATH", "PATHEXT", 
+                    "COMSPEC", "USERNAME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", 
+                    "PROGRAMFILES", "PROGRAMFILES(X86)", "COMMONPROGRAMFILES", 
+                    "COMPUTERNAME", "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_IDENTIFIER", 
+                    "PROCESSOR_LEVEL", "PROCESSOR_REVISION", "ALLUSERSPROFILE", "PUBLIC", 
+                    "HOMEDRIVE", "HOMEPATH"
+                }
+                provider_env = {}
+                for k in base_safe_keys:
+                    if k in os.environ:
+                        provider_env[k] = os.environ[k]
+                spiffe_cfg = bridge.get_spiffe_config()
+                provider_env["SPIFFE_ENABLED"] = "true" if spiffe_cfg["enabled"] else "false"
+                provider_env["RUNTIME_ROLE"] = bridge.DEFAULT_ROLE
+                provider_env["PROVIDER_NAME"] = provider_name
+                proc = bridge.launch_sandboxed_node(
+                    [command] + args,
+                    cwd=bridge.PROJECT_DIR,
+                    env=provider_env,
+                    allowed_paths=[bridge.WORKSPACE_DIR],
+                    provider_name=provider_name
+                )
+                bridge.mcp_processes[provider_name] = proc
+            except Exception as e:
+                logger.error(f"Failed to start local subprocess: {e}")
+
+    return {"status": "ok", "mcp_id": mcp_id}
+
+@app.delete("/api/registry/mcps/{mcp_id}")
+async def remove_registry(mcp_id: str):
+    import telemetry
+    import sys
+    registry = telemetry.get_mcp_registry()
+    provider_name = None
+    for r in registry:
+        if r.get("mcp_id") == mcp_id:
+            provider_name = r.get("provider_name")
+            break
+            
+    telemetry.delete_mcp(mcp_id)
+
+    bridge = sys.modules.get('bridge') or sys.modules.get('__main__')
+    if bridge and provider_name:
+        if hasattr(bridge, 'mcp_remote_clients') and provider_name in bridge.mcp_remote_clients:
+            try:
+                await bridge.mcp_remote_clients[provider_name].stop()
+                del bridge.mcp_remote_clients[provider_name]
+            except Exception as e:
+                logger.error(f"Error stopping remote client: {e}")
+        if hasattr(bridge, 'mcp_processes') and provider_name in bridge.mcp_processes:
+            try:
+                bridge.mcp_processes[provider_name].terminate()
+                del bridge.mcp_processes[provider_name]
+            except Exception as e:
+                logger.error(f"Error terminating process: {e}")
+
+    return {"status": "ok"}
+
+@app.post("/api/registry/mcps/{provider_name}/sync")
+async def sync_mcp(provider_name: str):
+    import sys
+    bridge = sys.modules.get('bridge') or sys.modules.get('__main__')
+    if bridge and hasattr(bridge, 'mcp_remote_clients'):
+        client = bridge.mcp_remote_clients.get(provider_name)
+        if client:
+            try:
+                await client.sync_tools()
+                return {"status": "ok", "message": f"Successfully synced tools for {provider_name}"}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+    return {"status": "error", "message": f"SSE Client for provider '{provider_name}' is not running or found in gateway memory"}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
@@ -194,6 +320,7 @@ DASHBOARD_HTML = """
         <div class="nav-item" data-view="policy" onclick="switchNav(this)">Policy Engine</div>
         <div class="nav-item" data-view="identity" onclick="switchNav(this)">Identity Mesh</div>
         <div class="nav-item" data-view="risk" onclick="switchNav(this)">Risk Graph</div>
+        <div class="nav-item" data-view="registry" onclick="switchNav(this)">MCP Registry</div>
         
         <div class="recent-label">Recent Sessions</div>
         <div class="recent-item">demo-session (Active)</div>
@@ -301,6 +428,50 @@ DASHBOARD_HTML = """
                 </div>
             </div>
         </div>
+
+        <!-- VIEW: MCP REGISTRY -->
+        <div id="view-registry" class="view-section">
+            <div style="padding: 0 40px 20px; font-size: 0.7rem; color: var(--text-dim); text-transform: uppercase; font-weight: 700; letter-spacing: 1px;">MCP Connections Registry</div>
+            <div style="margin: 0 40px 20px; display: flex; justify-content: flex-end;">
+                <button class="alert-btn" style="background: var(--accent); color: white;" onclick="openAddMcpModal()">+ Register MCP Server</button>
+            </div>
+            
+            <div class="mesh-list" id="registry-list-body">
+                <!-- Dynamically populated registry entries -->
+            </div>
+        </div>
+
+        <!-- Modal for registering new MCP -->
+        <div id="add-mcp-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); z-index:1000; align-items:center; justify-content:center;">
+            <div style="background:var(--sidebar-bg); border:1px solid var(--border); padding:30px; border-radius:12px; width:450px; display:flex; flex-direction:column; gap:15px;">
+                <h3 style="color:#fff; margin-bottom:5px;">Register MCP Server</h3>
+                <div>
+                    <label style="font-size:0.75rem; color:var(--text-dim); display:block; margin-bottom:5px;">Provider Name</label>
+                    <input type="text" id="mcp-provider-name" placeholder="my-remote-mcp" style="width:100%; background:var(--main-bg); border:1px solid var(--border); color:#fff; padding:8px; border-radius:6px; outline:none;">
+                </div>
+                <div>
+                    <label style="font-size:0.75rem; color:var(--text-dim); display:block; margin-bottom:5px;">Transport Type</label>
+                    <select id="mcp-transport" onchange="toggleTransportFields()" style="width:100%; background:var(--main-bg); border:1px solid var(--border); color:#fff; padding:8px; border-radius:6px; outline:none;">
+                        <option value="sse">Remote Network (SSE)</option>
+                        <option value="stdio">Local Command (stdio)</option>
+                    </select>
+                </div>
+                <div id="field-sse">
+                    <label style="font-size:0.75rem; color:var(--text-dim); display:block; margin-bottom:5px;">SSE Endpoint URL</label>
+                    <input type="text" id="mcp-url" placeholder="https://example.com/sse" style="width:100%; background:var(--main-bg); border:1px solid var(--border); color:#fff; padding:8px; border-radius:6px; outline:none;">
+                </div>
+                <div id="field-stdio" style="display:none;">
+                    <label style="font-size:0.75rem; color:var(--text-dim); display:block; margin-bottom:5px;">Executable Command</label>
+                    <input type="text" id="mcp-command" placeholder="node" style="width:100%; background:var(--main-bg); border:1px solid var(--border); color:#fff; padding:8px; border-radius:6px; outline:none; margin-bottom:10px;">
+                    <label style="font-size:0.75rem; color:var(--text-dim); display:block; margin-bottom:5px;">Arguments (Comma-separated)</label>
+                    <input type="text" id="mcp-args" placeholder="./dist/index.js, arg2" style="width:100%; background:var(--main-bg); border:1px solid var(--border); color:#fff; padding:8px; border-radius:6px; outline:none;">
+                </div>
+                <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:10px;">
+                    <button class="alert-btn" style="background:#444; color:#fff;" onclick="closeAddMcpModal()">Cancel</button>
+                    <button class="alert-btn" style="background:var(--green); color:#000;" onclick="submitAddMcp()">Register</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -381,6 +552,132 @@ DASHBOARD_HTML = """
             if (view === 'risk' && riskChart) {
                 setTimeout(() => riskChart.update(), 100);
             }
+            if (view === 'registry') {
+                loadRegistry();
+            }
+        }
+
+        function loadRegistry() {
+            fetch('/api/registry/mcps')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status === 'ok') {
+                        renderRegistry(data.mcps);
+                    }
+                });
+        }
+
+        function renderRegistry(mcps) {
+            const container = document.getElementById('registry-list-body');
+            container.innerHTML = '';
+            mcps.forEach(m => {
+                const item = document.createElement('div');
+                item.className = 'mesh-item';
+                
+                const isSse = m.transport === 'sse';
+                const tagColor = isSse ? 'var(--blue)' : 'var(--green)';
+                const tagText = isSse ? 'Remote Network (SSE)' : 'Local Sandboxed (stdio)';
+                const detailText = isSse ? m.url : `${m.command} ${(m.args || []).join(' ')}`;
+                const statusColor = m.active ? 'var(--green)' : 'var(--red)';
+                const statusText = m.active ? 'Active' : 'Disabled';
+
+                item.innerHTML = `
+                    <div>
+                        <div style="font-weight: 600; font-size: 0.9rem; margin-bottom: 5px; display:flex; align-items:center; gap:8px;">
+                            ${m.provider_name}
+                            <span style="font-size:0.65rem; background:rgba(255,255,255,0.08); padding:2px 6px; border-radius:4px; color:${statusColor}; font-weight:700;">${statusText}</span>
+                        </div>
+                        <div class="spiffe-id" style="font-size:0.8rem; color:var(--text-dim); margin-bottom:5px;">${detailText}</div>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:15px;">
+                        <span class="tag" style="color: ${tagColor}">${tagText}</span>
+                        ${isSse ? `<button class="alert-btn" style="background:#58a6ff; color:#fff; font-size:0.75rem; padding:4px 10px;" onclick="syncRemoteMcp('${m.provider_name}')">Sync Tools</button>` : ''}
+                        <button class="alert-btn" style="background:var(--red); color:#fff; font-size:0.75rem; padding:4px 10px;" onclick="deleteMcp('${m.mcp_id}')">Delete</button>
+                    </div>
+                `;
+                container.appendChild(item);
+            });
+        }
+
+        function syncRemoteMcp(name) {
+            fetch(`/api/registry/mcps/${name}/sync`, { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    alert(data.message || data.status);
+                })
+                .catch(err => alert('Sync failed: ' + err));
+        }
+
+        function deleteMcp(id) {
+            if (confirm('Are you sure you want to unregister this MCP server?')) {
+                fetch(`/api/registry/mcps/${id}`, { method: 'DELETE' })
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.status === 'ok') {
+                            loadRegistry();
+                        }
+                    });
+            }
+        }
+
+        function openAddMcpModal() {
+            document.getElementById('add-mcp-modal').style.display = 'flex';
+        }
+
+        function closeAddMcpModal() {
+            document.getElementById('add-mcp-modal').style.display = 'none';
+        }
+
+        function toggleTransportFields() {
+            const transport = document.getElementById('mcp-transport').value;
+            if (transport === 'sse') {
+                document.getElementById('field-sse').style.display = 'block';
+                document.getElementById('field-stdio').style.display = 'none';
+            } else {
+                document.getElementById('field-sse').style.display = 'none';
+                document.getElementById('field-stdio').style.display = 'block';
+            }
+        }
+
+        function submitAddMcp() {
+            const nameField = document.getElementById('mcp-provider-name');
+            const provider_name = nameField.value.trim();
+            const transport = document.getElementById('mcp-transport').value;
+            const url = document.getElementById('mcp-url').value;
+            const command = document.getElementById('mcp-command').value;
+            const argsRaw = document.getElementById('mcp-args').value;
+            
+            const payload = {
+                provider_name: provider_name,
+                transport: transport,
+                active: 1
+            };
+            if (transport === 'sse') {
+                payload.url = url;
+            } else {
+                payload.command = command;
+                payload.args = argsRaw ? argsRaw.split(',').map(x => x.trim()) : [];
+            }
+
+            fetch('/api/registry/mcps', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.status === 'ok') {
+                    closeAddMcpModal();
+                    loadRegistry();
+                    document.getElementById('mcp-provider-name').value = '';
+                    document.getElementById('mcp-url').value = '';
+                    document.getElementById('mcp-command').value = '';
+                    document.getElementById('mcp-args').value = '';
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            })
+            .catch(err => alert('Failed to register: ' + err));
         }
 
         function updateRiskUI() {

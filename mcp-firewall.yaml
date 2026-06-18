@@ -161,6 +161,27 @@ rules:
     message: "Governance: Jailed database operations permitted."
     zone: production
 
+  # 8. Allow admin to query active connections
+  - name: allow-admin-active-connections
+    tool: "GetActiveConnections"
+    match:
+      arguments:
+        role: "admin"
+    action: allow
+    message: "Security: Admin authorized to read diagnostic active connections."
+
+  # 9. Block other roles from querying active connections
+  - name: deny-user-active-connections
+    tool: "GetActiveConnections"
+    action: deny
+    message: "Security Violation: Non-admin role cannot view host active connections."
+
+  # 10. Allow general scanner/monitor tools for standard operations
+  - name: allow-general-diagnostics
+    tool: "ScanDependencies|ScanSecrets|GetSystemMetrics"
+    action: allow
+    message: "Governance: General diagnostic scans permitted."
+
 # Threat Feed Integration
 threat_feed:
   enabled: true
@@ -209,4 +230,22 @@ mcp_servers:
       - name: "GetCurrentUser"
         scope: "tool:keycloak_read"
       - name: "GetUserTransactions"
+        scope: "tool:keycloak_read"
+
+  scanner-provider:
+    command: "python"
+    args: ["-u", "./scanner_mcp.py"]
+    tools:
+      - name: "ScanDependencies"
+        scope: "tool:keycloak_read"
+      - name: "ScanSecrets"
+        scope: "tool:keycloak_read"
+
+  system-monitor-provider:
+    command: "python"
+    args: ["-u", "./system_monitor_mcp.py"]
+    tools:
+      - name: "GetSystemMetrics"
+        scope: "tool:keycloak_read"
+      - name: "GetActiveConnections"
         scope: "tool:keycloak_read"

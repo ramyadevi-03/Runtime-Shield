@@ -407,9 +407,10 @@ CRITICAL FORMATTING RULES:
     if not model_name_to_use.startswith("openai/"):
         model_name_to_use = f"openai/{model_name_to_use}"
 
+    shield_api_url = os.getenv("SHIELD_API_URL", "http://127.0.0.1:5001/v1")
     llm = ChatLiteLLM(
         model=model_name_to_use,
-        api_base="http://127.0.0.1:5001/v1",
+        api_base=shield_api_url,
         api_key=token,
         custom_llm_provider="openai",
         model_kwargs={"extra_headers": extra_headers},
@@ -444,7 +445,7 @@ CRITICAL FORMATTING RULES:
             print("🚨 Damn Vulnerable LLM Agent - LiteLLM Error Details", file=sys.stderr)
             print("==================================================", file=sys.stderr)
             print(f"Model Name       : {fetch_model_config()}", file=sys.stderr)
-            print(f"Base URL         : http://127.0.0.1:5001/v1", file=sys.stderr)
+            print(f"Base URL         : {shield_api_url}", file=sys.stderr)
             print(f"Keycloak Token   : {'Present (len=' + str(len(os.getenv('KEYCLOAK_TOKEN', ''))) + ')' if os.getenv('KEYCLOAK_TOKEN') else 'Missing'}", file=sys.stderr)
             print(f"Nvidia Key       : {'Present (len=' + str(len(os.getenv('NVIDIA_API_KEY', ''))) + ')' if os.getenv('NVIDIA_API_KEY') else 'Missing'}", file=sys.stderr)
             print(f"OpenAI Key       : {'Present (len=' + str(len(os.getenv('OPENAI_API_KEY', ''))) + ')' if os.getenv('OPENAI_API_KEY') else 'Missing'}", file=sys.stderr)

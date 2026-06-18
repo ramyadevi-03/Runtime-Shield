@@ -244,6 +244,87 @@ class TelemetryEventBus:
         self._stop_event.set()
         self._writer_thread.join(timeout=5)
 
+    def register_mcp(self, mcp_id: str, provider_name: str, transport: str, command: str = None, args: list = None, url: str = None, active: int = 1):
+        import json
+        import time
+        args_str = json.dumps(args or [])
+        now = time.time()
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO mcp_registry (mcp_id, provider_name, transport, command, args, url, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(mcp_id) DO UPDATE SET
+                    provider_name = excluded.provider_name,
+                    transport = excluded.transport,
+                    command = excluded.command,
+                    args = excluded.args,
+                    url = excluded.url,
+                    active = excluded.active,
+                    updated_at = excluded.updated_at
+            ''', (mcp_id, provider_name, transport, command, args_str, url, active, now, now))
+            conn.commit()
+
+    def get_mcp_registry(self) -> List[Dict[str, Any]]:
+        try:
+            with self._get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT * FROM mcp_registry')
+                result = []
+                for row in cursor.fetchall():
+                    d = dict(row)
+                    if d.get("args"):
+                        try:
+                            d["args"] = json.loads(d["args"])
+                        except:
+                            d["args"] = []
+                    else:
+                        d["args"] = []
+                    result.append(d)
+                return result
+        except Exception as e:
+            logger.error(f"Error reading MCP registry: {e}")
+            return []
+
+    def delete_mcp(self, mcp_id: str):
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT provider_name FROM mcp_registry WHERE mcp_id = ?', (mcp_id,))
+            row = cursor.fetchone()
+            if row:
+                provider_name = row[0]
+                cursor.execute('DELETE FROM mcp_registry_tools WHERE provider_name = ?', (provider_name,))
+            cursor.execute('DELETE FROM mcp_registry WHERE mcp_id = ?', (mcp_id,))
+            conn.commit()
+
+    def sync_mcp_tools(self, provider_name: str, tools_list: List[Dict[str, Any]]):
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM mcp_registry_tools WHERE provider_name = ?', (provider_name,))
+            for t in tools_list:
+                tool_name = t.get("name")
+                scope = t.get("scope")
+                role = t.get("required_role") or t.get("role") or "user"
+                cursor.execute('''
+                    INSERT INTO mcp_registry_tools (tool_name, provider_name, scope, required_role)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(tool_name) DO UPDATE SET
+                        provider_name = excluded.provider_name,
+                        scope = excluded.scope,
+                        required_role = excluded.required_role
+                ''', (tool_name, provider_name, scope, role))
+            conn.commit()
+
+    def get_registered_tools(self) -> List[Dict[str, Any]]:
+        try:
+            with self._get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT * FROM mcp_registry_tools')
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error reading registered tools: {e}")
+            return []
+
 # Singleton instance for the system
 bus = TelemetryEventBus()
 
@@ -261,3 +342,19 @@ def get_timeline(session_id: str):
 
 def get_analytics():
     return bus.get_analytics()
+
+def register_mcp(**kwargs):
+    bus.register_mcp(**kwargs)
+
+def get_mcp_registry():
+    return bus.get_mcp_registry()
+
+def delete_mcp(mcp_id: str):
+    bus.delete_mcp(mcp_id)
+
+def sync_mcp_tools(provider_name: str, tools_list: list):
+    bus.sync_mcp_tools(provider_name, tools_list)
+
+def get_registered_tools():
+    return bus.get_registered_tools()
+

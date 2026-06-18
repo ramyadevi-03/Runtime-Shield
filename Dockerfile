@@ -6,7 +6,7 @@ COPY src/ ./src/
 RUN npm ci && npm run build
 
 # --- Stage 2: Unified Gateway Runner ---
-FROM python:3.9-slim
+FROM python:3.11-slim
 WORKDIR /app
 
 # Install Node.js runtime and utilities

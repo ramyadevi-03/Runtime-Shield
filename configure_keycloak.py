@@ -90,6 +90,93 @@ def update_user(token: str, username: str, password: str):
         print(f"[ERROR] Failed to update password for '{username}': {r.status_code} {r.text}")
 
 
+def configure_client_scopes(token: str):
+    """Ensure required tool:* scopes exist and are associated as optional client scopes for the client."""
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    
+    # 1. Get the client UUID for CLIENT_ID (e.g. admin-cli)
+    clients_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients?clientId={CLIENT_ID}"
+    try:
+        r = requests.get(clients_url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            print(f"[ERROR] Failed to get client metadata: {r.status_code} {r.text}")
+            return
+        clients = r.json()
+        if not clients:
+            print(f"[ERROR] Client '{CLIENT_ID}' not found in realm '{REALM}'")
+            return
+        client_uuid = clients[0]["id"]
+        print(f"[INFO] Found client '{CLIENT_ID}' with UUID '{client_uuid}'")
+    except Exception as e:
+        print(f"[ERROR] Exception while retrieving client UUID: {e}")
+        return
+
+    # 2. Get existing client scopes
+    scopes_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/client-scopes"
+    try:
+        r = requests.get(scopes_url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            print(f"[ERROR] Failed to list client scopes: {r.status_code} {r.text}")
+            return
+        existing_scopes = {s["name"]: s["id"] for s in r.json() if "name" in s}
+    except Exception as e:
+        print(f"[ERROR] Exception while listing client scopes: {e}")
+        return
+
+    # 3. Scopes we want to configure
+    required_scopes = [
+        "tool:read_file",
+        "tool:write_file",
+        "tool:list_directory",
+        "tool:keycloak_read",
+        "tool:keycloak_admin",
+        "tool:keycloak_report",
+        "tool:admin_internal"
+    ]
+
+    for scope_name in required_scopes:
+        if scope_name in existing_scopes:
+            scope_uuid = existing_scopes[scope_name]
+            print(f"[INFO] Client scope '{scope_name}' already exists (UUID: {scope_uuid})")
+        else:
+            # Create the scope
+            create_scope_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/client-scopes"
+            scope_data = {
+                "name": scope_name,
+                "protocol": "openid-connect",
+                "attributes": {
+                    "display.on.consent.screen": "true",
+                    "consent.screen.text": f"Scope for {scope_name}"
+                }
+            }
+            try:
+                r = requests.post(create_scope_url, json=scope_data, headers=headers, timeout=10)
+                if r.status_code == 201:
+                    print(f"[OK] Created client scope '{scope_name}'")
+                    # Fetch scopes again to get the new UUID
+                    r_list = requests.get(scopes_url, headers=headers, timeout=10)
+                    existing_scopes = {s["name"]: s["id"] for s in r_list.json() if "name" in s}
+                    scope_uuid = existing_scopes.get(scope_name)
+                else:
+                    print(f"[ERROR] Failed to create client scope '{scope_name}': {r.status_code} {r.text}")
+                    continue
+            except Exception as e:
+                print(f"[ERROR] Exception while creating scope '{scope_name}': {e}")
+                continue
+
+        # 4. Associate client scope with the client as an optional client scope
+        if scope_uuid:
+            assoc_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{client_uuid}/optional-client-scopes/{scope_uuid}"
+            try:
+                r = requests.put(assoc_url, headers=headers, timeout=10)
+                if r.status_code in [204, 201, 200]:
+                    print(f"[OK] Associated scope '{scope_name}' as optional for client '{CLIENT_ID}'")
+                else:
+                    print(f"[ERROR] Failed to associate scope '{scope_name}': {r.status_code} {r.text}")
+            except Exception as e:
+                print(f"[ERROR] Exception while associating scope '{scope_name}': {e}")
+
+
 def main():
     print("--- Keycloak Setup Utility ---")
     print(f"  URL:   {KEYCLOAK_URL}")
@@ -101,6 +188,9 @@ def main():
     if not token:
         print("[ERROR] Could not acquire admin token. Aborting setup.")
         sys.exit(1)
+
+    # Configure the client scopes
+    configure_client_scopes(token)
 
     # Set passwords for the configured realm users from environment
     # KEYCLOAK_USER_PASSWORD must be defined or this will abort.

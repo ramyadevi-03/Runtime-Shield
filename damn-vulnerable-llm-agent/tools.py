@@ -6,6 +6,7 @@ import sys
 import json
 from langchain.agents import Tool
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from shield_sdk import ShieldStub
 

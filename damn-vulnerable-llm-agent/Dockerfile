@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
 
 RUN pip install python-dotenv
 
-COPY * /app/
+COPY . /app/
 RUN pip3 install -r requirements.txt
 
 COPY config.toml /root/.streamlit/config.toml

@@ -152,7 +152,11 @@ else:
                     st.success("Successfully authenticated!")
                     st.rerun()
                 else:
-                    st.error("Authentication failed: invalid credentials.")
+                    try:
+                        err_detail = r.json().get("error_description") or r.json().get("error") or r.text
+                    except Exception:
+                        err_detail = r.text
+                    st.error(f"Authentication failed ({r.status_code}): {err_detail}")
             except Exception as e:
                 st.error(f"Error connecting to Keycloak: {e}")
 

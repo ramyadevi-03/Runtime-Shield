@@ -77,6 +77,7 @@ services:
       - SPIRE_AGENT_SOCKET=/run/spire/sockets/agent.sock
       - SPIFFE_SVID_PATH=/app/spire/certs/bridge.crt
       - SPIFFE_BUNDLE_PATH=/app/spire/certs/ca.crt
+      - SPIFFE_HEADER_ONLY_FALLBACK=true
       - NVIDIA_API_KEY=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
       - NIM_BASE_URL=https://integrate.api.nvidia.com/v1
     volumes:

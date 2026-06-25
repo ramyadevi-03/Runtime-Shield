@@ -10,7 +10,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./keycloak_data:/opt/keycloak/data
+      - keycloak-data:/opt/keycloak/data
     networks:
       - shield-net
     restart: always
@@ -118,6 +118,7 @@ services:
 
 
 volumes:
+  keycloak-data:
   spire-server-data:
   spire-agent-data:
   spire-agent-socket:

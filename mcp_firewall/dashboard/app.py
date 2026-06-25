@@ -527,7 +527,7 @@ DASHBOARD_HTML = """
             const step = Math.max(1, Math.floor(history.length / 10));
             
             history.forEach((e, idx) => {
-                if (e.action === 'deny') runningInfractions++;
+                if (e.action === 'deny' || e.action === 'block') runningInfractions++;
                 if (idx % step === 0 || idx === history.length - 1) {
                     points.push(Math.min(100, runningInfractions * 25));
                     const d = new Date(e.timestamp * 1000);
@@ -720,7 +720,7 @@ DASHBOARD_HTML = """
             events.forEach(e => {
                 const act = (e.action || 'allow').toLowerCase();
                 if (act === 'allow') localStats.allowed++;
-                else if (act === 'deny') localStats.denied++;
+                else if (act === 'deny' || act === 'block') localStats.denied++;
                 else if (act === 'redact') localStats.redacted++;
             });
 
@@ -741,8 +741,11 @@ DASHBOARD_HTML = """
             
             document.getElementById('risk-drift').innerText = finalDrift + '%';
             
-            // Extract categories for "Suspicious Patterns" (Only count DENY events with AI Category 'S')
-            const patterns = events.filter(e => (e.action || '').toLowerCase() === 'deny' && e.reason && e.reason.includes('S')).length;
+            // Extract categories for "Suspicious Patterns" (Only count DENY/BLOCK events with AI Category 'S')
+            const patterns = events.filter(e => {
+                const act = (e.action || '').toLowerCase();
+                return (act === 'deny' || act === 'block') && e.reason && e.reason.includes('S');
+            }).length;
             document.getElementById('risk-patterns').innerText = patterns;
 
             // Calculate dynamic risk score based on denied requests (each deny event adds 25 risk points, max 100)

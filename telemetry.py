@@ -128,7 +128,7 @@ class TelemetryEventBus:
                 ))
 
                 # 2. Update Tenant Metrics
-                is_blocked = 1 if event["action"] == "deny" else 0
+                is_blocked = 1 if event["action"] in ("deny", "block") else 0
                 is_redacted = 1 if event["action"] == "redact" else 0
                 
                 cursor.execute('''
@@ -171,20 +171,34 @@ class TelemetryEventBus:
                 cursor = conn.cursor()
                 metrics = {}
                 cursor.execute('SELECT COUNT(*) FROM telemetry_events')
-                metrics["total_requests"] = cursor.fetchone()[0]
-                cursor.execute('SELECT COUNT(*) FROM telemetry_events WHERE action = "deny"')
-                metrics["blocked_requests"] = cursor.fetchone()[0]
+                total = cursor.fetchone()[0]
+                cursor.execute('SELECT COUNT(*) FROM telemetry_events WHERE action = "deny" OR action = "block"')
+                blocked = cursor.fetchone()[0]
                 cursor.execute('SELECT COUNT(*) FROM telemetry_events WHERE action = "allow"')
-                metrics["allowed_requests"] = cursor.fetchone()[0]
+                allowed = cursor.fetchone()[0]
                 cursor.execute('SELECT COUNT(*) FROM telemetry_events WHERE action = "redact"')
-                metrics["redacted_requests"] = cursor.fetchone()[0]
+                redacted = cursor.fetchone()[0]
                 cursor.execute('SELECT COUNT(*) FROM telemetry_events WHERE severity = "critical"')
-                metrics["high_risk_events"] = cursor.fetchone()[0]
+                high_risk = cursor.fetchone()[0]
                 cursor.execute('SELECT COUNT(*) FROM tenant_registry WHERE status = "online"')
-                metrics["active_tenants"] = cursor.fetchone()[0]
-                return metrics
+                active_tenants = cursor.fetchone()[0]
+                
+                return {
+                    "total_requests": total,
+                    "blocked_requests": blocked,
+                    "allowed_requests": allowed,
+                    "redacted_requests": redacted,
+                    "high_risk_events": high_risk,
+                    "active_tenants": active_tenants,
+                    
+                    # Add UI expected keys for frontend stats calculation compatibility
+                    "total": total,
+                    "allowed": allowed,
+                    "denied": blocked,
+                    "redacted": redacted
+                }
         except:
-            return {"total_requests": 0, "blocked_requests": 0, "high_risk_events": 0, "active_tenants": 0}
+            return {"total_requests": 0, "blocked_requests": 0, "high_risk_events": 0, "active_tenants": 0, "total": 0, "allowed": 0, "denied": 0, "redacted": 0}
 
     def get_timeline(self, session_id: str) -> List[Dict[str, Any]]:
         """Reconstruct an incident timeline for a session."""
@@ -201,7 +215,7 @@ class TelemetryEventBus:
         try:
             with self._get_conn() as conn:
                 cursor = conn.cursor()
-                cursor.execute('SELECT tool, COUNT(*) as count FROM telemetry_events WHERE action = "deny" GROUP BY tool ORDER BY count DESC LIMIT 5')
+                cursor.execute('SELECT tool, COUNT(*) as count FROM telemetry_events WHERE action = "deny" OR action = "block" GROUP BY tool ORDER BY count DESC LIMIT 5')
                 top_denied = [dict(row) for row in cursor.fetchall()]
                 
                 cursor.execute('SELECT strftime("%H:%M", datetime(timestamp, "unixepoch")) as minute, COUNT(*) as count FROM telemetry_events WHERE timestamp > ? GROUP BY minute ORDER BY minute ASC', (time.time() - 3600,))
@@ -210,11 +224,11 @@ class TelemetryEventBus:
                 # Distribution of decisions by Engine
                 cursor.execute('SELECT engine, COUNT(*) as count FROM telemetry_events GROUP BY engine')
                 engines = [dict(row) for row in cursor.fetchall()]
-
+ 
                 # Distribution by Severity
                 cursor.execute('SELECT severity, COUNT(*) as count FROM telemetry_events GROUP BY severity')
                 risk = [dict(row) for row in cursor.fetchall()]
-
+ 
                 # Top Personas
                 cursor.execute('SELECT role, COUNT(*) as count FROM telemetry_events GROUP BY role ORDER BY count DESC LIMIT 5')
                 personas = [dict(row) for row in cursor.fetchall()]

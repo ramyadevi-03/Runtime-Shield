@@ -2179,6 +2179,12 @@ def verify_svid_cryptographically(spiffe_id: str, cert_pem: str | None = None) -
     Falls back to allowlist-only check when no cert is provided (offline mode).
     """
     if not cert_pem:
+        fallback_allowed = os.getenv("SPIFFE_HEADER_ONLY_FALLBACK", "false").lower() == "true"
+        if fallback_allowed:
+            if spiffe_allowed(spiffe_id):
+                return {"valid": True, "reason": f"SVID verified via header-only fallback: {spiffe_id}"}
+            else:
+                return {"valid": False, "reason": f"Header-only fallback rejected: '{spiffe_id}' is not in allowlist"}
         return {"valid": False, "reason": "Security Violation: SPIFFE SVID certificate is required. Header-only fallback is disabled."}
 
     try:

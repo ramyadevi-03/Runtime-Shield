@@ -74,6 +74,7 @@ services:
       - SPIFFE_ENABLED=true
       - SPIFFE_BRIDGE_ID=spiffe://runtime-shield/bridge
       - SPIFFE_SERVER_ID=spiffe://runtime-shield/secure-runtime-shield
+      - ALLOWED_SPIFFE_IDS=spiffe://runtime-shield/agent,spiffe://runtime-shield/dashboard,spiffe://runtime-shield/bridge,spiffe://runtime-shield/secure-runtime-shield,spiffe://runtime-shield/llm-agent
       - SPIRE_AGENT_SOCKET=/run/spire/sockets/agent.sock
       - SPIFFE_SVID_PATH=/app/spire/certs/bridge.crt
       - SPIFFE_BUNDLE_PATH=/app/spire/certs/ca.crt

@@ -7,6 +7,7 @@ services:
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: kavss
+      KC_PROXY_HEADERS: xforwarded
     ports:
       - "8080:8080"
     volumes:

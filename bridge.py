@@ -3124,7 +3124,7 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             formatted = format_final_answer(text)
             return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
 
-    fallback_text = "I am a secure financial ReAct assistant. I can fetch your bank transactions or read allowed project files. Try asking me: 'What are my recent bank transactions?'"
+    fallback_text = "I am a secure financial React assistant. I can fetch your bank transactions or read allowed project files. Try asking me: 'What are my recent bank transactions?'"
     formatted = format_final_answer(fallback_text)
     return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
 

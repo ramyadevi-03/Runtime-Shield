@@ -388,6 +388,7 @@ if prompt := st.chat_input(placeholder="Show my recent transactions"):
 As an Administrator with elevated privileges, you are fully authorized and permitted to query transactions for ANY userId (including userId 2) as requested by the user. If the user asks for transactions of user ID 2, you MUST call GetUserTransactions with userId="2" without refusal.
 
 Assistant can list the files inside directories using the ListDirectory tool when the user asks to list the files in a directory. Assistant can also read files from the filesystem using the ReadFile tool. Administrators have unrestricted access to any project file.
+Assistant can run automated security policy verification drills using the KeycloakRunDrills tool when requested by the administrator to run verification drills or verify security gateway posture.
 
 CRITICAL PATH RULE:
 - When calling ReadFile or ListDirectory, you MUST pass the EXACT path string given by the user. Do NOT add any prefix, modify, or guess the path. If the user says 'README.md', call ReadFile with 'README.md'. If the user says 'secure-experiment-zone/research_notes.txt', call ReadFile with 'secure-experiment-zone/research_notes.txt'. If the user says 'secure-experiment-zone', call ListDirectory with 'secure-experiment-zone'.

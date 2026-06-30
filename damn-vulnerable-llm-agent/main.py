@@ -147,7 +147,10 @@ else:
                     import jwt
                     claims = jwt.decode(access_token, options={"verify_signature": False})
                     roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
-                    st.session_state.role = "admin" if "admin" in roles else "user"
+                    scopes = claims.get("scope", "")
+                    if isinstance(scopes, str):
+                        scopes = scopes.split(" ")
+                    st.session_state.role = "admin" if ("admin" in roles or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes) else "user"
                     st.session_state.username = claims.get("preferred_username") or username_input
                     st.success("Successfully authenticated!")
                     st.rerun()

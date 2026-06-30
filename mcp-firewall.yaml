@@ -222,6 +222,8 @@ mcp_servers:
         scope: "tool:keycloak_report"
       - name: "keycloak_quarantine_user"
         scope: "tool:keycloak_admin"
+      - name: "keycloak_run_drills"
+        scope: "tool:keycloak_report"
 
   database-provider:
     command: "python"

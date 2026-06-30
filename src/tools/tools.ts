@@ -276,15 +276,37 @@ export function registerTools(server: any) {
 
       const proposedRules = discoveries.map(d => d.proposed_rule).join("\n\n");
 
+      const proposedTests = discoveries.map((d, index) => {
+        const cleanedArgs = JSON.stringify(d.args);
+        return `- category: "Auto-discovered Verification"\n  name: "Verify allowed access to ${d.tool} (Case ${index + 1})"\n  tool: "${d.tool}"\n  args: ${cleanedArgs}\n  expect_blocked: false`;
+      }).join("\n\n");
+
       const output = [
         "### 🧠 Proposed Firewall Rules",
         "Review and add these to your `mcp-firewall.yaml` rules section:",
         "```yaml",
         proposedRules,
+        "```",
+        "",
+        "### 🧪 Generated Test Cases",
+        "Add these to your programmatic verification drills or policy tests baseline:",
+        "```yaml",
+        proposedTests,
         "```"
       ].join("\n");
 
       return { content: [{ type: "text", text: output }] };
+    }
+  );
+
+  /* -----------------------------
+     RUN SECURITY DRILLS
+  ----------------------------- */
+  server.tool(
+    "keycloak_run_drills",
+    {},
+    async () => {
+      return { content: [{ type: "text", text: "Policy verification is handled by the Python bridge runtime." }] };
     }
   );
 

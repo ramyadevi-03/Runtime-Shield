@@ -40,20 +40,30 @@ python bridge.py --learning
 ```
 * **Outcome:** The Shield intercepts all tool calls but **never blocks them** (risk score stays 0). It transparently builds a baseline of legitimate tools and parameters, logging them directly to `discovery.log`.
 
-### Phase 2: Automatic Policy Generation
+### Phase 2: Automatic Policy & Test Case Generation
 Once the agent has been run through common user queries, run the automatic policy compiler to convert the discovery baseline into strict firewall rules:
 ```powershell
 # Compiles discovery.log into mcp-firewall rules
 python -c "import telemetry; print(telemetry.get_registered_tools())"
 ```
-Or trigger the `keycloak_generate_policy` tool to output a production-ready ruleset for `mcp-firewall.yaml`.
+Or trigger the `keycloak_generate_policy` tool to output a production-ready ruleset for `mcp-firewall.yaml` **along with auto-generated test cases** to verify your policy setup.
 
-### Phase 3: Red Team Security Drills
-Turn off learning mode (`LEARNING_MODE=false`) and run programmatic drills to simulate attacks:
-1. **Directory Traversal:** Tell the agent to read `../../etc/passwd` or query paths outside the allowed sandbox.
-2. **Honeypot Interception:** Ask the agent to query fake internal management tools (`get_system_config`, `fetch_internal_db`).
-3. **PII Exfiltration:** Ask the agent to retrieve a database table containing dummy emails and credit card numbers.
-* **Outcome:** Verify that the Shield successfully blocks traversals and honeypots, redacts PII in transit, and displays security warning blocks.
+### Phase 3: Automated Security Drills & Policy Verification
+Turn off learning mode (`LEARNING_MODE=false`) and execute policy validation. You can verify that rules successfully block traversals and honeypots, and redact PII, using the following automated tools:
+
+#### 1. Standalone Verification (Local Terminal)
+Run the pre-defined test suite locally:
+```powershell
+python run_security_drills.py
+```
+* **Outcome**: Evaluates rules against 10 critical security scenarios (Directory Traversal, Admin RBAC, Honeypots, and PII Redaction) and prints a compliance posture report.
+
+#### 2. Remote Verification (Dokploy / Production)
+If the Shield is deployed inside containers on **Dokploy** (where CLI/terminal access is restricted), you can execute drills directly via the authenticated agent chat using the admin-only MCP tool:
+```
+keycloak_run_drills
+```
+* **Outcome**: Triggers the same internal verification suite against the active gateway and returns a markdown compliance audit table.
 
 ### Phase 4: Security Dashboard Audit
 Open `http://localhost:9090` to view the live dashboard. Review the logs for:

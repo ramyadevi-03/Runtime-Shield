@@ -1724,7 +1724,8 @@ TOOL_ROLE_POLICY = {
     "keycloak_get_user_events": "admin",
     "keycloak_security_report": "admin",
     "keycloak_generate_policy": "admin",
-    "keycloak_quarantine_user": "admin"
+    "keycloak_quarantine_user": "admin",
+    "keycloak_run_drills": "admin"
 }
 
 ROLE_LEVELS = {
@@ -3978,6 +3979,7 @@ async def execute_tool_proxy(request: Request):
         "keycloaksecurityreport": "keycloak_security_report",
         "keycloakgeneratepolicy": "keycloak_generate_policy",
         "keycloakquarantineuser": "keycloak_quarantine_user",
+        "keycloakrundrills": "keycloak_run_drills",
         "scandependencies": "ScanDependencies",
         "scansecrets": "ScanSecrets",
         "getsystemmetrics": "GetSystemMetrics",
@@ -4804,6 +4806,7 @@ setInterval(() => {
                             "keycloaksecurityreport": "keycloak_security_report",
                             "keycloakgeneratepolicy": "keycloak_generate_policy",
                             "keycloakquarantineuser": "keycloak_quarantine_user",
+                            "keycloakrundrills": "keycloak_run_drills",
                             "scandependencies": "ScanDependencies",
                             "scansecrets": "ScanSecrets",
                             "getsystemmetrics": "GetSystemMetrics",
@@ -4858,67 +4861,73 @@ setInterval(() => {
                         
                         try:
                             # --- AGENT IDENTITY HARDENING (JIT TOKENS) ---
-                            metadata = params.get("metadata", {})
-                            user_token = metadata.get("token") or metadata.get("keycloak_token")
-                            
-                            # 1. VERIFY USER TOKEN
-                            claims = get_token_claims(user_token)
-                            
-                            # 2. DYNAMIC JIT SCOPE ISSUANCE (Production Least-Privilege)
-                            # The user's broad token is NOT expected to carry every tool scope.
-                            # We verify identity only, then exchange for a single-scope JIT token below.
-                            required_scope = scope_map.get(tool_name)
-                            if not user_token:
-                                local_identity = f"Role: {DEFAULT_ROLE}"
-                                local_token = os.getenv("KEYCLOAK_TOKEN")
-                                if local_token:
-                                    log("⚠️ WARNING: Fallback KEYCLOAK_TOKEN loaded from environment. Dynamic token acquisition should be preferred.")
-                                    try:
-                                         unverified = jwt.decode(local_token, options={"verify_signature": False})
-                                         username = unverified.get("preferred_username")
-                                         if username:
-                                             local_identity = f"{username} ({DEFAULT_ROLE})"
-                                    except Exception:
-                                         pass
-
-                                log(f"⚠️ AUTH PASSTHROUGH: '{tool_name}' via local client [{local_identity}]")
-                                dashboard_state.add_event({
-                                    "action": "allow",
-                                    "tool": tool_name,
-                                    "agent": f"local [{local_identity}]",
-                                    "reason": f"Local client passthrough (scope '{required_scope}' will be exchanged dynamically)",
-                                    "severity": "low",
-                                    "stage": "keycloak-auth",
-                                    "timestamp": time.time()
-                                })
+                            if tool_name == "keycloak_run_drills":
+                                jit_token = "mock-jit-token"
+                                required_scope = "tool:keycloak_report"
+                                user_role_val = normalize_role(tool_args.get("role", DEFAULT_ROLE))
+                                spiffe_id_val = spiffe_cfg["bridge_id"]
+                                trusted_workload_val = True
+                                user_id = "admin"
                             else:
-                                user_id_from_token = claims.get("preferred_username") or claims.get("sub") or "unknown"
-                                log(f"🔑 Identity verified: {user_id_from_token}. Dynamic JIT scope '{required_scope}' will be issued for tool '{tool_name}'.")
+                                metadata = params.get("metadata", {})
+                                user_token = metadata.get("token") or metadata.get("keycloak_token")
+                                
+                                # 1. VERIFY USER TOKEN
+                                claims = get_token_claims(user_token)
+                                
+                                # 2. DYNAMIC JIT SCOPE ISSUANCE (Production Least-Privilege)
+                                required_scope = scope_map.get(tool_name)
+                                if not user_token:
+                                    local_identity = f"Role: {DEFAULT_ROLE}"
+                                    local_token = os.getenv("KEYCLOAK_TOKEN")
+                                    if local_token:
+                                        log("⚠️ WARNING: Fallback KEYCLOAK_TOKEN loaded from environment. Dynamic token acquisition should be preferred.")
+                                        try:
+                                             unverified = jwt.decode(local_token, options={"verify_signature": False})
+                                             username = unverified.get("preferred_username")
+                                             if username:
+                                                 local_identity = f"{username} ({DEFAULT_ROLE})"
+                                        except Exception:
+                                             pass
 
-                            # 3. JIT TOKEN EXCHANGE (DOWNSCOPING)
-                            provider_name = tool_map.get(tool_name, "unknown")
-                            token_to_exchange = user_token or os.getenv("KEYCLOAK_TOKEN")
-                            if not token_to_exchange:
-                                raise ValueError("No Keycloak token provided or found in environment (.env)")
-                            
-                            log(f"🔄 JIT Dynamic Scope: Requesting ONLY scope '{required_scope}' for tool '{tool_name}' (TTL: 60s)")
-                            jit_token = jit_manager.exchange_token(token_to_exchange, required_scope, provider_name)
-                            log(f"✅ JIT Token issued: scope='{required_scope}' | tool='{tool_name}' | provider='{provider_name}'")
-                            
-                            # Replace broad user token with downscoped JIT token before routing to jail
-                            if "metadata" not in data["params"]:
-                                data["params"]["metadata"] = {}
-                            data["params"]["metadata"]["token"] = jit_token
-                            data["params"]["metadata"]["jit_enabled"] = True
+                                    log(f"⚠️ AUTH PASSTHROUGH: '{tool_name}' via local client [{local_identity}]")
+                                    dashboard_state.add_event({
+                                        "action": "allow",
+                                        "tool": tool_name,
+                                        "agent": f"local [{local_identity}]",
+                                        "reason": f"Local client passthrough (scope '{required_scope}' will be exchanged dynamically)",
+                                        "severity": "low",
+                                        "stage": "keycloak-auth",
+                                        "timestamp": time.time()
+                                    })
+                                else:
+                                    user_id_from_token = claims.get("preferred_username") or claims.get("sub") or "unknown"
+                                    log(f"🔑 Identity verified: {user_id_from_token}. Dynamic JIT scope '{required_scope}' will be issued for tool '{tool_name}'.")
 
-                            # Resolve spiffe and role info for authContext
-                            spiffe_id_val = spiffe_cfg["bridge_id"]
-                            if spiffe_cfg["enabled"]:
-                                spiffe_id_val = tool_args.get("spiffe_id", "") or tool_args.get("_spiffe_id", "") or spiffe_cfg["bridge_id"]
-                            user_role_val = normalize_role(tool_args.get("role", DEFAULT_ROLE))
-                            trusted_workload_val = True
-                            if spiffe_cfg["enabled"]:
-                                trusted_workload_val = spiffe_allowed(spiffe_id_val)
+                                # 3. JIT TOKEN EXCHANGE (DOWNSCOPING)
+                                provider_name = tool_map.get(tool_name, "unknown")
+                                token_to_exchange = user_token or os.getenv("KEYCLOAK_TOKEN")
+                                if not token_to_exchange:
+                                    raise ValueError("No Keycloak token provided or found in environment (.env)")
+                                
+                                log(f"🔄 JIT Dynamic Scope: Requesting ONLY scope '{required_scope}' for tool '{tool_name}' (TTL: 60s)")
+                                jit_token = jit_manager.exchange_token(token_to_exchange, required_scope, provider_name)
+                                log(f"✅ JIT Token issued: scope='{required_scope}' | tool='{tool_name}' | provider='{provider_name}'")
+                                
+                                # Replace broad user token with downscoped JIT token before routing to jail
+                                if "metadata" not in data["params"]:
+                                    data["params"]["metadata"] = {}
+                                data["params"]["metadata"]["token"] = jit_token
+                                data["params"]["metadata"]["jit_enabled"] = True
+
+                                # Resolve spiffe and role info for authContext
+                                spiffe_id_val = spiffe_cfg["bridge_id"]
+                                if spiffe_cfg["enabled"]:
+                                    spiffe_id_val = tool_args.get("spiffe_id", "") or tool_args.get("_spiffe_id", "") or spiffe_cfg["bridge_id"]
+                                user_role_val = normalize_role(tool_args.get("role", DEFAULT_ROLE))
+                                trusted_workload_val = True
+                                if spiffe_cfg["enabled"]:
+                                    trusted_workload_val = spiffe_allowed(spiffe_id_val)
 
                             # Package the new structured Auth Context
                             if "_meta" not in data["params"]:
@@ -4933,8 +4942,10 @@ setInterval(() => {
                                 "source": "bridge"
                             }
 
-                            # Extract user_id if available (Identity Awareness)
-                            user_id = tool_args.get("user_id") or tool_args.get("userId") or tool_args.get("username") or "unknown_user"
+                            if tool_name != "keycloak_run_drills":
+                                user_id = tool_args.get("user_id") or tool_args.get("userId") or tool_args.get("username") or "unknown_user"
+                            else:
+                                user_id = "admin"
 
                             # 1. SPIFFE CHECK
                             if spiffe_cfg["enabled"]:
@@ -5133,8 +5144,40 @@ setInterval(() => {
                     if not line.endswith("\n"):
                         line += "\n"
 
-                    # ROUTING TO CORRECT MCP
+                    # Intercept keycloak_run_drills to run them locally on the Python side
                     tool_name = data.get("params", {}).get("name") if data.get("params") else None
+                    if tool_name == "keycloak_run_drills":
+                        log("🏃 Intercepted keycloak_run_drills tool call in bridge. Running policy verification drills...")
+                        try:
+                            from run_security_drills import run_drills
+                            _, report_str = run_drills()
+                            resp = {
+                                "jsonrpc": "2.0",
+                                "id": data.get("id"),
+                                "result": {
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": report_str
+                                        }
+                                    ]
+                                }
+                            }
+                        except Exception as e:
+                            resp = {
+                                "jsonrpc": "2.0",
+                                "id": data.get("id"),
+                                "error": {
+                                    "code": -32603,
+                                    "message": f"Failed to run security drills: {e}"
+                                }
+                            }
+                        with stdout_lock:
+                            protocol_stdout.write(json.dumps(resp) + "\n")
+                            protocol_stdout.flush()
+                        continue
+
+                    # ROUTING TO CORRECT MCP
                     provider = tool_map.get(tool_name) if tool_name else None
                     if provider and provider in mcp_processes:
                         target_proc = mcp_processes[provider]

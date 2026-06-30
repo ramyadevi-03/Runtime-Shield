@@ -4090,7 +4090,10 @@ async def execute_tool_proxy(request: Request):
             user_sub = claims.get("sub") or ""
             log(f"JWT SUB inside tool execute: {user_sub}")
             roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
-            user_role = "admin" if "admin" in roles else "user"
+            scopes = claims.get("scope", "")
+            if isinstance(scopes, str):
+                scopes = scopes.split(" ")
+            user_role = "admin" if ("admin" in roles or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes) else "user"
         except Exception as e:
             log(f"⚠️ Tool REST Proxy failed to decode JWT token: {e}")
 

@@ -2731,7 +2731,7 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
         elif name == "KeycloakRevokeUserSessions" or (role == "tool" and name == "KeycloakRevokeUserSessions"):
             keycloak_revoke_called = True
             keycloak_revoke_output = content
-        elif name == "KeycloakRunDrills" or (role == "tool" and name == "KeycloakRunDrills"):
+        elif name in ("KeycloakRunDrills", "keycloak_run_drills", "keycloakrundrills") or (role == "tool" and name in ("KeycloakRunDrills", "keycloak_run_drills", "keycloakrundrills")):
             keycloak_run_drills_called = True
             keycloak_run_drills_output = content
 
@@ -2787,7 +2787,7 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
                     keycloak_revoke_called = True
                     subparts = parts[1].split("USER'S INPUT")
                     keycloak_revoke_output = subparts[0].strip().lstrip("-").strip()
-            elif "KeycloakRunDrills" in content:
+            elif "KeycloakRunDrills" in content or "Compliance Report" in content or "traversal" in content:
                 parts = content.split("TOOL RESPONSE:")
                 if len(parts) > 1:
                     keycloak_run_drills_called = True

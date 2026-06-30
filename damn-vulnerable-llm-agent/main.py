@@ -10,7 +10,7 @@ from langchain.memory.chat_message_histories import StreamlitChatMessageHistory
 from langchain.agents import initialize_agent
 from langchain.callbacks import get_openai_callback
 
-from tools import get_current_user_tool, get_recent_transactions_tool, read_file_tool, list_directory_tool, keycloak_list_users_tool, keycloak_revoke_user_sessions_tool
+from tools import get_current_user_tool, get_recent_transactions_tool, read_file_tool, list_directory_tool, keycloak_list_users_tool, keycloak_revoke_user_sessions_tool, keycloak_run_drills_tool
 from utils import display_instructions, display_logo, fetch_model_config
 from spiffe_integration import fetch_svid
 
@@ -34,7 +34,7 @@ class SecureStreamlitCallbackHandler(StreamlitCallbackHandler):
         pass
 
 # Initialise tools
-tools = [get_current_user_tool, get_recent_transactions_tool, read_file_tool, list_directory_tool, keycloak_list_users_tool, keycloak_revoke_user_sessions_tool]
+tools = [get_current_user_tool, get_recent_transactions_tool, read_file_tool, list_directory_tool, keycloak_list_users_tool, keycloak_revoke_user_sessions_tool, keycloak_run_drills_tool]
 
 system_msg = """Assistant helps the current user retrieve the list of their recent bank transactions and shows them as a table. Assistant will ONLY operate on the userId returned by the GetCurrentUser() tool, and REFUSE to operate on any other userId provided by the user.
 
@@ -281,7 +281,7 @@ if prompt := st.chat_input(placeholder="Show my recent transactions"):
             pass
 
     # Create Dynamic Tool instances bound explicitly to the request context
-    from tools import get_current_user, get_transactions, read_file_with_policy, list_directory_with_policy, keycloak_list_users_with_policy, keycloak_revoke_user_sessions_with_policy
+    from tools import get_current_user, get_transactions, read_file_with_policy, list_directory_with_policy, keycloak_list_users_with_policy, keycloak_revoke_user_sessions_with_policy, keycloak_run_drills_with_policy
     from langchain.agents import Tool
     
     tools = [
@@ -364,6 +364,19 @@ if prompt := st.chat_input(placeholder="Show my recent transactions"):
                 "Revokes and logs out all active Keycloak sessions for the specified username. "
                 "Only accessible by administrators."
             )
+        ),
+        Tool(
+            name='KeycloakRunDrills',
+            func=lambda input="": keycloak_run_drills_with_policy(
+                sso_token=token,
+                spiffe_id=spiffe_svid.get("spiffe_id"),
+                cert_pem=spiffe_svid.get("cert_pem")
+            ),
+            description=(
+                "Executes automated policy verification drills to check that the security gateway "
+                "correctly handles security rules (Directory Traversal, PII Redaction, RBAC, and Honeypots). "
+                "Only available to administrators."
+            )
         )
     ]
     
@@ -383,7 +396,7 @@ CRITICAL DISPLAY RULE:
 - If you read a file containing CSV, comma-separated, or tabular data (like financial_data.csv), you MUST format and display all of its content as a clean Markdown table in your final response.
 
 CRITICAL TOOL CALL RULE:
-- You MUST ONLY call the tools explicitly provided: GetCurrentUser, GetUserTransactions, ReadFile, ListDirectory, KeycloakListUsers, KeycloakRevokeUserSessions. Do NOT hallucinate or attempt to call any other tool name under any circumstances.
+- You MUST ONLY call the tools explicitly provided: GetCurrentUser, GetUserTransactions, ReadFile, ListDirectory, KeycloakListUsers, KeycloakRevokeUserSessions, KeycloakRunDrills. Do NOT hallucinate or attempt to call any other tool name under any circumstances.
 - For listing files inside a directory like secure-experiment-zone, call ListDirectory with action_input="secure-experiment-zone".
 
 CRITICAL FORMATTING RULES:

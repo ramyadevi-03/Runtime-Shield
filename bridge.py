@@ -2706,6 +2706,9 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
     keycloak_revoke_called = False
     keycloak_revoke_output = None
 
+    keycloak_run_drills_called = False
+    keycloak_run_drills_output = None
+
     # 1. Direct tool/role parsing from JSON-RPC or tool results in messages
     for msg in current_turn_messages:
         role = msg.get("role")
@@ -2728,6 +2731,9 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
         elif name == "KeycloakRevokeUserSessions" or (role == "tool" and name == "KeycloakRevokeUserSessions"):
             keycloak_revoke_called = True
             keycloak_revoke_output = content
+        elif name == "KeycloakRunDrills" or (role == "tool" and name == "KeycloakRunDrills"):
+            keycloak_run_drills_called = True
+            keycloak_run_drills_output = content
 
     # 2. Assistant-User pair ReAct parsing fallback (robust against formatting shifts)
     for i, msg in enumerate(current_turn_messages):
@@ -2762,6 +2768,8 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
                 keycloak_list_called = True
             elif '"action": "KeycloakRevokeUserSessions"' in content:
                 keycloak_revoke_called = True
+            elif '"action": "KeycloakRunDrills"' in content:
+                keycloak_run_drills_called = True
 
     # 3. Text fallbacks for legacy/general formatted inputs
     for msg in current_turn_messages:
@@ -2779,6 +2787,12 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
                     keycloak_revoke_called = True
                     subparts = parts[1].split("USER'S INPUT")
                     keycloak_revoke_output = subparts[0].strip().lstrip("-").strip()
+            elif "KeycloakRunDrills" in content:
+                parts = content.split("TOOL RESPONSE:")
+                if len(parts) > 1:
+                    keycloak_run_drills_called = True
+                    subparts = parts[1].split("USER'S INPUT")
+                    keycloak_run_drills_output = subparts[0].strip().lstrip("-").strip()
             elif "ListDirectory" in content or "list_directory" in content:
                 parts = content.split("TOOL RESPONSE:")
                 if len(parts) > 1:
@@ -2820,6 +2834,7 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
     is_banking_query = get_user_called or get_trans_called
     is_keycloak_list_query = keycloak_list_called
     is_keycloak_revoke_query = keycloak_revoke_called
+    is_keycloak_run_drills_query = keycloak_run_drills_called
     is_greeting = False
     
     # 1. Deterministic intent parsing (always computed first for Zero-Trust auditing)
@@ -2888,6 +2903,8 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             is_keycloak_list_query = True
         elif intent == "KeycloakRevokeUserSessions":
             is_keycloak_revoke_query = True
+        elif intent == "KeycloakRunDrills":
+            is_keycloak_run_drills_query = True
         elif intent == "Greet":
             is_greeting = True
     else:
@@ -2904,6 +2921,8 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             is_keycloak_list_query = True
         elif any(w in raw_query_lower for w in ["revoke", "session", "logout"]):
             is_keycloak_revoke_query = True
+        elif any(w in raw_query_lower for w in ["drill", "verification", "compliance", "audit"]) or "verify security" in raw_query_lower:
+            is_keycloak_run_drills_query = True
         elif det_greet:
             is_greeting = True
 
@@ -3122,6 +3141,28 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
                 text = f"Blocked by Security Gateway: {tool_output}"
             else:
                 text = f"Result of session revocation:\n\n{tool_output}"
+            formatted = format_final_answer(text)
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+
+    if is_keycloak_run_drills_query:
+        if not keycloak_run_drills_called:
+            dashboard_state.add_event({
+                "action": "allow",
+                "tool": "KeycloakRunDrills",
+                "agent": "mock-llm-agent",
+                "reason": "Agent requested execution of policy verification drills",
+                "severity": "low",
+                "stage": "agent-reasoning",
+                "timestamp": time.time()
+            })
+            formatted = format_action("KeycloakRunDrills", "")
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+        else:
+            tool_output = keycloak_run_drills_output or ""
+            if "Security Violation:" in tool_output or "Access Denied" in tool_output:
+                text = f"Blocked by Security Gateway: {tool_output}"
+            else:
+                text = f"Compliance Report:\n\n{tool_output}"
             formatted = format_final_answer(text)
             return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
 

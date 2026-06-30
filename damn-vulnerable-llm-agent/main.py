@@ -278,7 +278,10 @@ if prompt := st.chat_input(placeholder="Show my recent transactions"):
             claims = jwt.decode(token, options={"verify_signature": False})
             keycloak_sub = claims.get("sub") or ""
             roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
-            role = "admin" if "admin" in roles else "user"
+            scopes = claims.get("scope", "")
+            if isinstance(scopes, str):
+                scopes = scopes.split(" ")
+            role = "admin" if ("admin" in roles or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes) else "user"
             debug_mode = False
         except Exception:
             pass

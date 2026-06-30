@@ -93,8 +93,37 @@ class KeycloakSession:
         return r
 
 
-def update_user(session: KeycloakSession, username: str, password: str):
-    """Create or update a user's password in the configured realm."""
+def assign_realm_role(session: KeycloakSession, user_id: str, role_name: str):
+    """Ensure the realm role exists and is assigned to the user."""
+    role_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/roles/{role_name}"
+    try:
+        r = session.request("GET", role_url, timeout=10)
+        if r.status_code != 200:
+            # Create the role first if it doesn't exist
+            create_role_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/roles"
+            session.request("POST", create_role_url, json={"name": role_name}, timeout=10)
+            r = session.request("GET", role_url, timeout=10)
+            if r.status_code != 200:
+                print(f"[ERROR] Failed to create or retrieve role '{role_name}'")
+                return
+        role_data = r.json()
+        
+        mapping_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/users/{user_id}/role-mappings/realm"
+        mapping_data = [{
+            "id": role_data["id"],
+            "name": role_name
+        }]
+        r = session.request("POST", mapping_url, json=mapping_data, timeout=10)
+        if r.status_code in [200, 204]:
+            print(f"[OK] Assigned role '{role_name}' to user ID '{user_id}'")
+        else:
+            print(f"[ERROR] Failed to map role '{role_name}': {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"[ERROR] Exception mapping role '{role_name}': {e}")
+
+
+def update_user(session: KeycloakSession, username: str, password: str, role_name: str = None):
+    """Create or update a user's password in the configured realm and map roles."""
     url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/users?username={username}"
     try:
         r = session.request("GET", url, timeout=10)
@@ -120,9 +149,15 @@ def update_user(session: KeycloakSession, username: str, password: str):
             r = session.request("POST", create_url, json=user_data, timeout=10)
             if r.status_code == 201:
                 print(f"[OK] Created user '{username}'")
+                # Retrieve the newly created user's ID
+                r_get = session.request("GET", url, timeout=10)
+                if r_get.status_code == 200 and r_get.json():
+                    user_id = r_get.json()[0]["id"]
+                else:
+                    return
             else:
                 print(f"[ERROR] Failed to create user '{username}': {r.status_code} {r.text}")
-            return
+                return
 
         pass_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/users/{user_id}/reset-password"
         pass_data = {"type": "password", "value": password, "temporary": False}
@@ -131,6 +166,10 @@ def update_user(session: KeycloakSession, username: str, password: str):
             print(f"[OK] Password updated for '{username}'")
         else:
             print(f"[ERROR] Failed to update password for '{username}': {r.status_code} {r.text}")
+
+        # Map role if specified
+        if role_name:
+            assign_realm_role(session, user_id, role_name)
     except Exception as e:
         print(f"[ERROR] Exception during user update for '{username}': {e}")
 
@@ -243,8 +282,8 @@ def main():
         print("[ERROR] KEYCLOAK_USER_PASSWORD is not set in .env — skipping user password updates.")
         sys.exit(1)
 
-    update_user(session, "admin", ADMIN_PASS)
-    update_user(session, "user", user_pass)
+    update_user(session, "admin", ADMIN_PASS, "admin")
+    update_user(session, "user", user_pass, "user")
 
     print("\n[OK] Keycloak setup complete.")
 

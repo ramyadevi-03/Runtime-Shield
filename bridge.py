@@ -4105,6 +4105,51 @@ async def execute_tool_proxy(request: Request):
             if user_id == "anonymous_user":
                 user_id = "admin"
 
+    # Intercept keycloak_run_drills to run them locally on the Python side
+    if tool_name == "keycloak_run_drills":
+        if user_role != "admin":
+            reason = f"Role violation: {user_role} cannot use {tool_name}"
+            log(f"🚫 Role violation: {reason}")
+            dashboard_state.add_event({
+                "action": "block",
+                "tool": tool_name,
+                "agent": spiffe_id,
+                "reason": reason,
+                "severity": "high",
+                "stage": "role-policy",
+                "timestamp": time.time()
+            })
+            return JSONResponse(status_code=403, content={"error": "Tool blocked due to insufficient role"})
+            
+        log("🏃 Intercepted keycloak_run_drills tool call in REST proxy. Running drills...")
+        dashboard_state.add_event({
+            "action": "allow",
+            "tool": tool_name,
+            "agent": spiffe_id,
+            "reason": "Authorized execution of verification drills via REST proxy",
+            "severity": "info",
+            "stage": "role-policy",
+            "timestamp": time.time()
+        })
+        try:
+            from run_security_drills import run_drills
+            _, report_str = run_drills()
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": report_str
+                        }
+                    ]
+                }
+            }
+            return JSONResponse(content=resp)
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": f"Failed to run security drills: {e}"})
+
     # 3. SPIFFE WORKLOAD IDENTITY ENFORCEMENT
     spiffe_cfg = get_spiffe_config()
     spiffe_id = "chatbot"  # default identity

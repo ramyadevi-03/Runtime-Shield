@@ -132,12 +132,12 @@ def keycloak_revoke_user_sessions_with_policy(username: str = "", userId: str = 
     except Exception as e:
         return f"Security Violation: {e}"
 
-def keycloak_run_drills_with_policy(sso_token: str = None, spiffe_id: str = None, cert_pem: str = None) -> str:
+def keycloak_run_drills_with_policy(role: str = "user", sso_token: str = None, spiffe_id: str = None, cert_pem: str = None) -> str:
     """
     Executes automated policy verification drills via the Shield Bridge proxy.
     """
     try:
-        args = {}
+        args = {"role": role}
         resp = shield.call_tool(
             tool_name="keycloak_run_drills",
             args=args,

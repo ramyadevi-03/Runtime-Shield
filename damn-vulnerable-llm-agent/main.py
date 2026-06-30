@@ -371,6 +371,7 @@ if prompt := st.chat_input(placeholder="Show my recent transactions"):
         Tool(
             name='KeycloakRunDrills',
             func=lambda input="": keycloak_run_drills_with_policy(
+                role=role,
                 sso_token=token,
                 spiffe_id=spiffe_svid.get("spiffe_id"),
                 cert_pem=spiffe_svid.get("cert_pem")

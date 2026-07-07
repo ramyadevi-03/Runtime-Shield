@@ -21,6 +21,7 @@ class DashboardManager:
         self._start_time = time.time()
 
     async def connect(self, websocket: WebSocket):
+        self.loop = asyncio.get_running_loop()
         await websocket.accept()
         self.active_connections.append(websocket)
         stats = telemetry.get_metrics()
@@ -74,21 +75,18 @@ class DashboardState:
 
         # 2. Broadcast to live WebSockets
         try:
-            # We use the existing manager's broadcast logic
-            # Since this is called from the bridge's sync threads, we use the loop
-            # if one is already running, or we just rely on the next poll/connect.
-            import asyncio
-            loop = None
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                pass
-
-            if loop and loop.is_running():
-                loop.create_task(manager.broadcast_event(event))
+            if hasattr(manager, 'loop') and manager.loop and manager.loop.is_running():
+                asyncio.run_coroutine_threadsafe(manager.broadcast_event(event), manager.loop)
             else:
-                # Fallback: the next client that connects will see this in their 'init'
-                pass
+                import asyncio
+                loop = None
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    pass
+
+                if loop and loop.is_running():
+                    loop.create_task(manager.broadcast_event(event))
         except Exception as e:
             logger.error(f"Failed to broadcast live event: {e}")
 

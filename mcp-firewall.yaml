@@ -22,6 +22,7 @@ pii:
   # Entity types to exclude from auto-detection to prevent false-positives (like row IDs flagged as years)
   presidio_exclude_entities:
     - DATE_TIME
+    - URL
 
 nemo_cloud:
   enabled: true
@@ -176,11 +177,130 @@ rules:
     action: deny
     message: "Security Violation: Non-admin role cannot view host active connections."
 
-  # 10. Allow general scanner/monitor tools for standard operations
+  # 10. Allow admin to run ScanDependencies
+  - name: allow-admin-scan-dependencies
+    tool: "ScanDependencies"
+    match:
+      arguments:
+        role: "admin"
+    action: allow
+    message: "Admin Access: Authorized dependency scanner active."
+
+  # Block other roles from ScanDependencies
+  - name: deny-user-scan-dependencies
+    tool: "ScanDependencies"
+    action: deny
+    message: "Security Violation: Non-admin role cannot run ScanDependencies."
+
+  # Allow general scanner/monitor tools for standard operations
   - name: allow-general-diagnostics
-    tool: "ScanDependencies|ScanSecrets|GetSystemMetrics"
+    tool: "ScanSecrets|GetSystemMetrics"
     action: allow
     message: "Governance: General diagnostic scans permitted."
+
+  # ── Vulnerable MCP Challenge Rules ──────────────────────────────────────────
+
+  # VulnChallenge-1: Block path traversal from the vulnerable filesystem MCP
+  - name: block-vuln-fs-traversal
+    tool: "vuln_read_file"
+    match:
+      arguments:
+        path: "**/../**"
+    action: deny
+    message: "🛡️ Shield Block [Lab 1]: Directory traversal attack detected! Path escape via '../' is denied by Runtime Shield Policy Firewall."
+    priority: critical
+
+  # VulnChallenge-1b: Block access to absolute/OS sensitive paths
+  - name: block-vuln-fs-absolute
+    tool: "vuln_read_file"
+    match:
+      arguments:
+        path: "/etc/**"
+    action: deny
+    message: "🛡️ Shield Block [Lab 1]: Absolute path to OS directory detected and denied by Runtime Shield."
+    priority: critical
+
+  # VulnChallenge-1c: Allow only safe paths through the vulnerable filesystem
+  - name: block-vuln-fs-all-default
+    tool: "vuln_read_file"
+    action: deny
+    message: "🛡️ Shield Block [Lab 1]: Unauthorized file path. Vulnerable filesystem MCP access is blocked by Runtime Shield policy."
+    priority: high
+
+  # VulnChallenge-2: Block eval code injection attempts via get_qotd format parameter
+  - name: block-eval-injection-process
+    tool: "vuln_get_qotd"
+    match:
+      arguments:
+        format: "**process**"
+    action: deny
+    message: "🛡️ Shield Block [Lab 2]: eval() code injection payload detected! 'process' object access via format parameter is denied by Runtime Shield."
+    priority: critical
+
+  - name: block-eval-injection-require
+    tool: "vuln_get_qotd"
+    match:
+      arguments:
+        format: "**require**"
+    action: deny
+    message: "🛡️ Shield Block [Lab 2]: eval() code injection payload detected! 'require()' access via format parameter is denied by Runtime Shield."
+    priority: critical
+
+  - name: block-eval-injection-constructor
+    tool: "vuln_get_qotd"
+    match:
+      arguments:
+        format: "**constructor**"
+    action: deny
+    message: "🛡️ Shield Block [Lab 2]: eval() code injection payload detected! Prototype chain exploit via 'constructor' is denied by Runtime Shield."
+    priority: critical
+
+  # VulnChallenge-3: Block server IP leakage tool for all standard users
+  - name: block-ip-leakage
+    tool: "vuln_get_current_ip"
+    action: deny
+    message: "🛡️ Shield Block [Lab 3]: Server IP/infrastructure disclosure denied by Runtime Shield. This tool exposes sensitive server metadata."
+    priority: high
+
+  # VulnChallenge-4: Block run_diagnostic command injection (semicolons / pipes)
+  - name: block-cmd-injection-semicolon
+    tool: "vuln_run_diagnostic"
+    match:
+      arguments:
+        operation: "**;**"
+    action: deny
+    message: "🛡️ Shield Block [Lab 4]: Command injection payload detected! Shell metacharacter ';' in diagnostic operation is denied by Runtime Shield."
+    priority: critical
+
+  - name: block-cmd-injection-pipe
+    tool: "vuln_run_diagnostic"
+    match:
+      arguments:
+        operation: "**|**"
+    action: deny
+    message: "🛡️ Shield Block [Lab 4]: Command injection payload detected! Shell metacharacter '|' in diagnostic operation is denied by Runtime Shield."
+    priority: critical
+
+  - name: block-cmd-injection-backtick
+    tool: "vuln_run_diagnostic"
+    match:
+      arguments:
+        operation: "**`**"
+    action: deny
+    message: "🛡️ Shield Block [Lab 4]: Command injection payload detected! Backtick subshell in diagnostic operation is denied by Runtime Shield."
+    priority: critical
+
+  # Allow safe diagnostic operations through
+  - name: allow-safe-diagnostic
+    tool: "vuln_run_diagnostic"
+    action: allow
+    message: "Governance: Safe diagnostic operation forwarded to vulnerable MCP."
+
+  # VulnChallenge-4b: Allow Atlassian status (demonstrates prompt injection in response)
+  - name: allow-atlassian-status
+    tool: "vuln_get_atlassian_status"
+    action: allow
+    message: "Governance: Atlassian status tool allowed (demonstrates prompt injection in tool response)."
 
 # Threat Feed Integration
 threat_feed:

@@ -258,7 +258,8 @@ for idx, msg in enumerate(msgs.messages):
             with st.status(f"**{step[0].tool}**: {step[0].tool_input}", state="complete"):
                 st.write(step[0].log)
                 st.write(step[1])
-        if "Security Violation Detected" in msg.content or msg.content.startswith("An error occurred:"):
+        is_shield_block = any(term in msg.content for term in ["Security Violation", "Blocked by", "RBAC", "rbac_violation", "security_violation"]) or msg.content.startswith("An error occurred:")
+        if is_shield_block:
             st.error(msg.content)
         else:
             st.write(msg.content)
@@ -457,7 +458,12 @@ CRITICAL FORMATTING RULES:
         st_cb = SecureStreamlitCallbackHandler(st.container(), expand_new_thoughts=False)
         try:
             response = executor(prompt, callbacks=[st_cb])
-            st.write(response["output"])
+            output_text = response["output"]
+            is_shield_block = any(term in output_text for term in ["Security Violation", "Blocked by", "RBAC", "rbac_violation", "security_violation"])
+            if is_shield_block:
+                st.error(output_text)
+            else:
+                st.write(output_text)
             st.session_state.steps[str(len(msgs.messages) - 1)] = response["intermediate_steps"]
         except Exception as e:
             import traceback

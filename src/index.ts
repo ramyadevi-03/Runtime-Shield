@@ -88,7 +88,11 @@ function applyNodeRuntimeContainment() {
 
 // applyNodeRuntimeContainment() will be called in main() after attestation
 
-const mandatoryVars = ["KEYCLOAK_URL", "KEYCLOAK_REALM", "KEYCLOAK_CLIENT_ID", "KEYCLOAK_CLIENT_SECRET"];
+const provider = process.env.PROVIDER_NAME || "unknown";
+const mandatoryVars = ["KEYCLOAK_URL", "KEYCLOAK_REALM"];
+if (provider === "keycloak-provider") {
+    mandatoryVars.push("KEYCLOAK_CLIENT_ID", "KEYCLOAK_CLIENT_SECRET");
+}
 const missingVars = mandatoryVars.filter(v => !process.env[v]);
 if (missingVars.length > 0) {
     console.error(`❌ Fatal Startup Error: Keycloak configuration is incomplete. Missing environment variables: ${missingVars.join(", ")}`);
@@ -203,11 +207,12 @@ function wrapToolsWithJitVerification(serverInstance: any) {
         }
       }
 
+      if (process.env.LOCAL_DEV_MODE === "true") {
+        console.error(`⚠️ [JIT Security Gateway] LOCAL DEV BYPASS: LOCAL_DEV_MODE=true. Bypassing JIT token verification for '${toolName}'.`);
+        return await originalHandler(args, extra);
+      }
+
       if (!token) {
-        if (process.env.LOCAL_DEV_MODE === "true") {
-          console.error(`⚠️ [JIT Security Gateway] LOCAL DEV BYPASS: No token provided for '${toolName}'. Bypassing validation.`);
-          return await originalHandler(args, extra);
-        }
         console.error(`❌ [JIT Security Gateway] DENIED: No JIT token found in metadata for tool '${toolName}'`);
         throw new Error(`Unauthorized: No JIT token found in metadata for tool '${toolName}'`);
       }

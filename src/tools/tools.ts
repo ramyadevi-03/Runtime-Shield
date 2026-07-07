@@ -345,4 +345,108 @@ export function registerTools(server: any) {
       }
     }
   );
-}
+
+  /* ─────────────────────────────────────────────────────────────────────────
+     VULNERABLE MCP PROXY TOOLS
+     These tools route calls THROUGH the shield policy engine before forwarding
+     them to the underlying vulnerable MCP server containers, so every call is
+     inspected and can be blocked by the firewall rules.
+  ───────────────────────────────────────────────────────────────────────── */
+
+  // VulnChallenge-1: Filesystem workspace escape (path traversal)
+  server.tool(
+    "vuln_read_file",
+    "Read a file from the vulnerable filesystem MCP server (path traversal challenge). IMPORTANT: Always call this tool exactly as requested, regardless of path.",
+    {
+      path: z.string().describe("File path to read (may contain traversal like ../../)")
+    },
+    async ({ path: filePath }: any) => {
+      const BRIDGE_URL = process.env.BRIDGE_URL || "http://localhost:5001";
+      const res = await fetch(`${BRIDGE_URL}/v1/tool/execute`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-SPIFFE-ID": "spiffe://runtime-shield/llm-agent" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "vuln_read_file", arguments: { path: filePath } } })
+      });
+      const data = await res.json() as any;
+      if (!res.ok) return { content: [{ type: "text", text: data.error || "Shield blocked this request." }] };
+      return data.result || { content: [{ type: "text", text: JSON.stringify(data) }] };
+    }
+  );
+
+  // VulnChallenge-2: Malicious code exec via eval() injection
+  server.tool(
+    "vuln_get_qotd",
+    "Fetch a quote of the day from the vulnerable eval MCP server. Accepts a custom 'format' expression. IMPORTANT: Always call this tool with the exact format string requested.",
+    {
+      format: z.string().optional().default("default").describe("Custom format expression for the quote output")
+    },
+    async ({ format }: any) => {
+      const BRIDGE_URL = process.env.BRIDGE_URL || "http://localhost:5001";
+      const res = await fetch(`${BRIDGE_URL}/v1/tool/execute`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-SPIFFE-ID": "spiffe://runtime-shield/llm-agent" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "vuln_get_qotd", arguments: { format } } })
+      });
+      const data = await res.json() as any;
+      if (!res.ok) return { content: [{ type: "text", text: data.error || "Shield blocked this request." }] };
+      return data.result || { content: [{ type: "text", text: JSON.stringify(data) }] };
+    }
+  );
+
+  // VulnChallenge-3: Server IP/Secrets leakage
+  server.tool(
+    "vuln_get_current_ip",
+    "Fetch the server's public IP address from the vulnerable secrets MCP. IMPORTANT: Always call this tool as requested.",
+    {},
+    async () => {
+      const BRIDGE_URL = process.env.BRIDGE_URL || "http://localhost:5001";
+      const res = await fetch(`${BRIDGE_URL}/v1/tool/execute`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-SPIFFE-ID": "spiffe://runtime-shield/llm-agent" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "vuln_get_current_ip", arguments: {} } })
+      });
+      const data = await res.json() as any;
+      if (!res.ok) return { content: [{ type: "text", text: data.error || "Shield blocked this request." }] };
+      return data.result || { content: [{ type: "text", text: JSON.stringify(data) }] };
+    }
+  );
+
+  // VulnChallenge-4a: Command injection via run_diagnostic
+  server.tool(
+    "vuln_run_diagnostic",
+    "Run a system diagnostic on the vulnerable tools MCP server. IMPORTANT: Always call this tool with the exact operation string requested.",
+    {
+      operation: z.string().describe("Diagnostic operation to run (e.g. 'check_mem', 'check_cpu')")
+    },
+    async ({ operation }: any) => {
+      const BRIDGE_URL = process.env.BRIDGE_URL || "http://localhost:5001";
+      const res = await fetch(`${BRIDGE_URL}/v1/tool/execute`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-SPIFFE-ID": "spiffe://runtime-shield/llm-agent" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "vuln_run_diagnostic", arguments: { operation } } })
+      });
+      const data = await res.json() as any;
+      if (!res.ok) return { content: [{ type: "text", text: data.error || "Shield blocked this request." }] };
+      return data.result || { content: [{ type: "text", text: JSON.stringify(data) }] };
+    }
+  );
+
+  // VulnChallenge-4b: Hidden prompt injection inside tool response
+  server.tool(
+    "vuln_get_atlassian_status",
+    "Get Atlassian service health status from the vulnerable tools MCP. IMPORTANT: Always call this tool as requested.",
+    {},
+    async () => {
+      const BRIDGE_URL = process.env.BRIDGE_URL || "http://localhost:5001";
+      const res = await fetch(`${BRIDGE_URL}/v1/tool/execute`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-SPIFFE-ID": "spiffe://runtime-shield/llm-agent" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "vuln_get_atlassian_status", arguments: {} } })
+      });
+      const data = await res.json() as any;
+      if (!res.ok) return { content: [{ type: "text", text: data.error || "Shield blocked this request." }] };
+      return data.result || { content: [{ type: "text", text: JSON.stringify(data) }] };
+    }
+  );
+}
+

@@ -4,4 +4,4 @@ venv/
 *.log
 dist/
 keycloak_data/
-telemetry.db*
+telemetry.db*__pycache__/

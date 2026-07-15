@@ -48,6 +48,22 @@ semantic_parser_instance = None
 
 import telemetry
 
+# ── Governance Memory Layer ──────────────────────────────────────────────────
+try:
+    from governance_memory.writer import MemoryWriter
+    from governance_memory.scanner import MemoryScanner
+    from governance_memory.consolidator import MemoryConsolidator
+    memory_writer       = MemoryWriter(base_dir=PROJECT_DIR)
+    memory_scanner      = MemoryScanner(base_dir=PROJECT_DIR)
+    memory_consolidator = MemoryConsolidator(base_dir=PROJECT_DIR)
+    memory_consolidator.start()   # 🧠 Start background consolidation daemon
+except Exception as _mem_err:
+    memory_writer       = None
+    memory_scanner      = None
+    memory_consolidator = None
+    print(f"[GovernanceMemory] ⚠️ Memory layer could not be initialized: {_mem_err}", flush=True)
+# ────────────────────────────────────────────────────────────────────────────
+
 mcp_processes = {}
 mcp_remote_clients = {}
 tool_map = {}
@@ -6197,6 +6213,24 @@ setInterval(() => {
                                     protocol_stdout.flush()
                                 continue
 
+                            # ── 🧠 MEMORY SCANNER: Enrich context before firewall check ──
+                            _mem_ctx = None
+                            if memory_scanner:
+                                try:
+                                    _mem_ctx = memory_scanner.scan(
+                                        agent_id=spiffe_id,
+                                        tool_name=tool_name,
+                                        tool_args=tool_args or {},
+                                    )
+                                    if _mem_ctx.known_attack_match:
+                                        log(f"🧠 MEMORY: Known attack pattern — {_mem_ctx.known_attack_match}")
+                                    if _mem_ctx.agent_trust_level in ("suspicious", "high-risk"):
+                                        log(f"🧠 MEMORY: Agent trust level is '{_mem_ctx.agent_trust_level}' "
+                                            f"({_mem_ctx.historical_blocks} lifetime blocks)")
+                                except Exception as _sc_err:
+                                    log(f"[GovernanceMemory] ⚠️ Non-fatal scan error: {_sc_err}")
+                            # ─────────────────────────────────────────────────────────────
+
                             # --- NE-MO NIM CLOUD CHECK ---
                             is_safe_zone = False
                             if tool_args:
@@ -6246,7 +6280,18 @@ setInterval(() => {
 
                             # 3. FIREWALL & FRAUD ENGINE CHECK
                             decision = gw.check(tool_name, tool_args, agent=spiffe_id)
-                            
+
+                            # 🧠 MEMORY BOOST: Pre-seed risk score from historical context
+                            if _mem_ctx and _mem_ctx.base_risk_boost > 0:
+                                with fraud_engine.lock:
+                                    current = fraud_engine.agent_risk_scores.get(spiffe_id, 0)
+                                    # Only boost if memory context adds more than current score
+                                    if _mem_ctx.base_risk_boost > current:
+                                        fraud_engine.agent_risk_scores[spiffe_id] = _mem_ctx.base_risk_boost
+                                        log(f"🧠 MEMORY BOOST: Agent '{spiffe_id}' risk pre-seeded to "
+                                            f"{_mem_ctx.base_risk_boost} (was {current}) | "
+                                            f"Reason: {_mem_ctx.reasoning}")
+
                             # Apply Fraud Detection Engine analysis (with risk deduplication)
                             fraud_blocked, final_action, final_reason, final_severity = fraud_engine.analyze(
                                 agent=spiffe_id,
@@ -6277,6 +6322,30 @@ setInterval(() => {
                                 "stage": decision.stage,
                                 "timestamp": time.time()
                             })
+
+                            # ── 🧠 GOVERNANCE MEMORY: Record every decision to .md files ──
+                            if memory_writer:
+                                try:
+                                    _session_id = data.get("id") or str(id(data))
+                                    _action_val = decision.action.value if hasattr(decision.action, 'value') else str(decision.action)
+                                    _severity_val = decision.severity.value if hasattr(decision.severity, 'value') else str(decision.severity)
+                                    _risk_score = fraud_engine.agent_risk_scores.get(spiffe_id, 0)
+                                    memory_writer.record_decision(
+                                        session_id=_session_id,
+                                        agent_id=spiffe_id,
+                                        user_id=user_id,
+                                        user_role=user_role,
+                                        tool_name=tool_name,
+                                        tool_args=tool_args or {},
+                                        action=_action_val,
+                                        reason=decision.reason,
+                                        severity=_severity_val,
+                                        risk_score=_risk_score,
+                                        memory_context=vars(_mem_ctx) if _mem_ctx else None,
+                                    )
+                                except Exception as _mw_err:
+                                    log(f"[GovernanceMemory] ⚠️ Non-fatal memory write error: {_mw_err}")
+                            # ─────────────────────────────────────────────────────────────
 
                             if decision.blocked and not learning_allowed:
                                 log(f"🚫 Blocked: {decision.reason}")

@@ -55,6 +55,21 @@ manager = DashboardManager()
 
 class DashboardState:
     """Interface for the bridge to push events into the dashboard system."""
+
+    def __init__(self):
+        # Policy engine status — updated by bridge after engine initialisation
+        self.policy_state: Dict[str, Any] = {
+            "active_backend": "yaml",
+            "shadow_backend": "none",
+        }
+
+    def set_policy_status(self, active_backend: str, shadow_backend: str) -> None:
+        """Called by bridge once the policy engines are initialised."""
+        self.policy_state["active_backend"] = (active_backend or "yaml").lower()
+        _sb = (shadow_backend or "").lower()
+        self.policy_state["shadow_backend"] = _sb if _sb not in ["", "false", "off", "none"] else "none"
+        logger.info(f"[PolicyState] active={self.policy_state['active_backend']}  shadow={self.policy_state['shadow_backend']}")
+
     def add_event(self, event: Dict[str, Any]):
         # 1. Log to persistent telemetry (Database)
         try:
@@ -94,6 +109,45 @@ class DashboardState:
 
 # Exported state for bridge.py
 state = DashboardState()
+
+@app.get("/api/policy/status")
+async def get_policy_status():
+    import os
+    import sys
+
+    opa_info = {
+        "opa_reachable": False,
+        "last_sync_status": "N/A",
+        "last_data_hash": "N/A",
+        "last_sync_time": 0.0,
+    }
+    try:
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from src.opa_sync import get_opa_status
+        opa_info = get_opa_status()
+    except Exception as e:
+        logger.warning(f"Could not fetch OPA status: {e}")
+
+    # --- Read from shared DashboardState.policy_state (set by bridge after engine init) ---
+    # Falls back to os.environ if bridge hasn't updated the state yet.
+    active_backend = state.policy_state.get("active_backend") or os.getenv("POLICY_BACKEND", "yaml").lower()
+    shadow_backend = state.policy_state.get("shadow_backend") or "none"
+    if shadow_backend in ["", "false", "off"]:
+        shadow_backend = "none"
+
+    return {
+        "status": "ok",
+        "active_backend": active_backend,
+        "shadow_backend": shadow_backend,
+        "opa_reachable": opa_info.get("opa_reachable", False),
+        "last_sync_status": opa_info.get("last_sync_status", "N/A"),
+        "last_data_hash": opa_info.get("last_data_hash", "N/A"),
+        "last_sync_time": opa_info.get("last_sync_time", 0.0),
+        "source_of_truth": "mcp-firewall.yaml",
+        "enforcement_note": "Dashboard is display-only. Bridge remains the enforcement point."
+    }
 
 @app.get("/")
 async def index():
@@ -418,14 +472,95 @@ DASHBOARD_HTML = """
 
         <!-- VIEW: POLICY ENGINE -->
         <div id="view-policy" class="view-section">
-            <div class="mesh-list">
-                <div class="mesh-item">
-                    <div>
-                        <div style="font-weight: 600; font-size: 0.9rem; margin-bottom: 5px;">active_tenant_rules.yaml</div>
-                        <div style="font-size: 0.75rem; color: var(--text-dim);">Last Synchronized: Just Now</div>
-                    </div>
-                    <div class="tag" style="color: var(--green)">Policy v3.1</div>
+            <div style="padding: 0 40px 15px; display: flex; align-items: center; justify-content: space-between;">
+                <div style="font-size: 0.7rem; color: var(--text-dim); text-transform: uppercase; font-weight: 700; letter-spacing: 1px;">Policy Engine Governance & Parity</div>
+                <div style="font-size: 0.75rem; background: rgba(255,255,255,0.06); padding: 5px 12px; border-radius: 6px; border: 1px solid var(--border); color: var(--text-dim);">
+                    ℹ️ <b style="color: #fff;">Enforcement Note:</b> Dashboard is display-only. Bridge remains the sole enforcement point.
                 </div>
+            </div>
+
+            <!-- Policy Status Cards -->
+            <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; padding: 0 40px 25px;">
+                <!-- 1. Live / Active Backend -->
+                <div class="m-card">
+                    <div class="m-label">LIVE / ACTIVE BACKEND</div>
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 5px;">
+                        <div class="m-value" id="policy-active-backend" style="color: var(--green); text-transform: uppercase;">YAML</div>
+                        <span class="tag" style="color: var(--green); background: rgba(74,222,128,0.1); padding: 4px 8px; border-radius: 4px;">ENFORCING</span>
+                    </div>
+                    <div style="font-size: 0.75rem; color: var(--text-dim); margin-top: 8px;">Actively enforcing policy decisions on tool calls</div>
+                </div>
+
+                <!-- 2. Shadow Backend -->
+                <div class="m-card">
+                    <div class="m-label">SHADOW BACKEND</div>
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 5px;">
+                        <div class="m-value" id="policy-shadow-backend" style="color: #60a5fa; text-transform: uppercase;">NONE</div>
+                        <span class="tag" style="color: #60a5fa; background: rgba(96,165,250,0.1); padding: 4px 8px; border-radius: 4px;">COMPARISON ONLY</span>
+                    </div>
+                    <div style="font-size: 0.75rem; color: var(--text-dim); margin-top: 8px;">Evaluates in parallel without blocking execution</div>
+                </div>
+
+                <!-- 3. OPA Health -->
+                <div class="m-card">
+                    <div class="m-label">OPA HEALTH</div>
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 5px;">
+                        <div class="m-value" id="policy-opa-health" style="color: var(--green); text-transform: uppercase;">REACHABLE</div>
+                        <span id="policy-opa-badge" class="tag" style="color: var(--green);">● HEALTHY</span>
+                    </div>
+                    <div style="font-size: 0.75rem; color: var(--text-dim); margin-top: 8px;">OPA daemon health endpoint status</div>
+                </div>
+
+                <!-- 4. OPA Sync Status -->
+                <div class="m-card">
+                    <div class="m-label">OPA SYNC STATUS</div>
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 5px;">
+                        <div class="m-value" id="policy-sync-status" style="font-size: 1.3rem; color: #fff; text-transform: uppercase;">SUCCESS</div>
+                        <span style="font-family: 'JetBrains Mono'; font-size: 0.75rem; color: var(--accent);" id="policy-hash-val">HASH: -</span>
+                    </div>
+                    <div style="font-size: 0.75rem; color: var(--text-dim); margin-top: 8px;" id="policy-sync-time">Last Sync: N/A</div>
+                </div>
+
+                <!-- 5. Source of Truth -->
+                <div class="m-card">
+                    <div class="m-label">SOURCE OF TRUTH</div>
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 5px;">
+                        <div style="font-family: 'JetBrains Mono'; font-size: 1.1rem; font-weight: 600; color: #fff;">mcp-firewall.yaml</div>
+                        <span class="tag" style="color: var(--accent);">YAML ROOT</span>
+                    </div>
+                    <div style="font-size: 0.75rem; color: var(--text-dim); margin-top: 8px;">Single source of truth for standard rules</div>
+                </div>
+
+                <!-- 6. Shadow Parity Metrics -->
+                <div class="m-card">
+                    <div class="m-label">SHADOW PARITY METRICS</div>
+                    <div style="display: flex; align-items: center; gap: 15px; margin-top: 8px;">
+                        <div><span style="color: var(--green); font-weight: 700; font-size: 1.1rem;" id="shadow-count-match">0</span> <span style="font-size: 0.75rem; color: var(--text-dim);">MATCH</span></div>
+                        <div><span style="color: var(--red); font-weight: 700; font-size: 1.1rem;" id="shadow-count-mismatch">0</span> <span style="font-size: 0.75rem; color: var(--text-dim);">MISMATCH</span></div>
+                        <div><span style="color: var(--orange); font-weight: 700; font-size: 1.1rem;" id="shadow-count-err">0</span> <span style="font-size: 0.75rem; color: var(--text-dim);">ERR</span></div>
+                    </div>
+                    <div style="font-size: 0.75rem; color: var(--text-dim); margin-top: 8px;">Parity check breakdown across engine evaluations</div>
+                </div>
+            </div>
+
+            <!-- Table of Policy Decisions & Shadow Parity -->
+            <div style="padding: 0 40px 10px; font-size: 0.7rem; color: var(--text-dim); text-transform: uppercase; font-weight: 700; letter-spacing: 1px;">Live Policy Evaluation & Shadow Parity Log</div>
+            <div class="feed-container">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th class="th" style="width: 100px;">TIME</th>
+                            <th class="th">TOOL & AGENT</th>
+                            <th class="th">ENFORCED (ACTIVE)</th>
+                            <th class="th">SHADOW EVALUATION</th>
+                            <th class="th">PARITY RESULT</th>
+                            <th class="th">RULE / REASON</th>
+                        </tr>
+                    </thead>
+                    <tbody id="policy-feed-body">
+                        <tr><td class="td" colspan="6" style="color: var(--text-dim); text-align: center; padding: 20px;">No policy events recorded yet.</td></tr>
+                    </tbody>
+                </table>
             </div>
         </div>
 
@@ -554,6 +689,9 @@ DASHBOARD_HTML = """
             }
             if (view === 'registry') {
                 loadRegistry();
+            }
+            if (view === 'policy') {
+                loadPolicyStatus();
             }
         }
 
@@ -753,6 +891,123 @@ DASHBOARD_HTML = """
 
             updateRiskUI();
             updateChartData(events);
+
+            // Update Shadow parity counters & policy table
+            let matchCount = 0, mismatchCount = 0, errCount = 0;
+            events.forEach(e => {
+                if (e.shadow_backend && e.shadow_backend !== 'none') {
+                    if (e.shadow_error) {
+                        errCount++;
+                    } else if (e.shadow_match === true) {
+                        matchCount++;
+                    } else if (e.shadow_match === false) {
+                        mismatchCount++;
+                    }
+                }
+            });
+            const mEl = document.getElementById('shadow-count-match');
+            const mmEl = document.getElementById('shadow-count-mismatch');
+            const errEl = document.getElementById('shadow-count-err');
+            if (mEl) mEl.innerText = matchCount;
+            if (mmEl) mmEl.innerText = mismatchCount;
+            if (errEl) errEl.innerText = errCount;
+
+            renderPolicyFeed(events);
+        }
+
+        function loadPolicyStatus() {
+            fetch('/api/policy/status')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status === 'ok') {
+                        const activeEl = document.getElementById('policy-active-backend');
+                        const shadowEl = document.getElementById('policy-shadow-backend');
+                        const healthEl = document.getElementById('policy-opa-health');
+                        const healthBadge = document.getElementById('policy-opa-badge');
+                        const syncStatusEl = document.getElementById('policy-sync-status');
+                        const hashEl = document.getElementById('policy-hash-val');
+                        const syncTimeEl = document.getElementById('policy-sync-time');
+
+                        if (activeEl) activeEl.innerText = (data.active_backend || 'yaml').toUpperCase();
+                        if (shadowEl) shadowEl.innerText = (data.shadow_backend || 'none').toUpperCase();
+
+                        const isReachable = data.opa_reachable;
+                        if (healthEl) {
+                            healthEl.innerText = isReachable ? 'REACHABLE' : 'UNREACHABLE';
+                            healthEl.style.color = isReachable ? 'var(--green)' : 'var(--red)';
+                        }
+                        if (healthBadge) {
+                            healthBadge.innerText = isReachable ? '● HEALTHY' : '▲ OFFLINE';
+                            healthBadge.style.color = isReachable ? 'var(--green)' : 'var(--red)';
+                        }
+
+                        const syncSt = (data.last_sync_status || 'N/A').toUpperCase();
+                        if (syncStatusEl) {
+                            syncStatusEl.innerText = syncSt;
+                            syncStatusEl.style.color = syncSt === 'SUCCESS' ? 'var(--green)' : (syncSt === 'FAILED' ? 'var(--red)' : '#fff');
+                        }
+
+                        if (hashEl) hashEl.innerText = `HASH: ${data.last_data_hash || '-'}`;
+                        if (syncTimeEl) {
+                            if (data.last_sync_time && data.last_sync_time > 0) {
+                                const d = new Date(data.last_sync_time * 1000);
+                                syncTimeEl.innerText = `Last Sync: ${d.toLocaleTimeString()}`;
+                            } else {
+                                syncTimeEl.innerText = 'Last Sync: N/A';
+                            }
+                        }
+                    }
+                })
+                .catch(err => console.error('Failed to load policy status:', err));
+        }
+
+        function renderPolicyFeed(events) {
+            const tbody = document.getElementById('policy-feed-body');
+            if (!tbody) return;
+            tbody.innerHTML = '';
+            
+            if (!events || events.length === 0) {
+                tbody.innerHTML = '<tr><td class="td" colspan="6" style="color: var(--text-dim); text-align: center; padding: 20px;">No policy events recorded yet.</td></tr>';
+                return;
+            }
+
+            events.slice(0, 50).forEach(e => {
+                const tr = document.createElement('tr');
+                const date = new Date((e.timestamp || Date.now()/1000) * 1000);
+                const timeStr = date.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false});
+                const act = (e.action || 'allow').toLowerCase();
+
+                let parityTag = '<span class="tag" style="color: var(--text-dim)">N/A</span>';
+                if (e.shadow_backend && e.shadow_backend !== 'none') {
+                    if (e.shadow_error) {
+                        parityTag = '<span class="tag" style="color: var(--orange)">ERR</span>';
+                    } else if (e.shadow_match === true) {
+                        parityTag = '<span class="tag" style="color: var(--green)">MATCH</span>';
+                    } else if (e.shadow_match === false) {
+                        parityTag = '<span class="tag" style="color: var(--red)">MISMATCH</span>';
+                    }
+                }
+
+                const enforcedBackend = (e.enforced_backend || e.policy_backend || 'yaml').toUpperCase();
+                const shadowBackend = (e.shadow_backend || 'none').toUpperCase();
+
+                tr.innerHTML = `
+                    <td class="td" style="color: var(--text-dim); font-family: 'JetBrains Mono'; font-size: 0.75rem;">${timeStr}</td>
+                    <td class="td">
+                        <span style="font-family: 'JetBrains Mono'; font-weight: 600; color: #fff;">${e.tool || '-'}</span>
+                        <span style="color: var(--text-dim); font-size: 0.75rem; margin-left: 8px;">(${e.agent || e.identity || 'agent'})</span>
+                    </td>
+                    <td class="td">
+                        <span class="tag" style="color: ${act === 'allow' ? 'var(--green)' : 'var(--red)'}">${act} (${enforcedBackend})</span>
+                    </td>
+                    <td class="td" style="font-size: 0.8rem; color: var(--text-dim);">
+                        ${shadowBackend !== 'NONE' ? shadowBackend : 'Disabled'}
+                    </td>
+                    <td class="td">${parityTag}</td>
+                    <td class="td" style="font-size: 0.8rem; color: var(--text-dim);">${e.reason || e.rule_id || '-'}</td>
+                `;
+                tbody.appendChild(tr);
+            });
         }
 
         function createRow(e) {
@@ -825,6 +1080,8 @@ DASHBOARD_HTML = """
             }, 1000);
         }
         connect();
+        loadPolicyStatus();
+        setInterval(loadPolicyStatus, 5000);
     </script>
 </body>
 </html>

@@ -17,7 +17,11 @@ from .inbound.injection import InjectionDetector
 from .inbound.egress import EgressControl
 from .inbound.rate_limiter import RateLimiter
 from .inbound.policy import PolicyEngine
-from .inbound.chain_detector import ChainDetector
+from .inbound.kill_switch import KillSwitch
+from .inbound.injection import InjectionDetector
+from .inbound.egress import EgressControl
+from .inbound.rate_limiter import RateLimiter
+from .inbound.policy import PolicyEngine
 from .inbound.human_approval import HumanApproval
 from .outbound.secrets import SecretScanner
 from .outbound.pii import PIIDetector
@@ -36,7 +40,6 @@ class PipelineRunner:
         self._injection = InjectionDetector()
         self._egress = EgressControl()
         self._policy = PolicyEngine()
-        self._chain = ChainDetector()
         self._approval = HumanApproval(auto_approve=auto_approve)
 
         self.inbound_stages = [
@@ -45,7 +48,6 @@ class PipelineRunner:
             self._injection,
             self._egress,
             self._policy,
-            self._chain,
         ]
 
         # Outbound stages

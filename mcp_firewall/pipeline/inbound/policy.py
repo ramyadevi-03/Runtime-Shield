@@ -73,12 +73,21 @@ class PolicyEngine(InboundStage):
                 r_action = rule.action if hasattr(rule, "action") else rule.get("action", Action.DENY)
                 r_name = rule.name if hasattr(rule, "name") else rule.get("name", "unnamed")
                 r_msg = rule.message if hasattr(rule, "message") else rule.get("message")
+                r_risk_delta = rule.risk_delta if hasattr(rule, "risk_delta") else rule.get("risk_delta")
+                r_priority = rule.priority if hasattr(rule, "priority") else rule.get("priority", "")
+
+                # Metadata carried forward so SDK / policy engines can read it without re-matching
+                rule_meta = {
+                    "rule_name": r_name,
+                    "risk_delta": r_risk_delta,
+                    "priority": r_priority,
+                }
 
                 if r_action == Action.ALLOW:
-                    return self._allow(f"Rule '{r_name}' allows this call")
+                    return self._allow_with_meta(f"Rule '{r_name}' allows this call", rule_meta)
                 elif r_action == Action.DENY:
                     msg = r_msg or f"Blocked by rule '{r_name}'"
-                    return self._deny(msg, severity=Severity.HIGH)
+                    return self._deny_with_meta(msg, severity=Severity.HIGH, meta=rule_meta)
                 elif r_action == Action.PROMPT:
                     return self._prompt(f"Rule '{r_name}' requires approval")
 

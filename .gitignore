@@ -1,7 +1,18 @@
 node_modules/
 .env
 venv/
+.venv/
 *.log
 dist/
 keycloak_data/
 telemetry.db*
+
+# Test & scratch artifacts
+tests/
+scratch/
+temp_repo/
+__pycache__/
+.pytest_cache/
+
+# Large binaries
+opa.exe

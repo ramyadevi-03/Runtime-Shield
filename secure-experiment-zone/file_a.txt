@@ -1,0 +1,9 @@
+Date: 2026-07-23
+Researcher: Dr. Aris
+Subject: Test File A — Dynamic Chain Detection
+
+This is a secondary test file used to confirm that the dangerous-chain
+detector triggers on the canonical read_file -> fetch_url sequence
+regardless of which specific file was read or which URL is targeted.
+
+Content: Alpha-sector telemetry baseline — no sensitive data.

@@ -1,3 +1,8 @@
+param(
+    [string]$PolicyBackend = "opa",
+    [string]$ShadowBackend = "yaml"
+)
+
 # =====================================================================
 # RUNTIME SHIELD & DVLA INTEGRATED DEMO LAUNCHER FOR WINDOWS (POWERSHELL)
 # =====================================================================
@@ -25,17 +30,19 @@ Remove-Item -Path "damn-vulnerable-llm-agent/streamlit_demo.log" -Force -ErrorAc
 Start-Sleep -Seconds 1
 
 # 1. Start Runtime Shield Bridge
-Write-Host "🚀 Starting Runtime Shield Bridge & Live Dashboard..." -ForegroundColor Green
+Write-Host "🚀 Starting Runtime Shield Bridge & Live Dashboard (Backend: $PolicyBackend, Shadow: $ShadowBackend)..." -ForegroundColor Green
 $RootVenvActivate = Join-Path $PSScriptRoot "venv\Scripts\Activate.ps1"
+
+$BridgeArgs = "--policy-backend $PolicyBackend --shadow-backend $ShadowBackend"
 
 # Create a job or start process in background
 $BridgeLog = "bridge_demo.log"
 if (Test-Path $RootVenvActivate) {
     # Run within the virtual environment and detach using cmd.exe to avoid powershell redirection issues
-    $BridgeProcess = Start-Process -FilePath "cmd.exe" -ArgumentList "/c venv\Scripts\activate.bat && python bridge.py > bridge_demo.log 2>&1" -WindowStyle Hidden -PassThru
+    $BridgeProcess = Start-Process -FilePath "cmd.exe" -ArgumentList "/c venv\Scripts\activate.bat && python bridge.py $BridgeArgs > bridge_demo.log 2>&1" -WindowStyle Hidden -PassThru
 } else {
     Write-Host "⚠️ Global Virtual Environment 'venv' not found. Trying global python..." -ForegroundColor Red
-    $BridgeProcess = Start-Process -FilePath "cmd.exe" -ArgumentList "/c python bridge.py > bridge_demo.log 2>&1" -WindowStyle Hidden -PassThru
+    $BridgeProcess = Start-Process -FilePath "cmd.exe" -ArgumentList "/c python bridge.py $BridgeArgs > bridge_demo.log 2>&1" -WindowStyle Hidden -PassThru
 }
 
 Write-Host "✅ Bridge process launched. Logging to bridge_demo.log." -ForegroundColor Green

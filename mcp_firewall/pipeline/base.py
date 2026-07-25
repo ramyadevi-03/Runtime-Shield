@@ -27,8 +27,14 @@ class InboundStage(ABC):
     def _allow(self, reason: str = "") -> PipelineDecision:
         return PipelineDecision(stage=self.stage, action=Action.ALLOW, reason=reason)
 
+    def _allow_with_meta(self, reason: str, meta: dict) -> PipelineDecision:
+        return PipelineDecision(stage=self.stage, action=Action.ALLOW, reason=reason, details=meta)
+
     def _deny(self, reason: str, **kwargs) -> PipelineDecision:
         return PipelineDecision(stage=self.stage, action=Action.DENY, reason=reason, **kwargs)
+
+    def _deny_with_meta(self, reason: str, severity, meta: dict) -> PipelineDecision:
+        return PipelineDecision(stage=self.stage, action=Action.DENY, reason=reason, severity=severity, details=meta)
 
     def _prompt(self, reason: str) -> PipelineDecision:
         return PipelineDecision(stage=self.stage, action=Action.PROMPT, reason=reason)

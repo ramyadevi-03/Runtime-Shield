@@ -14,6 +14,9 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(PROJECT_DIR, "src"))
+
 class ShieldStub:
     """
     Client SDK for integrating chatbots with the Secure Runtime Shield.
@@ -23,9 +26,15 @@ class ShieldStub:
         self.tenant_id = tenant_id
         self.dashboard_url = dashboard_url
         self.proxy_url = os.getenv("SHIELD_PROXY_URL", "http://127.0.0.1:5001/v1/tool/execute")
+        # Load policies from the ARD catalog (if any)
+        try:
+            import policy_loader
+            policy_loader.init_policies()
+        except Exception as e:
+            print(f"⚠️ [Shield SDK] Failed to initialize ARD policies: {e}")
         print(f"🛡️ [Shield SDK] Initialized for Tenant: {self.tenant_id}")
         
-    def call_tool(self, tool_name: str, args: dict, sso_token: str = None, spiffe_id: str = None, cert_pem: str = None) -> dict:
+    def call_tool(self, tool_name: str, args: dict, sso_token: str = None, spiffe_id: str = None, cert_pem: str = None, session_id: str = None) -> dict:
         """
         Wraps a tool execution request, injecting identity and sending it to the Shield Bridge.
         """
@@ -40,14 +49,16 @@ class ShieldStub:
             "params": {
                 "name": tool_name,
                 "arguments": args,
-                "metadata": {}
+                "_meta": {"session_id": session_id} if session_id else {}
             }
         }
         
-        # 2. Build headers (JWT + SPIFFE identity)
+        # 2. Build headers (JWT + SPIFFE identity + session ID)
         headers = {
             "Content-Type": "application/json"
         }
+        if session_id:
+            headers["X-Session-ID"] = session_id
         
         token = sso_token or os.getenv("KEYCLOAK_TOKEN")
         if token:

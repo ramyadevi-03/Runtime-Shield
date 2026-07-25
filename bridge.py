@@ -33,6 +33,11 @@ from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
 import asyncio
 
+from src.policy_loader import init_policies, search as ard_search, auto_refresh_catalog
+from src.policy_registry import PolicyRegistry
+from src.policy_engine import YamlPolicyEngine, OpaPolicyEngine
+from src.opa_sync import sync_policies
+
 try:
     from presidio_analyzer import AnalyzerEngine
     from presidio_anonymizer import AnonymizerEngine
@@ -45,8 +50,61 @@ gateway_instance = None
 nim_guard_instance = None
 fraud_engine_instance = None
 semantic_parser_instance = None
+active_policy_engine = None
+shadow_policy_engine = None
 
 import telemetry
+from mcp_firewall.config import load_config
+from mcp_firewall.models import ToolCallRequest, Action, GatewayConfig
+
+try:
+    global_gateway_config = load_config(os.path.join(PROJECT_DIR, "mcp-firewall.yaml"))
+except Exception:
+    global_gateway_config = GatewayConfig()
+
+from dataclasses import dataclass
+from typing import Any, Optional, Tuple
+
+# Import pure, side-effect-free helpers from chain_helpers module
+from chain_helpers import (
+    ToolExecutionResult,
+    secure_hash,
+    canonicalize_tool_name,
+    build_chain_context_id,
+    rest_execution_success,
+    mcp_execution_success,
+)
+
+# Policy helper lives in src to avoid importing the entire bridge during tests
+from src.policy_helpers import evaluate_tool_policy
+
+
+# Convenience alias kept for backward compatibility with any callers
+def get_session_key(session_id: str, user_id: str, spiffe_id: str) -> str:
+    return build_chain_context_id(session_id=session_id, user_id=user_id, spiffe_id=spiffe_id)
+
+
+def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[dict], user_id: str, user_sub: str, user_role: str) -> Tuple[str, str, str]:
+    resolved_user_id = user_id
+    resolved_user_role = user_role
+    resolved_user_sub = user_sub
+
+    if token and claims:
+        resolved_user_id = claims.get("preferred_username") or claims.get("sub") or resolved_user_id
+        resolved_user_sub = claims.get("sub") or ""
+        roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
+        scopes = claims.get("scope", "")
+        if isinstance(scopes, str):
+            scopes = scopes.split(" ")
+        resolved_user_role = "admin" if ("admin" in roles or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes) else "user"
+    elif not token:
+        env_role = (env_role or "user").strip().lower().replace("'", "").replace('"', '')
+        if resolved_user_role != "admin" and env_role == "admin":
+            resolved_user_role = "admin"
+            if resolved_user_id == "anonymous_user":
+                resolved_user_id = "admin"
+
+    return resolved_user_id, resolved_user_role, resolved_user_sub
 
 mcp_processes = {}
 mcp_remote_clients = {}
@@ -62,6 +120,9 @@ def reload_tool_mappings():
         for t in registered_tools:
             tool_map[t["tool_name"]] = t["provider_name"]
             scope_map[t["tool_name"]] = t["scope"]
+        if "fetch_url" not in tool_map:
+            tool_map["fetch_url"] = "bridge-internal"
+            scope_map["fetch_url"] = "tool:read_file"
         log(f"🔄 Reloaded tool mappings from database. Total tools in memory: {len(tool_map)}")
     except Exception as e:
         log(f"⚠️ Failed to reload tool mappings from DB: {e}")
@@ -222,6 +283,9 @@ class RemoteSseMcpClient:
 @dashboard_app.on_event("startup")
 async def start_remote_mcp_clients():
     log("🔌 FastAPI Startup: Connecting to remote MCP servers...")
+    log("🛡️ Initializing ARD Policies...")
+    init_policies()
+    asyncio.create_task(auto_refresh_catalog())
     for provider, client in mcp_remote_clients.items():
         try:
             await client.start()
@@ -318,7 +382,14 @@ class FraudDetectionEngine:
 
                         self.last_activity[entry] = now # Reset timer after successful decay step
 
-    def analyze(self, agent: str, decision, tool_name: str = None, tool_args: dict = None, user_id: str = None) -> tuple[bool, str, str, str]:
+    def analyze(self, agent: str, decision, tool_name: str = None, tool_args: dict = None, user_id: str = None, risk_delta_override: int = None) -> tuple[bool, str, str, str]:
+        """Analyse a policy decision and update agent risk scores.
+
+        Args:
+            risk_delta_override: When provided (from the standard PolicyDecision.risk_delta),
+                this value is used directly instead of the action-based defaults.
+                This ensures YAML-configured risk_delta values are respected end-to-end.
+        """
         action_val = decision.action.value if hasattr(decision.action, 'value') else str(decision.action)
         now = time.time()
 
@@ -334,7 +405,9 @@ class FraudDetectionEngine:
             # --- UPDATED: REFRESH ACTIVITY ---
             # (Decay is now handled by _decay_loop background thread)
 
-            # Increase risk score based on static firewall triggers
+            # Increase risk score based on policy decision.
+            # risk_delta_override (from PolicyDecision.risk_delta) takes full priority.
+            # Action-based defaults are the last-resort fallback only.
             risk_increase = 0
             if action_val == "deny":
                 # --- RISK DEDUPLICATION ---
@@ -356,7 +429,8 @@ class FraudDetectionEngine:
                         is_retry = True
                 
                 if not is_retry:
-                    risk_increase = 15 
+                    # Use YAML-configured risk_delta if available, otherwise default for deny
+                    risk_increase = risk_delta_override if risk_delta_override is not None else 15
                 else:
                     log(f"🛡️ Fraud Engine: Risk deduplicated for repeated call to {tool_name}")
                 
@@ -365,13 +439,14 @@ class FraudDetectionEngine:
                     self.last_calls[agent] = (tool_name, tool_args, now)
                     
             elif action_val == "redact":
-                risk_increase = 10 # User set this to 10
+                # Use YAML-configured risk_delta if available, otherwise default for redact
+                risk_increase = risk_delta_override if risk_delta_override is not None else 10
                 
-            # --- HONEYPOT DETECTION ---
-            # If the rule name matches our honeypot trap, apply maximum penalty
-            if hasattr(decision, 'name') and decision.name == "block-honeypots":
-                risk_increase = self.HONEYPOT_PENALTY
-                log(f"🚨 FRAUD ENGINE CRITICAL: Honeypot trap '{tool_name}' triggered by {agent}!")
+            # --- QUARANTINE / PRIORITY DETECTION ---
+            # Use the standardized quarantine flag from PolicyDecision (driven by priority=critical in YAML).
+            # No hardcoded rule names — the behaviour is fully driven by the policy decision.
+            if getattr(decision, 'quarantine', False):
+                log(f"🚨 FRAUD ENGINE CRITICAL: Quarantine-eligible rule triggered by '{tool_name}' (agent: {agent})!")
 
             # Suppress risk score increments if in learning mode
             if self.learning_mode:
@@ -1716,17 +1791,10 @@ if not os.path.exists(MCPWN_EXE):
 # =========================
 # TOOL ROLE POLICY
 # =========================
-
-TOOL_ROLE_POLICY = {
-    "keycloak_revoke_user_sessions": "admin",
-    "keycloak_list_user_sessions": "admin",
-    "keycloak_list_users": "admin",
-    "keycloak_get_user_events": "admin",
-    "keycloak_security_report": "admin",
-    "keycloak_generate_policy": "admin",
-    "keycloak_quarantine_user": "admin",
-    "keycloak_run_drills": "admin"
-}
+# REMOVED: TOOL_ROLE_POLICY dict and role_allowed() have been deleted.
+# Keycloak tool role restrictions are now enforced exclusively through
+# mcp-firewall.yaml (rule: deny-keycloak-admin-tools-non-admin) and evaluated
+# by the active policy engine (YAML or OPA). No shadow policy layer exists here.
 
 ROLE_LEVELS = {
     "user": 1,
@@ -1753,21 +1821,6 @@ def normalize_role(role: str) -> str:
         return DEFAULT_ROLE
     role = str(role).strip().lower().replace("'", "").replace('"', '')
     return role if role in ROLE_LEVELS else DEFAULT_ROLE
-
-
-def role_allowed(tool_name, user_role):
-    required_role = TOOL_ROLE_POLICY.get(tool_name)
-
-    if not required_role:
-        return True, None
-
-    user_role = normalize_role(user_role)
-    required_role = normalize_role(required_role)
-
-    if ROLE_LEVELS[user_role] < ROLE_LEVELS[required_role]:
-        return False, required_role
-
-    return True, required_role
 
 
 # =========================
@@ -2709,6 +2762,9 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
     keycloak_run_drills_called = False
     keycloak_run_drills_output = None
 
+    fetch_url_called = False
+    fetch_url_output = None
+
     # 1. Direct tool/role parsing from JSON-RPC or tool results in messages
     for msg in current_turn_messages:
         role = msg.get("role")
@@ -2734,6 +2790,9 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
         elif name in ("KeycloakRunDrills", "keycloak_run_drills", "keycloakrundrills") or (role == "tool" and name in ("KeycloakRunDrills", "keycloak_run_drills", "keycloakrundrills")):
             keycloak_run_drills_called = True
             keycloak_run_drills_output = content
+        elif name in ("FetchURL", "fetch_url") or (role == "tool" and name in ("FetchURL", "fetch_url")):
+            fetch_url_called = True
+            fetch_url_output = content
 
     # 2. Assistant-User pair ReAct parsing fallback (robust against formatting shifts)
     for i, msg in enumerate(current_turn_messages):
@@ -2770,6 +2829,15 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
                 keycloak_revoke_called = True
             elif '"action": "KeycloakRunDrills"' in content:
                 keycloak_run_drills_called = True
+            elif '"action": "FetchURL"' in content or '"action": "fetch_url"' in content:
+                if i + 1 < len(current_turn_messages) and current_turn_messages[i+1].get("role") == "user":
+                    user_content = current_turn_messages[i+1].get("content", "") or ""
+                    if "TOOL RESPONSE:" in user_content:
+                        fetch_url_called = True
+                        parts = user_content.split("TOOL RESPONSE:")
+                        if len(parts) > 1:
+                            subparts = parts[1].split("USER'S INPUT")
+                            fetch_url_output = subparts[0].strip().lstrip("-").strip()
 
     # 3. Text fallbacks for legacy/general formatted inputs
     for msg in current_turn_messages:
@@ -2793,6 +2861,12 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
                     keycloak_run_drills_called = True
                     subparts = parts[1].split("USER'S INPUT")
                     keycloak_run_drills_output = subparts[0].strip().lstrip("-").strip()
+            elif "FetchURL" in content or "fetch_url" in content or "http://" in content or "https://" in content:
+                parts = content.split("TOOL RESPONSE:")
+                if len(parts) > 1:
+                    fetch_url_called = True
+                    subparts = parts[1].split("USER'S INPUT")
+                    fetch_url_output = subparts[0].strip().lstrip("-").strip()
             elif "ListDirectory" in content or "list_directory" in content:
                 parts = content.split("TOOL RESPONSE:")
                 if len(parts) > 1:
@@ -2835,11 +2909,13 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
     is_keycloak_list_query = keycloak_list_called
     is_keycloak_revoke_query = keycloak_revoke_called
     is_keycloak_run_drills_query = keycloak_run_drills_called
+    is_fetch_url_query = fetch_url_called
     is_greeting = False
     
     # 1. Deterministic intent parsing (always computed first for Zero-Trust auditing)
+    det_fetch = any(w in raw_query_lower for w in ["fetch", "url", "http://", "https://", "send", "endpoint", "webhook"])
     det_list = (any(w in raw_query_lower for w in ["list", "dir", "folder"]) and any(w in raw_query_lower for w in ["file", "sandbox", "experiment", "zone"]))
-    det_file = any(w in raw_query_lower for w in ["file", "read", "sandbox", "readme", "txt", "csv", "experiment"])
+    det_file = any(w in raw_query_lower for w in ["file", "read", "sandbox", "readme", "txt", "csv", "experiment"]) and not det_fetch
     det_bank = any(w in raw_query_lower for w in ["transaction", "money", "salary", "balance", "bank"])
     det_greet = any(w in raw_query_lower for w in ["hi", "hello", "hey", "hola"]) and len(raw_query_lower) < 15
     
@@ -2879,6 +2955,29 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
 
     # 3. Confidence routing
     if confidence >= CONFIDENCE_THRESHOLD:
+        if intent in ("KeycloakListUsers", "KeycloakRevokeUserSessions", "KeycloakRunDrills") and user_role != "admin":
+            reason = f"Role violation: Semantic Keycloak action '{intent}' requires admin role."
+            log(f"🚫 SEMANTIC RBAC BLOCK: {reason} (user={user_id})")
+            dashboard_state.add_event({
+                "action": "deny",
+                "tool": "semantic_router",
+                "agent": f"user-{user_id}",
+                "reason": reason,
+                "severity": "high",
+                "stage": "role-policy",
+                "timestamp": time.time()
+            })
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "message": reason,
+                        "type": "security_violation",
+                        "code": "rbac_unauthorized"
+                    }
+                }
+            )
+
         log(f"✅ [SEMANTIC INTENT APPROVED] Route intent '{intent}' (Confidence: {confidence:.2f})")
         dashboard_state.add_event({
             "action": "allow",
@@ -2905,24 +3004,44 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             is_keycloak_revoke_query = True
         elif intent == "KeycloakRunDrills":
             is_keycloak_run_drills_query = True
+        elif intent == "FetchURL":
+            is_fetch_url_query = True
         elif intent == "Greet":
             is_greeting = True
     else:
         # Safe single-intent deterministic routing fallback
         log(f"⚠️ [SEMANTIC INTENT AMBIGUOUS] Confidence {confidence:.2f} below threshold {CONFIDENCE_THRESHOLD}. Falling back to deterministic rules...")
         
-        if det_list:
+        if det_fetch:
+            is_fetch_url_query = True
+        elif det_list:
             is_list_query = True
         elif det_file:
             is_file_query = True
         elif det_bank:
             is_banking_query = True
         elif any(w in raw_query_lower for w in ["keycloak", "users"]) and any(w in raw_query_lower for w in ["list", "show"]):
-            is_keycloak_list_query = True
+            # Policy-gate: only allow this routing if active_policy_engine permits it
+            _kc_inp = {"user": {"id": user_id, "role": user_role, "scopes": []}, "workload": {"spiffe_id": "spiffe://runtime-shield/workload/mock-llm"}, "agent": {"id": "spiffe://runtime-shield/workload/mock-llm", "risk_score": 0}, "mcp": {"server": "keycloak-provider", "tool": "keycloak_list_users", "action": "call"}, "resource": {"path": ""}, "request": {"contains_pii": False, "prompt_injection_detected": False, "original_args": {"role": user_role}}}
+            _kc_dec = active_policy_engine.evaluate_policy(_kc_inp) if active_policy_engine else {"allow": False, "reason": "No policy engine"}
+            if _kc_dec["allow"]:
+                is_keycloak_list_query = True
+            else:
+                return JSONResponse(status_code=403, content={"error": {"message": _kc_dec.get("reason", "Role violation: Keycloak governance tools require admin role."), "type": "security_violation", "code": "rbac_unauthorized"}})
         elif any(w in raw_query_lower for w in ["revoke", "session", "logout"]):
-            is_keycloak_revoke_query = True
+            _kc_inp = {"user": {"id": user_id, "role": user_role, "scopes": []}, "workload": {"spiffe_id": "spiffe://runtime-shield/workload/mock-llm"}, "agent": {"id": "spiffe://runtime-shield/workload/mock-llm", "risk_score": 0}, "mcp": {"server": "keycloak-provider", "tool": "keycloak_revoke_user_sessions", "action": "call"}, "resource": {"path": ""}, "request": {"contains_pii": False, "prompt_injection_detected": False, "original_args": {"role": user_role}}}
+            _kc_dec = active_policy_engine.evaluate_policy(_kc_inp) if active_policy_engine else {"allow": False, "reason": "No policy engine"}
+            if _kc_dec["allow"]:
+                is_keycloak_revoke_query = True
+            else:
+                return JSONResponse(status_code=403, content={"error": {"message": _kc_dec.get("reason", "Role violation: Keycloak governance tools require admin role."), "type": "security_violation", "code": "rbac_unauthorized"}})
         elif any(w in raw_query_lower for w in ["drill", "verification", "compliance", "audit"]) or "verify security" in raw_query_lower:
-            is_keycloak_run_drills_query = True
+            _kc_inp = {"user": {"id": user_id, "role": user_role, "scopes": []}, "workload": {"spiffe_id": "spiffe://runtime-shield/workload/mock-llm"}, "agent": {"id": "spiffe://runtime-shield/workload/mock-llm", "risk_score": 0}, "mcp": {"server": "keycloak-provider", "tool": "keycloak_run_drills", "action": "call"}, "resource": {"path": ""}, "request": {"contains_pii": False, "prompt_injection_detected": False, "original_args": {"role": user_role}}}
+            _kc_dec = active_policy_engine.evaluate_policy(_kc_inp) if active_policy_engine else {"allow": False, "reason": "No policy engine"}
+            if _kc_dec["allow"]:
+                is_keycloak_run_drills_query = True
+            else:
+                return JSONResponse(status_code=403, content={"error": {"message": _kc_dec.get("reason", "Role violation: Keycloak governance tools require admin role."), "type": "security_violation", "code": "rbac_unauthorized"}})
         elif det_greet:
             is_greeting = True
 
@@ -2931,12 +3050,51 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
     log(f"[DEBUG QUERY] raw_query_lower={repr(raw_query_lower)}...")
     log(f"[DEBUG QUERY] is_list_query={is_list_query} (called={list_dir_called}), is_file_query={is_file_query} (called={read_file_called}), is_keycloak_list_query={is_keycloak_list_query} (called={keycloak_list_called}), is_keycloak_revoke_query={is_keycloak_revoke_query} (called={keycloak_revoke_called})")
     
-    if is_list_query:
-        if not list_dir_called:
-            # Use semantically extracted target path if valid, otherwise fallback
-            target_path = target if target else "secure-experiment-zone"
+    if is_fetch_url_query:
+        if not fetch_url_called:
+            url_match = re.search(r'https?://[^\s\'"]+', original_query)
+            target_url = url_match.group(0).rstrip(".,;") if url_match else None
+            
+            if not target_url:
+                text = "Please provide the URL to fetch."
+                formatted = format_final_answer(text)
+                return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+
             dashboard_state.add_event({
                 "action": "allow",
+                "tool": "FetchURL",
+                "agent": "mock-llm-agent",
+                "reason": f"Agent requested FetchURL for {target_url}",
+                "severity": "low",
+                "stage": "agent-reasoning",
+                "timestamp": time.time()
+            })
+            formatted = format_action("FetchURL", target_url)
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+        else:
+            tool_output = fetch_url_output or ""
+            if "Security Violation:" in tool_output or "Access Denied" in tool_output or "Dangerous" in tool_output or "Tool blocked" in tool_output:
+                text = f"Blocked by Security Gateway: {tool_output}"
+            else:
+                text = f"FetchURL result:\n\n{tool_output}"
+            formatted = format_final_answer(text)
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+
+    if is_list_query:
+        if not list_dir_called:
+            target_path = target if target else None
+            if not target_path:
+                dir_match = re.search(r'(?:list|dir|show|folder)\s+(?:the\s+directory\s+|in\s+)?([^\s]+/[^\s]+|[^\s]+)', original_query, re.IGNORECASE)
+                if dir_match:
+                    target_path = dir_match.group(1).strip()
+            
+            if not target_path:
+                text = "Please provide the directory path to list."
+                formatted = format_final_answer(text)
+                return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+
+            dashboard_state.add_event({
+                "action": "info",
                 "tool": "ListDirectory",
                 "agent": "mock-llm-agent",
                 "reason": f"Agent requested directory contents for {target_path}",
@@ -2951,7 +3109,6 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             if "Security Violation:" in tool_output or "Access Denied" in tool_output:
                 text = f"Blocked by Security Gateway: {tool_output}"
             else:
-                # Format files dynamically as a beautiful markdown bulleted list matching Claude/premium UIs
                 files = [f.strip() for f in tool_output.strip().split('\n') if f.strip()]
                 formatted_list = ""
                 for f in files:
@@ -2959,23 +3116,29 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
                         formatted_list += f"- `{f}` (directory)\n"
                     else:
                         formatted_list += f"- `{f}`\n"
-                text = f"Here are the files in `secure-experiment-zone`:\n\n{formatted_list}"
+                text = f"Here are the files in directory:\n\n{formatted_list}"
             formatted = format_final_answer(text)
             return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
 
     if is_file_query:
         if not read_file_called:
-            # Use semantically extracted target path if valid, otherwise fallback
-            target_path = target if target else "secure-experiment-zone/test_sandbox.txt"
-            
-            # Resolve target if it's just a file name (prefix with secure-experiment-zone/ if not already specified)
-            # Exception: if the user is authenticated as admin, do NOT force secure-experiment-zone/ prefixing.
+            target_path = target if target else None
+            if not target_path:
+                file_match = re.search(r'(?:read|show|cat|view|file)\s+(?:the\s+file\s+)?([^\s]+\.[a-zA-Z0-9]+|[^\s]+/[^\s]+)', original_query, re.IGNORECASE)
+                if file_match:
+                    target_path = file_match.group(1).strip()
+
+            if not target_path:
+                text = "Please provide the file path to read."
+                formatted = format_final_answer(text)
+                return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+                
             is_path_like = ("/" in target_path or "\\" in target_path)
             if user_role != "admin" and target_path and not is_path_like and target_path not in ("README.md", "bridge.py"):
                 target_path = f"secure-experiment-zone/{target_path}"
                 
             dashboard_state.add_event({
-                "action": "allow",
+                "action": "info",
                 "tool": "ReadFile",
                 "agent": "mock-llm-agent",
                 "reason": f"Agent requested file contents for path: {target_path}",
@@ -3000,7 +3163,7 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
     if is_banking_query:
         if not get_user_called:
             dashboard_state.add_event({
-                "action": "allow",
+                "action": "info",
                 "tool": "GetCurrentUser",
                 "agent": "mock-llm-agent",
                 "reason": "Agent requested current user identity verification",
@@ -3013,7 +3176,7 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             
         elif get_user_called and not get_trans_called:
             dashboard_state.add_event({
-                "action": "allow",
+                "action": "info",
                 "tool": "GetUserTransactions",
                 "agent": "mock-llm-agent",
                 "reason": f"Agent requesting bank transactions for authenticated userId: {target_user_id}",
@@ -3064,7 +3227,7 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
                 text = "Here are your recent bank transactions:\n\n| Date | Description | Amount |\n| --- | --- | --- |\n| 2026-05-18 | Grocery Store | -$42.50 |\n| 2026-05-17 | Salary Credit | +$3500.00 |\n| 2026-05-15 | Coffee Shop | -$5.80 |\n| 2026-05-14 | Electric Bill | -$120.00 |\n\nAll transactions have been successfully retrieved and processed."
 
             dashboard_state.add_event({
-                "action": "allow",
+                "action": "info",
                 "tool": "chat_completion",
                 "agent": "mock-llm-agent",
                 "reason": "Agent successfully processed and rendered authenticated bank transactions",
@@ -3077,8 +3240,24 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
 
     if is_keycloak_list_query:
         if not keycloak_list_called:
+            # RESTORE: Hardcoded RBAC check — block non-admins immediately (pre-JIT)
+            if user_role != "admin":
+                reason = "Role violation: Keycloak user-management tools require admin role."
+                log(f"🚫 RBAC Block: {reason} (user={user_id})")
+                dashboard_state.add_event({
+                    "action": "deny",
+                    "tool": "keycloak_list_users",
+                    "agent": f"user-{user_id}",
+                    "reason": reason,
+                    "severity": "high",
+                    "stage": "role-policy",
+                    "timestamp": time.time()
+                })
+                return JSONResponse(status_code=403, content={"error": {"message": reason, "type": "security_violation", "code": "rbac_unauthorized"}})
+
+            # Admins proceed as before
             dashboard_state.add_event({
-                "action": "allow",
+                "action": "info",
                 "tool": "KeycloakListUsers",
                 "agent": "mock-llm-agent",
                 "reason": "Agent requested Keycloak users list",
@@ -3124,8 +3303,23 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
     if is_keycloak_revoke_query:
         if not keycloak_revoke_called:
             target_user = target if target else "user1"
+            # RESTORE: Hardcoded RBAC check — block non-admins immediately (pre-JIT)
+            if user_role != "admin":
+                reason = "Role violation: Keycloak user-management tools require admin role."
+                log(f"🚫 RBAC Block: {reason} (user={user_id})")
+                dashboard_state.add_event({
+                    "action": "deny",
+                    "tool": "keycloak_revoke_user_sessions",
+                    "agent": f"user-{user_id}",
+                    "reason": reason,
+                    "severity": "high",
+                    "stage": "role-policy",
+                    "timestamp": time.time()
+                })
+                return JSONResponse(status_code=403, content={"error": {"message": reason, "type": "security_violation", "code": "rbac_unauthorized"}})
+
             dashboard_state.add_event({
-                "action": "allow",
+                "action": "info",
                 "tool": "KeycloakRevokeUserSessions",
                 "agent": "mock-llm-agent",
                 "reason": f"Agent requested session revocation for username: {target_user}",
@@ -3146,8 +3340,23 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
 
     if is_keycloak_run_drills_query:
         if not keycloak_run_drills_called:
+            # RESTORE: Direct admin check for running drills
+            if user_role != "admin":
+                reason = "Role violation: only admin may run Keycloak verification drills."
+                log(f"🚫 RBAC Block: {reason} (user={user_id})")
+                dashboard_state.add_event({
+                    "action": "deny",
+                    "tool": "keycloak_run_drills",
+                    "agent": f"user-{user_id}",
+                    "reason": reason,
+                    "severity": "high",
+                    "stage": "role-policy",
+                    "timestamp": time.time()
+                })
+                return JSONResponse(status_code=403, content={"error": {"message": reason, "type": "security_violation", "code": "rbac_unauthorized"}})
+
             dashboard_state.add_event({
-                "action": "allow",
+                "action": "info",
                 "tool": "KeycloakRunDrills",
                 "agent": "mock-llm-agent",
                 "reason": "Agent requested execution of policy verification drills",
@@ -3170,6 +3379,15 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
     formatted = format_final_answer(fallback_text)
     return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
 
+@dashboard_app.get("/search")
+async def search_ard_policies(query: str = ""):
+    """REST discovery endpoint for ARD policies."""
+    try:
+        results = ard_search(query)
+        return JSONResponse(content={"entries": results})
+    except Exception as e:
+        log(f"⚠️ ARD Search failed: {e}")
+        return JSONResponse(status_code=500, content={"error": "Failed to search ARD catalog"})
 
 # =============================================================================
 # DYNAMIC NEMO CONFIG ENDPOINTS  (hot-reload without restarting the bridge)
@@ -3398,14 +3616,20 @@ async def chat_completions_proxy(request: Request):
         except Exception as e:
             log(f"⚠️ Proxy failed to decode JWT token: {e}")
 
-    # Local Dev Override/Fallback:
-    # If the user explicitly switched to admin persona in local development,
-    # let's honor the RUNTIME_ROLE from .env even if the mock/Keycloak token doesn't map it properly.
-    if user_role != "admin" and env_role == "admin":
-        log(f"ℹ️ Local Dev Override: Elevating {user_id} to admin role due to RUNTIME_ROLE=admin in .env")
-        user_role = "admin"
-        if user_id == "anonymous_user":
-            user_id = "admin"
+    # Resolve identity/role from the token when available; only use the env override
+    # as a fallback when the request is unauthenticated.
+    user_id, user_role, user_sub = resolve_user_context(
+        token=token,
+        env_role=env_role,
+        claims=claims,
+        user_id=user_id,
+        user_sub=user_sub,
+        user_role=user_role,
+    )
+    if token and claims and user_role != "admin":
+        log(f"🧭 Resolved request identity from token: user={user_id}, role={user_role}")
+    elif not token:
+        log(f"ℹ️ Local Dev Override: Using RUNTIME_ROLE={env_role} for unauthenticated request")
 
     # Extract prompt messages
     messages = body.get("messages", [])
@@ -3564,46 +3788,152 @@ async def chat_completions_proxy(request: Request):
                 }
             )
 
-    # 4. Inbound Security Checks: Keycloak RBAC Validation
-    if user_role != "admin":
-        user_lower = actual_user_query.lower()
-        has_rbac_violation = False
-        matched_kw = ""
+    # 4. Inbound Security Checks: Dynamic Policy Evaluation via Active Policy Engine (YAML/OPA)
+    prompt_canonical_tool = None
+    prompt_target_path = ""
+    
+    if semantic_parser_instance:
+        try:
+            parsed_intent = await semantic_parser_instance.parse(actual_user_query)
+            intent_name = parsed_intent.get("intent", "None")
+            target_val = parsed_intent.get("target", "") or ""
+            
+            if intent_name == "KeycloakListUsers":
+                prompt_canonical_tool = "keycloak_list_users"
+            elif intent_name == "KeycloakRevokeUserSessions":
+                prompt_canonical_tool = "keycloak_revoke_user_sessions"
+                prompt_target_path = target_val
+            elif intent_name == "KeycloakRunDrills":
+                prompt_canonical_tool = "keycloak_run_drills"
+            elif intent_name == "ReadFile":
+                prompt_canonical_tool = "read_file"
+                prompt_target_path = target_val
+            elif intent_name == "ListDirectory":
+                prompt_canonical_tool = "list_directory"
+                prompt_target_path = target_val
+            elif intent_name == "GetUserTransactions":
+                prompt_canonical_tool = "GetUserTransactions"
+                prompt_target_path = target_val
+            elif intent_name == "GetCurrentUser":
+                prompt_canonical_tool = "GetCurrentUser"
+        except Exception as e:
+            log(f"⚠️ Semantic intent parsing failed during prompt policy evaluation: {e}")
 
-        # Rule A: Blocked keywords
-        blocked_keywords = ["all sessions", "revoke session", "quarantine", "admin panel", "dump database", "remove sessions", "dump sessions"]
-        for kw in blocked_keywords:
-            if kw in user_lower:
-                has_rbac_violation = True
-                matched_kw = kw
-                break
+    # Fallback canonical tool mapping: exact tool names or natural language patterns
+    if not prompt_canonical_tool:
+        import re as _re
+        query_lower = actual_user_query.lower()
+        
+        # Keycloak tool matching
+        if "keycloak_list_users" in query_lower or "keycloaklistusers" in query_lower:
+            prompt_canonical_tool = "keycloak_list_users"
+        elif "keycloak_revoke_user_sessions" in query_lower or "keycloakrevokeusersessions" in query_lower:
+            prompt_canonical_tool = "keycloak_revoke_user_sessions"
+        elif "keycloak_run_drills" in query_lower or "keycloakrundrills" in query_lower:
+            prompt_canonical_tool = "keycloak_run_drills"
+        elif _re.search(r'\b(list|show|get|display|fetch)\s+(all\s+|the\s+)?(keycloak\s+)?users\b', query_lower):
+            prompt_canonical_tool = "keycloak_list_users"
+        elif _re.search(r'\b(revoke|terminate|logout|kick|end|remove)\s+.{0,20}(session|sessions)\b', query_lower):
+            prompt_canonical_tool = "keycloak_revoke_user_sessions"
+        elif _re.search(r'\b(run|execute|start)\s+.{0,20}(drill|drills|audit|compliance|verification)\b', query_lower):
+            prompt_canonical_tool = "keycloak_run_drills"
+        
+        # Filesystem read_file matching
+        elif _re.search(r'\b(read|open|view|show|cat)\s+(?:the\s+file\s+)?([^\s]+)', query_lower):
+            m = _re.search(r'\b(read|open|view|show|cat)\s+(?:the\s+file\s+)?([^\s]+)', query_lower)
+            candidate = m.group(2).strip().strip('"').strip("'")
+            if candidate and candidate not in ("users", "transactions", "sessions", "drills", "the", "a", "my", "your"):
+                prompt_canonical_tool = "read_file"
+                prompt_target_path = candidate
+        
+        # Filesystem list_directory matching
+        elif _re.search(r'\b(list|dir|show)\s+(?:files|directory|folder)\s*(in\s+)?([^\s]*)', query_lower):
+            m = _re.search(r'\b(list|dir|show)\s+(?:files|directory|folder)\s*(in\s+)?([^\s]*)', query_lower)
+            prompt_canonical_tool = "list_directory"
+            prompt_target_path = m.group(3).strip().strip('"').strip("'") or "."
 
-        # Robust check for Keycloak user management listing variations (e.g. list the users, list all users, list users)
-        if not has_rbac_violation:
-            import re
-            user_mgmt_patterns = [
-                r"\blist\s+(?:all\s+|the\s+)?users\b",
-                r"\bshow\s+(?:all\s+|the\s+)?users\b",
-                r"\bget\s+(?:all\s+|the\s+)?users\b",
-                r"\bkeycloak_list_users\b",
-                r"\bkeycloaklistusers\b"
-            ]
-            for pattern in user_mgmt_patterns:
-                if re.search(pattern, user_lower):
-                    has_rbac_violation = True
-                    matched_kw = re.search(pattern, user_lower).group(0)
-                    break
+        # Honeypot matching
+        elif "get_system_config" in query_lower or "system_config" in query_lower or "system config" in query_lower:
+            prompt_canonical_tool = "get_system_config"
+        elif "fetch_internal_db" in query_lower or "internal_db" in query_lower or "internal db" in query_lower:
+            prompt_canonical_tool = "fetch_internal_db"
 
-        if has_rbac_violation:
-            reason = f"RBAC Violation: Requesting '{matched_kw}' is restricted to admin role. User '{user_id}' has role '{user_role}'."
-            log(f"🚫 RBAC BLOCK: {reason}")
+        # Active connections matching
+        elif "getactiveconnections" in query_lower or "active connections" in query_lower or "active_connections" in query_lower:
+            prompt_canonical_tool = "GetActiveConnections"
+
+    if prompt_canonical_tool:
+        spiffe_id_ctx = "spiffe://runtime-shield/workload/chat-completion"
+        policy_input = {
+            "user": {
+                "id": user_id or user_sub,
+                "role": user_role,
+                "scopes": []
+            },
+            "workload": {
+                "spiffe_id": spiffe_id_ctx
+            },
+            "agent": {
+                "id": spiffe_id_ctx,
+                "risk_score": fraud_engine_instance.agent_risk_scores.get(spiffe_id_ctx, 0) if fraud_engine_instance else 0
+            },
+            "mcp": {
+                "server": "keycloak-provider",
+                "tool": prompt_canonical_tool,
+                "action": "call"
+            },
+            "resource": {
+                "path": prompt_target_path or ""
+            },
+            "request": {
+                "contains_pii": False,
+                "prompt_injection_detected": False,
+                "original_args": {"path": prompt_target_path or "", "role": user_role}
+            }
+        }
+
+        # Evaluate Active Policy Engine
+        prompt_decision = None
+        if active_policy_engine:
+            prompt_decision = active_policy_engine.evaluate_policy(policy_input)
+
+        # Evaluate Shadow Policy Engine for Parity Tracking
+        if shadow_policy_engine:
+            sh_prompt_decision = shadow_policy_engine.evaluate_policy(policy_input)
+            sh_err = sh_prompt_decision.get("rule_id") == "opa_fail_closed"
+            if sh_err:
+                sh_match = None
+                sh_err_reason = sh_prompt_decision.get("reason", "Unknown connection failure")
+            else:
+                sh_match = (
+                    prompt_decision["allow"] == sh_prompt_decision["allow"] and
+                    prompt_decision["redact_output"] == sh_prompt_decision["redact_output"] and
+                    prompt_decision["quarantine"] == sh_prompt_decision["quarantine"]
+                ) if prompt_decision else False
+                sh_err_reason = None
+
+            log_entry = {
+                "enforced_backend": prompt_decision["policy_backend"] if prompt_decision else "none",
+                "shadow_backend": sh_prompt_decision["policy_backend"],
+                "match": sh_match,
+                "shadow_error": sh_err,
+                "shadow_error_reason": sh_err_reason,
+                "enforced_decision": prompt_decision,
+                "shadow_decision": sh_prompt_decision
+            }
+            log(f"🛡️ SHADOW EVALUATION ({prompt_canonical_tool}): {json.dumps(log_entry)}")
+
+        # Hardcoded RBAC check for Keycloak tools before any policy evaluation
+        if prompt_canonical_tool in ("keycloak_list_users", "keycloak_revoke_user_sessions", "keycloak_run_drills") and user_role != "admin":
+            reason = f"Role violation: Keycloak tool '{prompt_canonical_tool}' requires admin role."
+            log(f"🚫 RBAC Block: {reason} (user={user_id})")
             dashboard_state.add_event({
                 "action": "deny",
-                "tool": "chat_completion",
-                "agent": "keycloak-rbac",
+                "tool": prompt_canonical_tool,
+                "agent": "keycloak-authz",
                 "reason": reason,
                 "severity": "high",
-                "stage": "keycloak-auth",
+                "stage": "role-policy",
                 "timestamp": time.time()
             })
             return JSONResponse(
@@ -3617,6 +3947,29 @@ async def chat_completions_proxy(request: Request):
                 }
             )
 
+        if prompt_decision and not prompt_decision["allow"]:
+            reason = prompt_decision.get("reason", f"Access Denied: Tool '{prompt_canonical_tool}' denied by security policy.")
+            log(f"🚫 POLICY BLOCK ({prompt_canonical_tool}): {reason}")
+            dashboard_state.add_event({
+                "action": "deny",
+                "tool": prompt_canonical_tool,
+                "agent": f"user-{user_id}",
+                "reason": reason,
+                "severity": "high",
+                "stage": "policy-engine",
+                "timestamp": time.time()
+            })
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "message": f"Blocked by Security Gateway: {reason}",
+                        "type": "security_violation",
+                        "code": "policy_denied"
+                    }
+                }
+            )
+
         # Resolve dynamic userId by sub (defaults to "1" if sub not mapped or empty)
         allowed_userid = resolve_userid_by_sub(user_sub)
 
@@ -3624,7 +3977,7 @@ async def chat_completions_proxy(request: Request):
         has_hijacking_attempt = re.search(r'\b(user\s*id|user_?id|user)\b\s*(=?\s*\b\d+\b)', actual_user_query.lower())
         if has_hijacking_attempt:
             val = has_hijacking_attempt.group(2).replace("=", "").strip()
-            if val != allowed_userid:
+            if val != allowed_userid and user_role != "admin":
                 reason = f"RBAC Violation: Refusing to fetch transactions for userId '{val}'. User '{user_id}' (role '{user_role}') is only authorized to access userId '{allowed_userid}'."
                 log(f"🚫 RBAC BLOCK: {reason}")
                 dashboard_state.add_event({
@@ -3656,7 +4009,7 @@ async def chat_completions_proxy(request: Request):
                     try:
                         args = json.loads(func.get("arguments", "{}"))
                         u_id = str(args.get("userId", "")).strip()
-                        if u_id and u_id != allowed_userid:
+                        if u_id and u_id != allowed_userid and user_role != "admin":
                             reason = f"RBAC Violation: User '{user_id}' (role '{user_role}') is not authorized to call GetUserTransactions for userId '{u_id}'. Access is restricted to own userId '{allowed_userid}'."
                             log(f"🚫 RBAC BLOCK: {reason}")
                             dashboard_state.add_event({
@@ -4009,6 +4362,7 @@ async def execute_tool_proxy(request: Request):
         "readfile": "read_file",
         "listdirectory": "list_directory",
         "writefile": "write_file",
+        "fetchurl": "fetch_url",
         "getcurrentuser": "GetCurrentUser",
         "getusertransactions": "GetUserTransactions",
         "getsystemconfig": "get_system_config",
@@ -4069,6 +4423,13 @@ async def execute_tool_proxy(request: Request):
     # 2. Extract JWT and verify identity/role
     auth_header = request.headers.get("Authorization")
     shield_header = request.headers.get("X-Shield-Token")
+    session_id = (
+        request.headers.get("X-Session-ID") or 
+        request.headers.get("x-session-id") or 
+        (params.get("_meta", {}) or {}).get("session_id") or 
+        (params.get("metadata", {}) or {}).get("session_id") or 
+        ""
+    )
     token = shield_header or auth_header
     if token and token.startswith("Bearer "):
         token = token[7:]
@@ -4097,30 +4458,49 @@ async def execute_tool_proxy(request: Request):
         except Exception as e:
             log(f"⚠️ Tool REST Proxy failed to decode JWT token: {e}")
 
-    # Fallback/Override role check matching env RUNTIME_ROLE in local dev (only if no token provided)
-    if not token:
-        env_role = os.getenv("RUNTIME_ROLE", "user").strip().lower().replace("'", "").replace('"', '')
-        if user_role != "admin" and env_role == "admin":
-            user_role = "admin"
-            if user_id == "anonymous_user":
-                user_id = "admin"
+    # Resolve identity/role from the token when available; only use the env override
+    # as a fallback when the request is unauthenticated.
+    user_id, user_role, user_sub = resolve_user_context(
+        token=token,
+        env_role=os.getenv("RUNTIME_ROLE", "user"),
+        claims=claims,
+        user_id=user_id,
+        user_sub=user_sub,
+        user_role=user_role,
+    )
 
-    # Intercept keycloak_run_drills to run them locally on the Python side
+    # REST-level RBAC: block non-admin direct tool calls for Keycloak management tools before any JIT
+    if tool_name in ("keycloak_list_users", "keycloak_revoke_user_sessions") and user_role != "admin":
+        reason = "Role violation: Keycloak user-management tools require admin role."
+        log(f"🚫 RBAC Block: {reason} (user={user_id}, tool={tool_name})")
+        dashboard_state.add_event({
+            "action": "deny",
+            "tool": tool_name,
+            "agent": f"user-{user_id}",
+            "reason": reason,
+            "severity": "high",
+            "stage": "role-policy",
+            "timestamp": time.time()
+        })
+        return JSONResponse(status_code=403, content={"error": {"message": reason, "type": "security_violation", "code": "rbac_unauthorized"}})
+
+    # Intercept keycloak_run_drills to run them locally on the Python side — restore direct admin check
     if tool_name == "keycloak_run_drills":
+        spiffe_id_val = "spiffe://runtime-shield/workload/bridge"
         if user_role != "admin":
-            reason = f"Role violation: {user_role} cannot use {tool_name}"
-            log(f"🚫 Role violation: {reason}")
+            reason = "Role violation: only admin may run Keycloak verification drills."
+            log(f"🚫 RBAC Block: {reason} (user={user_id})")
             dashboard_state.add_event({
                 "action": "block",
                 "tool": tool_name,
-                "agent": spiffe_id,
+                "agent": spiffe_id_val,
                 "reason": reason,
                 "severity": "high",
                 "stage": "role-policy",
                 "timestamp": time.time()
             })
-            return JSONResponse(status_code=403, content={"error": "Tool blocked due to insufficient role"})
-            
+            return JSONResponse(status_code=403, content={"error": reason})
+
         log("🏃 Intercepted keycloak_run_drills tool call in REST proxy. Running drills...")
         dashboard_state.add_event({
             "action": "allow",
@@ -4195,22 +4575,6 @@ async def execute_tool_proxy(request: Request):
         if "params" in body and "arguments" in body["params"]:
             body["params"]["arguments"]["role"] = user_role
 
-    # 5. Role Checking
-    allowed, required = role_allowed(tool_name, user_role)
-    if not allowed:
-        reason = f"Role violation: {user_role} cannot use {tool_name}"
-        log(f"🚫 Role violation: {reason}")
-        dashboard_state.add_event({
-            "action": "block",
-            "tool": tool_name,
-            "agent": spiffe_id,
-            "reason": reason,
-            "severity": "high",
-            "stage": "role-policy",
-            "timestamp": time.time()
-        })
-        return JSONResponse(status_code=403, content={"error": "Tool blocked due to insufficient role"})
-
     # 6. NIM Cloud / Safety Checks
     is_safe_zone = False
     for k, v in tool_args.items():
@@ -4230,35 +4594,170 @@ async def execute_tool_proxy(request: Request):
             log(f"🚫 NE-MO BLOCK: {tp_reason}")
             return JSONResponse(status_code=400, content={"error": tp_reason})
 
-    # 7. Gateway Firewall & Fraud Scoring Checks
-    decision = gateway_instance.check(tool_name, tool_args, agent=spiffe_id)
+
+
+    # 7. Standardized Pluggable Policy Evaluation
+    policy_input = {
+        "user": {
+            "id": user_id or user_sub,
+            "role": user_role,
+            "scopes": []  # Add actual scopes if available
+        },
+        "workload": {
+            "spiffe_id": spiffe_id
+        },
+        "agent": {
+            "id": spiffe_id,
+            "risk_score": fraud_engine_instance.agent_risk_scores.get(spiffe_id, 0) if fraud_engine_instance else 0
+        },
+        "mcp": {
+            "server": tool_map.get(tool_name, "unknown"),
+            "tool": tool_name,
+            "action": "call"
+        },
+        "resource": {
+            "path": tool_args.get("path", "") if isinstance(tool_args, dict) else ""
+        },
+        "request": {
+            "contains_pii": False,
+            "prompt_injection_detected": False,
+            "original_args": tool_args
+        }
+    }
+
+    # Evaluate Active Engine
+    decision = None
+    if active_policy_engine:
+        decision = active_policy_engine.evaluate_policy(policy_input)
+    
+    # Evaluate Shadow Engine
+    if shadow_policy_engine:
+        shadow_decision = shadow_policy_engine.evaluate_policy(policy_input)
+        shadow_error = shadow_decision.get("rule_id") == "opa_fail_closed"
+        
+        if shadow_error:
+            match = None
+            shadow_error_reason = shadow_decision.get("reason", "Unknown connection failure")
+        else:
+            match = (
+                decision["allow"] == shadow_decision["allow"] and
+                decision["redact_output"] == shadow_decision["redact_output"] and
+                decision["quarantine"] == shadow_decision["quarantine"]
+            )
+            shadow_error_reason = None
+
+        log_entry = {
+            "enforced_backend": decision["policy_backend"] if decision else "none",
+            "shadow_backend": shadow_decision["policy_backend"],
+            "match": match,
+            "shadow_error": shadow_error,
+            "shadow_error_reason": shadow_error_reason,
+            "enforced_decision": decision,
+            "shadow_decision": shadow_decision
+        }
+        log(f"🛡️ SHADOW EVALUATION: {json.dumps(log_entry)}")
+        
+    if not decision:
+        # Failsafe default decision if engine setup failed
+        decision = {
+            "allow": False,
+            "reason": "No policy engine configured",
+            "risk_delta": 0,
+            "redact_output": False,
+            "quarantine": False,
+            "rule_id": "failsafe_block",
+            "policy_backend": "none"
+        }
+
+    # Integrate with Fraud Engine for risk score modification and deduplication
+    class DummyDecision:
+        def __init__(self, action, reason, name, risk_delta=None, quarantine=False):
+            self.action = action
+            self.reason = reason
+            self.name = name
+            self.risk_delta = risk_delta
+            self.quarantine = quarantine
+            self.severity = "critical" if action == "deny" else "medium"
+            self.stage = "policy-engine"
+
+    dummy_action = "allow"
+    if not decision["allow"]:
+        dummy_action = "deny"
+    elif decision["redact_output"]:
+        dummy_action = "redact"
+
     fraud_blocked, final_action, final_reason, final_severity = fraud_engine_instance.analyze(
         agent=spiffe_id,
-        decision=decision,
+        decision=DummyDecision(
+            dummy_action,
+            decision["reason"],
+            decision["rule_id"],
+            risk_delta=decision.get("risk_delta"),
+            quarantine=decision.get("quarantine", False),
+        ),
         tool_name=tool_name,
         tool_args=tool_args,
-        user_id=user_id
+        user_id=user_id,
+        risk_delta_override=decision.get("risk_delta"),
     )
 
     if fraud_blocked:
-        decision.blocked = True
-        decision.action = final_action
-        decision.reason = final_reason
-        decision.severity = final_severity
+        decision["allow"] = False
+        decision["reason"] = final_reason
 
-    dashboard_state.add_event({
-        "action": decision.action.value if hasattr(decision.action, 'value') else str(decision.action),
+    event_payload = {
+        "action": final_action,
         "tool": tool_name,
         "agent": spiffe_id,
-        "reason": decision.reason,
-        "severity": decision.severity.value if hasattr(decision.severity, 'value') else str(decision.severity),
-        "stage": decision.stage,
+        "reason": decision["reason"],
+        "severity": final_severity,
+        "stage": "policy-engine",
+        "policy_backend": decision.get("policy_backend", "yaml"),
+        "rule_id": decision.get("rule_id", "unnamed"),
+        "risk_delta": decision.get("risk_delta", 0),
+        "priority": "critical" if decision.get("quarantine") else ("high" if final_action == "deny" else "info"),
+        "user_role": user_role,
+        "resource_path": tool_args.get("path", "") if isinstance(tool_args, dict) else "",
+        "session_id": session_id,
         "timestamp": time.time()
-    })
+    }
+    if 'log_entry' in locals():
+        event_payload.update({
+            "enforced_backend": log_entry.get("enforced_backend"),
+            "shadow_backend": log_entry.get("shadow_backend"),
+            "shadow_match": log_entry.get("match"),
+            "shadow_error": log_entry.get("shadow_error"),
+            "shadow_error_reason": log_entry.get("shadow_error_reason"),
+        })
 
-    if decision.blocked:
-        log(f"🚫 Blocked REST tool '{tool_name}': {decision.reason}")
-        return JSONResponse(status_code=403, content={"error": f"Tool blocked by firewall: {decision.reason}"})
+    dashboard_state.add_event(event_payload)
+
+    if not decision["allow"]:
+        log(f"🚫 Blocked REST tool '{tool_name}' ({decision['policy_backend']}): {decision['reason']}")
+        return JSONResponse(status_code=403, content={"error": f"Tool blocked by policy: {decision['reason']}"})
+
+    # Intercept fetch_url execution directly in Bridge
+    if tool_name == "fetch_url":
+        url = tool_args.get("url", "")
+        log(f"🌐 REST Proxy: Executing authorized fetch_url for URL: {url}")
+        try:
+            r = requests.get(url, timeout=5)
+            res_text = r.text[:2000]
+        except Exception as fetch_err:
+            res_text = f"URL Fetch completed (Response simulated/offline: {fetch_err})"
+        resp = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": res_text
+                    }
+                ]
+            }
+        }
+        return JSONResponse(content=resp)
 
     # 8. JIT TOKEN EXCHANGE (RFC 8693)
     required_scope = scope_map.get(tool_name)
@@ -4425,6 +4924,8 @@ def main():
     parser = argparse.ArgumentParser(description="MCP Security Bridge & Scanner")
     parser.add_argument("--scan", action="store_true", help="Only run the security scan")
     parser.add_argument("--learning", action="store_true", help="Enable Learning Mode (log unknown tools instead of blocking)")
+    parser.add_argument("--policy-backend", "-p", choices=["yaml", "opa"], help="Active policy engine backend (yaml or opa)")
+    parser.add_argument("--shadow-backend", "-s", choices=["yaml", "opa", "none"], help="Shadow policy engine backend (yaml, opa, or none)")
     args = parser.parse_args()
 
     # Path to the node-based MCP server
@@ -4522,10 +5023,52 @@ def main():
 
     # Bind globals for FastAPI endpoints
     global gateway_instance, nim_guard_instance, fraud_engine_instance, semantic_parser_instance, mcp_processes, tool_map, scope_map
+    global active_policy_engine, shadow_policy_engine
     gateway_instance = gw
     nim_guard_instance = nim_guard
     fraud_engine_instance = fraud_engine
     semantic_parser_instance = semantic_parser
+
+    # Initialize Policy Engines based on CLI flags or env vars
+    policy_backend = (args.policy_backend or os.getenv("POLICY_BACKEND", "yaml")).lower()
+    shadow_backend_arg = args.shadow_backend if args.shadow_backend is not None else os.getenv("POLICY_SHADOW_BACKEND", "")
+    shadow_backend = (shadow_backend_arg or "").lower()
+    if shadow_backend == "none":
+        shadow_backend = ""
+
+    os.environ["POLICY_BACKEND"] = policy_backend
+    os.environ["POLICY_SHADOW_BACKEND"] = shadow_backend
+    
+    log(f"🛡️ Initializing Policy Engines (Active: {policy_backend.upper()}, Shadow: {shadow_backend.upper() if shadow_backend else 'None'})")
+    
+    if policy_backend == "opa" or shadow_backend == "opa":
+        log("🔄 Synchronizing YAML rules to OPA backend...")
+        sync_success = sync_policies()
+        if not sync_success:
+            if policy_backend == "opa":
+                log("❌ OPA synchronization failed. Failing closed since OPA is the active backend.")
+                sys.exit(1)
+            else:
+                log("⚠️ OPA synchronization failed. Continuing since OPA is only the shadow backend.")
+
+    if policy_backend == "opa":
+        active_policy_engine = OpaPolicyEngine()
+    else:
+        active_policy_engine = YamlPolicyEngine(config_path=CONFIG_PATH)
+        
+    if shadow_backend == "opa":
+        shadow_policy_engine = OpaPolicyEngine()
+    elif shadow_backend == "yaml":
+        shadow_policy_engine = YamlPolicyEngine(config_path=CONFIG_PATH)
+
+    # --- Push live policy status to dashboard state so the UI reflects the real config ---
+    try:
+        dashboard_state.set_policy_status(
+            active_backend=policy_backend,
+            shadow_backend=shadow_backend if shadow_backend else "none",
+        )
+    except Exception as _e:
+        log(f"⚠️ Could not update dashboard policy state: {_e}")
 
     # Start the Dashboard with configurable port
     dashboard_port = int(os.getenv("DASHBOARD_PORT", "9090"))
@@ -4884,6 +5427,7 @@ setInterval(() => {
                             "readfile": "read_file",
                             "listdirectory": "list_directory",
                             "writefile": "write_file",
+                            "fetchurl": "fetch_url",
                             "getcurrentuser": "GetCurrentUser",
                             "getusertransactions": "GetUserTransactions",
                             "getsystemconfig": "get_system_config",
@@ -4947,6 +5491,34 @@ setInterval(() => {
                                     tool_args["path"] = norm_p
                                     if "params" in data and "arguments" in data["params"]:
                                         data["params"]["arguments"]["path"] = norm_p
+
+                        # Hardcoded RBAC blocks for Keycloak administrative tools before JIT enforcement
+                        if tool_name in ("keycloak_list_users", "keycloak_revoke_user_sessions", "keycloak_run_drills"):
+                            effective_role = normalize_role(tool_args.get("role", DEFAULT_ROLE))
+                            if effective_role != "admin":
+                                reason = f"Role violation: Keycloak tool '{tool_name}' requires admin role."
+                                log(f"🚫 RBAC Block: {reason} (user={tool_args.get('user_id') or tool_args.get('username') or 'unknown_user'})")
+                                dashboard_state.add_event({
+                                    "action": "deny",
+                                    "tool": tool_name,
+                                    "agent": "bridge-mcp-input",
+                                    "reason": reason,
+                                    "severity": "high",
+                                    "stage": "role-policy",
+                                    "timestamp": time.time()
+                                })
+                                error_resp = {
+                                    "jsonrpc": "2.0",
+                                    "id": data.get("id"),
+                                    "error": {
+                                        "code": -32001,
+                                        "message": reason
+                                    }
+                                }
+                                with stdout_lock:
+                                    protocol_stdout.write(json.dumps(error_resp) + "\n")
+                                    protocol_stdout.flush()
+                                continue
                         
                         try:
                             # --- AGENT IDENTITY HARDENING (JIT TOKENS) ---
@@ -4980,15 +5552,6 @@ setInterval(() => {
                                              pass
 
                                     log(f"⚠️ AUTH PASSTHROUGH: '{tool_name}' via local client [{local_identity}]")
-                                    dashboard_state.add_event({
-                                        "action": "allow",
-                                        "tool": tool_name,
-                                        "agent": f"local [{local_identity}]",
-                                        "reason": f"Local client passthrough (scope '{required_scope}' will be exchanged dynamically)",
-                                        "severity": "low",
-                                        "stage": "keycloak-auth",
-                                        "timestamp": time.time()
-                                    })
                                 else:
                                     user_id_from_token = claims.get("preferred_username") or claims.get("sub") or "unknown"
                                     log(f"🔑 Identity verified: {user_id_from_token}. Dynamic JIT scope '{required_scope}' will be issued for tool '{tool_name}'.")
@@ -5076,31 +5639,6 @@ setInterval(() => {
                                 if "params" in data and "arguments" in data["params"]:
                                     data["params"]["arguments"]["role"] = user_role
 
-                            allowed, required = role_allowed(tool_name, user_role)
-                            if not allowed:
-                                log(f"🚫 Role violation: {user_role} cannot use {tool_name}")
-                                dashboard_state.add_event({
-                                    "action": "block",
-                                    "tool": tool_name,
-                                    "agent": "claude-desktop",
-                                    "reason": f"Role '{user_role}' not allowed",
-                                    "severity": "high",
-                                    "stage": "role-policy",
-                                    "timestamp": time.time()
-                                })
-                                error_resp = {
-                                    "jsonrpc": "2.0",
-                                    "id": data.get("id"),
-                                    "error": {
-                                        "code": -32001,
-                                        "message": "Tool blocked due to insufficient role"
-                                    }
-                                }
-                                with stdout_lock:
-                                    protocol_stdout.write(json.dumps(error_resp) + "\n")
-                                    protocol_stdout.flush()
-                                continue
-
                             # --- NE-MO NIM CLOUD CHECK ---
                             is_safe_zone = False
                             if tool_args:
@@ -5151,6 +5689,19 @@ setInterval(() => {
                             # 3. FIREWALL & FRAUD ENGINE CHECK
                             decision = gw.check(tool_name, tool_args, agent=spiffe_id)
                             
+                            # 3b. ARD POLICY REGISTRY CHECK
+                            ard_policies = PolicyRegistry().get_applicable_policies(tool_name, tool_args)
+                            for policy in ard_policies:
+                                p_decision = policy.enforce(tool_name, tool_args, spiffe_id)
+                                if p_decision.blocked:
+                                    decision.blocked = True
+                                    decision.reason = p_decision.reason
+                                    decision.stage = "ard-policy"
+                                    # Fallback action/severity string for event dashboard compatibility
+                                    decision.action = getattr(decision, 'action', "deny")
+                                    decision.severity = p_decision.severity
+                                    break
+                            
                             # Apply Fraud Detection Engine analysis (with risk deduplication)
                             fraud_blocked, final_action, final_reason, final_severity = fraud_engine.analyze(
                                 agent=spiffe_id,
@@ -5172,15 +5723,47 @@ setInterval(() => {
                                 log(f"📚 Learning mode: Logging blocked tool '{tool_name}'")
                                 log_discovery(tool_name, tool_args, spiffe_id)
                                 learning_allowed = True
-                            dashboard_state.add_event({
+                            shadow_info = {}
+                            if shadow_policy_engine:
+                                try:
+                                    pol_inp = {
+                                        "user": {"id": user_id, "role": tool_args.get("role", "user") if isinstance(tool_args, dict) else "user"},
+                                        "workload": {"id": spiffe_id, "spiffe_id": spiffe_id},
+                                        "agent": {"id": spiffe_id},
+                                        "mcp": {"tool": tool_name},
+                                        "resource": {"path": tool_args.get("path", "") if isinstance(tool_args, dict) else ""},
+                                        "request": {"contains_pii": False, "prompt_injection_detected": False, "original_args": tool_args}
+                                    }
+                                    sh_dec = shadow_policy_engine.evaluate_policy(pol_inp)
+                                    sh_err = (sh_dec.get("rule_id") == "opa_fail_closed")
+                                    sh_match = None if sh_err else ((not decision.blocked) == sh_dec.get("allow", False))
+                                    shadow_info = {
+                                        "enforced_backend": os.getenv("POLICY_BACKEND", "yaml").lower(),
+                                        "shadow_backend": sh_dec.get("policy_backend", "opa"),
+                                        "shadow_match": sh_match,
+                                        "shadow_error": sh_err,
+                                        "shadow_error_reason": sh_dec.get("reason") if sh_err else None
+                                    }
+                                except Exception as err:
+                                    logger.warning("Shadow evaluation error: %s", err)
+
+                            event_data = {
                                 "action": decision.action.value if hasattr(decision.action, 'value') else str(decision.action),
                                 "tool": tool_name,
                                 "agent": spiffe_id,
                                 "reason": decision.reason,
                                 "severity": decision.severity.value if hasattr(decision.severity, 'value') else str(decision.severity),
                                 "stage": decision.stage,
+                                "policy_backend": os.getenv("POLICY_BACKEND", "yaml").lower(),
+                                "rule_id": getattr(decision, "rule_name", "") or "unnamed",
+                                "risk_delta": getattr(decision, "risk_delta", None) if getattr(decision, "risk_delta", None) is not None else (15 if decision.blocked else 0),
+                                "priority": getattr(decision, "priority", ""),
+                                "user_role": tool_args.get("role", "user") if isinstance(tool_args, dict) else "user",
+                                "resource_path": tool_args.get("path", "") if isinstance(tool_args, dict) else "",
                                 "timestamp": time.time()
-                            })
+                            }
+                            event_data.update(shadow_info)
+                            dashboard_state.add_event(event_data)
 
                             if decision.blocked and not learning_allowed:
                                 log(f"🚫 Blocked: {decision.reason}")

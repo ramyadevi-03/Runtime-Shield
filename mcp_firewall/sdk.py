@@ -57,6 +57,10 @@ class CheckResult:
     reason: str
     severity: str
     stage: str | None
+    # Rule metadata — populated when the decision came from a named YAML rule.
+    rule_name: str = ""
+    risk_delta: int | None = None
+    priority: str = ""
 
     @property
     def allowed(self) -> bool:
@@ -137,6 +141,9 @@ class Gateway:
             reason=decision.reason,
             severity=decision.severity.value,
             stage=decision.stage.value if decision.stage else None,
+            rule_name=decision.details.get("rule_name", ""),
+            risk_delta=decision.details.get("risk_delta"),
+            priority=decision.details.get("priority", ""),
         )
 
     def scan_response(

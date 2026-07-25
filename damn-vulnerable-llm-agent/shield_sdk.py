@@ -25,7 +25,7 @@ class ShieldStub:
         self.proxy_url = os.getenv("SHIELD_PROXY_URL", "http://127.0.0.1:5001/v1/tool/execute")
         print(f"🛡️ [Shield SDK] Initialized for Tenant: {self.tenant_id}")
         
-    def call_tool(self, tool_name: str, args: dict, sso_token: str = None, spiffe_id: str = None, cert_pem: str = None) -> dict:
+    def call_tool(self, tool_name: str, args: dict, sso_token: str = None, spiffe_id: str = None, cert_pem: str = None, session_id: str = None) -> dict:
         """
         Wraps a tool execution request, injecting identity and sending it to the Shield Bridge.
         """
@@ -59,6 +59,9 @@ class ShieldStub:
         spiffe_id_val = spiffe_id or os.getenv("SPIFFE_LLM_ID", "spiffe://runtime-shield/llm-agent")
         headers["X-SPIFFE-ID"] = spiffe_id_val
         
+        if session_id:
+            headers["X-Session-ID"] = session_id
+
         if cert_pem:
             headers["X-SPIFFE-CERT"] = urllib.parse.quote(cert_pem)
             

@@ -122,6 +122,8 @@ class MCPServerConfig(BaseModel):
     args: list[str] = Field(default_factory=list)
     tools: list[Any] = Field(default_factory=list)
 
+
+
 class GatewayConfig(BaseModel):
     """Top-level gateway configuration."""
 
@@ -139,6 +141,7 @@ class GatewayConfig(BaseModel):
     audit: AuditConfig = Field(default_factory=lambda: AuditConfig())
     nemo_cloud: NemoCloudConfig = Field(default_factory=lambda: NemoCloudConfig())
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+
 
 
 class KillSwitchConfig(BaseModel):
@@ -238,6 +241,11 @@ class RuleConfig(BaseModel):
     action: Action = Action.DENY
     message: str = ""
     rate_limit: dict[str, int] | None = None
+    # Risk delta applied to the FraudDetectionEngine when this rule fires.
+    # If None, the engine falls back to action-based defaults (deny=15, redact=10, allow=0).
+    risk_delta: int | None = None
+    # Priority level. "critical" marks the decision as quarantine-eligible.
+    priority: str = ""
 
 
 class AuditConfig(BaseModel):

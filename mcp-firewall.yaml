@@ -84,6 +84,8 @@ rules:
         role: "user"
     action: deny
     message: "Security violation: Potential directory traversal detected."
+    risk_delta: 15
+    priority: high
 
   # 2. Block specific unauthorized directories
   - name: block-admin-access
@@ -94,6 +96,8 @@ rules:
         role: "user"
     action: deny
     message: "Access denied: The 'admin/' directory is off-limits."
+    risk_delta: 15
+    priority: high
 
   # 3. Allow access to the authorized folder
   - name: allow-claude-files
@@ -103,6 +107,7 @@ rules:
         path: "secure-experiment-zone/claude-desktop**"
     action: allow
     message: "Workspace Access: Internal configuration tools permitted."
+    risk_delta: 0
 
   # 4. Allow access to the Secure Experiment Zone (Safe Agent Workspace)
   - name: allow-experiment-zone-access
@@ -112,6 +117,17 @@ rules:
         path: "secure-experiment-zone**"
     action: allow
     message: "Sandbox Access: Authorized experiment zone operations."
+    risk_delta: 0
+
+  # 6. Allow external-send tools for standard users (required for dangerous-chain demo)
+  - name: allow-external-send
+    tool: "http_post|fetch_url|curl|wget|send_request|http_request"
+    match:
+      arguments:
+        role: "user"
+    action: allow
+    message: "External send tools are permitted for normal users (required for dangerous‑chain demo)."
+    risk_delta: 0
 
   # 4. Block all other filesystem access for standard users (Defense in Depth)
   # 4. Block all other filesystem access for standard and privileged users (Defense in Depth)
@@ -122,6 +138,8 @@ rules:
         role: "user|privileged"
     action: deny
     message: "Security violation: Unauthorized filesystem access attempt."
+    risk_delta: 15
+    priority: high
 
   # 5. Block access to environment credential files (.env) for ALL roles
   - name: block-env-access
@@ -131,6 +149,8 @@ rules:
         path: "**.env*"
     action: deny
     message: "Security exception: Access to environment credential files (.env) is strictly prohibited for all roles."
+    risk_delta: 20
+    priority: high
 
   # 5. Allow admin unrestricted filesystem access throughout the project (inside and outside the zone)
   - name: allow-admin-unrestricted-fs
@@ -140,40 +160,55 @@ rules:
         role: "admin"
     action: allow
     message: "Admin Access: Unrestricted filesystem access permitted."
+    risk_delta: 0
 
   # 5. HONEYPOT TRAPS: Block access to fake internal tools without internal-admin scope
   - name: block-honeypots
     tool: "get_system_config|fetch_internal_db"
     action: deny
     message: "CRITICAL VIOLATION: Access to internal system management tools is strictly prohibited."
+    risk_delta: 100
     priority: critical
 
   # 6. Restrict sensitive Keycloak administration tools to admin only
   - name: allow-keycloak-admin
-    tool: "keycloak_list_users|keycloak_revoke_user_sessions|keycloak_run_drills|keycloak_generate_policy|keycloak_quarantine_user"
+    tool: "keycloak_list_users|keycloak_list_user_sessions|keycloak_revoke_user_sessions|keycloak_run_drills|keycloak_generate_policy|keycloak_quarantine_user"
     match:
       arguments:
         role: "admin"
     action: allow
     message: "Governance: Admin authorized to manage Keycloak and run drills."
+    risk_delta: 0
 
   - name: deny-keycloak-admin
-    tool: "keycloak_list_users|keycloak_revoke_user_sessions|keycloak_run_drills|keycloak_generate_policy|keycloak_quarantine_user"
+    tool: "keycloak_list_users|keycloak_list_user_sessions|keycloak_revoke_user_sessions|keycloak_run_drills|keycloak_generate_policy|keycloak_quarantine_user"
     action: deny
     message: "Access Denied: Keycloak administration is restricted to the administrator role."
+    risk_delta: 15
+    priority: high
 
   # 6b. Allow general Keycloak user profile/event read tools for normal/privileged
   - name: allow-keycloak-general
     tool: "keycloak_get_user_events|keycloak_security_report"
     action: allow
     message: "Governance: Keycloak diagnostic events read granted."
+    risk_delta: 0
     zone: staging # Default zone for these tools
+
+  # Default deny for all other roles or users invoking Keycloak tools.
+  - name: deny-keycloak-tools-fallback
+    tool: "keycloak_*"
+    action: deny
+    message: "Role violation: Keycloak governance tools require the 'admin' role."
+    risk_delta: 15
+    priority: high
 
   # 7. Default Allow for Sandboxed Database tools
   - name: allow-database-tools
     tool: "GetCurrentUser|GetUserTransactions"
     action: allow
     message: "Governance: Jailed database operations permitted."
+    risk_delta: 0
     zone: production
 
   # 8. Allow admin to query active connections
@@ -184,12 +219,15 @@ rules:
         role: "admin"
     action: allow
     message: "Security: Admin authorized to read diagnostic active connections."
+    risk_delta: 0
 
   # 9. Block other roles from querying active connections
   - name: deny-user-active-connections
     tool: "GetActiveConnections"
     action: deny
     message: "Security Violation: Non-admin role cannot view host active connections."
+    risk_delta: 15
+    priority: high
 
   # 10. Allow general scanner/monitor tools only for admin and privileged users
   - name: allow-general-diagnostics
@@ -199,12 +237,15 @@ rules:
         role: "admin|privileged"
     action: allow
     message: "Governance: Diagnostic scans permitted for privileged and admin roles."
+    risk_delta: 0
 
   # 11. Block normal user role from running diagnostic scans
   - name: deny-user-diagnostics
     tool: "ScanDependencies|ScanSecrets|GetSystemMetrics"
     action: deny
     message: "Access Denied: Standard users cannot run diagnostic system scans."
+    risk_delta: 15
+    priority: high
 
 # Threat Feed Integration
 threat_feed:
@@ -223,6 +264,8 @@ mcp_servers:
         scope: "tool:write_file"
       - name: "list_directory"
         scope: "tool:list_directory"
+      - name: "fetch_url"
+        scope: "tool:read_file"
       - name: "get_system_config"
         scope: "tool:admin_internal"
       - name: "fetch_internal_db"

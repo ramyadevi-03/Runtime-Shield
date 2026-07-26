@@ -128,18 +128,14 @@ def assign_realm_role(session: KeycloakSession, user_id: str, role_name: str):
 
 def update_user(session: KeycloakSession, username: str, password: str, role_name: str = None):
     """Create or update a user's password in the configured realm and map roles."""
-    url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/users?username={username}"
+    url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/users?exact=true&username={username}"
     try:
         r = session.request("GET", url, timeout=10)
         if r.status_code != 200:
             print(f"[ERROR] Failed to fetch user '{username}': {r.status_code} {r.text}")
             return
 
-        users = r.json()
-        if not isinstance(users, list):
-            print(f"[ERROR] Invalid response format when fetching user '{username}': {users}")
-            return
-
+        users = [u for u in r.json() if u.get("username") == username] if isinstance(r.json(), list) else []
         if users:
             user_id = users[0]["id"]
         else:

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import logging
 import yaml
 
-from .models import GatewayConfig
+from .models import GatewayConfig, RuleConfig
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_NAME = "mcp-firewall.yaml"
 
@@ -18,6 +21,7 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
 
     path = Path(path)
     if not path.exists():
+        logger.warning("Configuration file %s does not exist; returning default GatewayConfig.", path)
         return GatewayConfig()
 
     with open(path, encoding="utf-8") as f:
@@ -64,10 +68,11 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
             mapped.setdefault("pii", {})["enabled"] = rs["detectPII"]
 
     mapped["agents"] = raw.get("agents", {})
-    from .models import RuleConfig
     rules_raw = raw.get("rules", [])
     mapped["tenants"] = raw.get("tenants", {})
     mapped["rules"] = [RuleConfig(**r) if isinstance(r, dict) else r for r in rules_raw]
+
+
     mapped["audit"] = raw.get("audit", {})
     mapped["nemo_cloud"] = raw.get("nemo_cloud", {})
     mapped["mcp_servers"] = raw.get("mcp_servers", {})
@@ -146,7 +151,9 @@ rules:
     tool: "read_file|get_file_contents|view_file|list_directory"
     action: allow
 
+
 audit:
   enabled: true
   path: mcp-firewall.audit.jsonl
 """
+

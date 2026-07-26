@@ -17,6 +17,22 @@ class Action(Enum):
     REDACT = "redact"
 
 class PolicyEngine:
+    """DISPLAY-ONLY policy evaluator for the runtime-shield dashboard.
+
+    ⚠️  This class is NOT in the runtime request enforcement path.
+        It is instantiated only by mcp_firewall/dashboard/app.py for
+        displaying live rule state in the governance UI.
+
+    Runtime enforcement uses:
+        src/policy_engine.py → YamlPolicyEngine  (active or shadow)
+        src/policy_engine.py → OpaPolicyEngine   (active or shadow)
+        bridge.py            → active_policy_engine / shadow_policy_engine
+
+    The single source of truth for all rules is mcp-firewall.yaml.
+    tenant_rules.yaml (loaded below by default) is a supplemental
+    identity-layer config for Keycloak scope/role display only.
+    Do not add runtime enforcement logic here.
+    """
     def __init__(self, rules_path: str = "rules/tenant_rules.yaml"):
         self.rules_path = rules_path
         self.policies = {}

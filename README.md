@@ -56,25 +56,12 @@ Start the entire integrated bridge, live dashboard, and Streamlit agent chatbot 
 
 ## 🧪 Security & Governance Verification
 
-Verify the active security layers using the following programmatic test suites:
+Verify the active security layers using the programmatic test suite:
 
-1. **Governance & Normalization Test:**
-   ```powershell
-   python scratch/test_governance_normalization.py
-   ```
-   *Validates case-insensitive tool normalization, SVID authentication, and zero-trust default-deny blocks on unknown tools.*
-
-2. **Robust RBAC & Attestation Test:**
-   ```powershell
-   python scratch/test_robust_rbac.py
-   ```
-   *Validates that header-only SPIFFE requests are blocked cryptographically, and that verified standard users are blocked by NeMo/RBAC policies when requesting admin operations.*
-
-3. **PII Redaction Test:**
-   ```powershell
-   python scratch/test_json_aware.py
-   ```
-   *Validates JSON-aware Microsoft Presidio NLP in-flight PII redaction (emails, SSNs) before they reach the LLM.*
+```powershell
+python run_security_drills.py
+```
+*Validates directory traversal guardrails, role-based access control (RBAC), tool normalization, and zero-trust default-deny blocks on unauthorized tools.*
 
 ---
 
@@ -82,10 +69,34 @@ Verify the active security layers using the following programmatic test suites:
 Once the bridge is active, you can monitor all tool calls, risk levels, and redactions in real-time:
 - **URL:** `http://127.0.0.1:9090`
 
-## ⚙️ Configuration & Architecture Guides
+## ⚙️ Pluggable Policy Engine Architecture
+
+The Runtime Shield features a pluggable policy engine architecture allowing for seamless migration and parity checking between internal and enterprise policy backends.
+
+*   **YAML Mode (`POLICY_BACKEND=yaml`)**: The default engine. Enforces rules defined directly in `mcp-firewall.yaml`.
+*   **OPA Mode (`POLICY_BACKEND=opa`)**: The enterprise engine. Evaluates standard policy inputs against an external OPA server via its REST API. To configure the endpoint, set `OPA_URL`.
+*   **Shadow Mode (`POLICY_SHADOW_BACKEND=opa`)**: Allows evaluating requests against both the active engine and a shadow engine without enforcing the shadow engine's decision. This outputs a comparison log (`match`: true/false) which is critical for verifying policy parity before fully migrating.
+
+**Avoiding Duplication**: The architecture prevents manual rule duplication by standardizing the input data and keeping the active YAML rules as the single source of truth for generating normalized policy data, which is then provided to the OPA server.
+
+### Final Enforcement Flow
+```text
+mcp-firewall.yaml → opa_sync.py → OPA data → generic Rego policy → PolicyDecision → Bridge enforcement
+```
+
+### Troubleshooting OPA Integration
+- **OPA Server Unreachable**: If `POLICY_BACKEND=opa`, the Bridge will intentionally **fail closed** (exit on startup, or block all requests) to prevent unsecured execution.
+- **OPA Sync Failure**: If OPA is reachable but synchronization fails, verify the syntax in `mcp-firewall.yaml` and check the Bridge logs for `opa_sync.py` errors.
+- **Shadow Mode Mismatch**: If `POLICY_SHADOW_BACKEND=opa` logs a mismatch, verify that the OPA server contains the latest synchronized rules. Note that if OPA is offline, it will log a distinct `shadow_error: true` rather than a policy mismatch.
+- **Policy Parity Test Failure**: Run `python -m pytest tests/test_policy_engines.py`. If tests fail, ensure the OPA server is running locally on port 8181 and the `opa_sync` logic properly translates the failing YAML rule.
+
+---
+
+## 📚 Configuration & Architecture Guides
 - **Centralized Governance Walkthrough:** [centralized_governance_walkthrough.md](file:///c:/Users/Lenovo/Desktop/Runtime-shield-%20login/Runtime-shield-for-agentic-systems/document/centralized_governance_walkthrough.md) — Comprehensive guide detailing unified tool normalization, cryptographic JWKS/SVID verification, Llama Guard bypass optimization, and RBAC rules.
 - **Firewall Rules:** Modify `mcp-firewall.yaml` to define tool permissions and path guardrails.
 - **Roles:** Set `RUNTIME_ROLE=user` or `admin` in your `.env` to test different RBAC personas dynamically.
 
 ---
 **Note:** This project is part of a Secure Agentic Runtime research initiative. Use the `--learning` flag with `bridge.py` to discover required policies without enforcing blocks.
+

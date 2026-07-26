@@ -13,7 +13,7 @@ from shield_sdk import ShieldStub
 # Initialize the central Shield client
 shield = ShieldStub(tenant_id="customer-delta-99")
 
-def get_current_user(keycloak_sub: str = "", debug_mode: bool = True, sso_token: str = None, spiffe_id: str = None, cert_pem: str = None):
+def get_current_user(keycloak_sub: str = "", debug_mode: bool = True, sso_token: str = None, spiffe_id: str = None, cert_pem: str = None, session_id: str = None):
     """
     Retrieves the current user identity by delegating execution to the sandboxed 
     'database-provider' MCP tool via the central Runtime Shield.
@@ -25,13 +25,14 @@ def get_current_user(keycloak_sub: str = "", debug_mode: bool = True, sso_token:
             args=args,
             sso_token=sso_token,
             spiffe_id=spiffe_id,
-            cert_pem=cert_pem
+            cert_pem=cert_pem,
+            session_id=session_id
         )
         return resp.get("result", "[]")
     except Exception as e:
         return f"Security Violation: {e}"
 
-def get_transactions(userId: str, keycloak_sub: str = "", role: str = "user", debug_mode: bool = True, sso_token: str = None, spiffe_id: str = None, cert_pem: str = None):
+def get_transactions(userId: str, keycloak_sub: str = "", role: str = "user", debug_mode: bool = True, sso_token: str = None, spiffe_id: str = None, cert_pem: str = None, session_id: str = None):
     """
     Retrieves banking transactions by delegating execution to the sandboxed
     'database-provider' MCP tool via the central Runtime Shield.
@@ -43,14 +44,15 @@ def get_transactions(userId: str, keycloak_sub: str = "", role: str = "user", de
             args=args,
             sso_token=sso_token,
             spiffe_id=spiffe_id,
-            cert_pem=cert_pem
+            cert_pem=cert_pem,
+            session_id=session_id
         )
         return resp.get("result", "[]")
     except Exception as e:
         # Propagate the block reasons clearly to be picked up by the LangChain UI block parsers
         return f"Security Violation: {e}"
 
-def read_file_with_policy(file_path: str, role: str = "user", sso_token: str = None, spiffe_id: str = None, cert_pem: str = None) -> str:
+def read_file_with_policy(file_path: str, role: str = "user", sso_token: str = None, spiffe_id: str = None, cert_pem: str = None, session_id: str = None) -> str:
     """
     Reads project files by delegating execution to the sandboxed 'read_file' tool
     running inside the isolated 'filesystem-provider' subprocess.
@@ -63,13 +65,14 @@ def read_file_with_policy(file_path: str, role: str = "user", sso_token: str = N
             args=args,
             sso_token=sso_token,
             spiffe_id=spiffe_id,
-            cert_pem=cert_pem
+            cert_pem=cert_pem,
+            session_id=session_id
         )
         return resp.get("result", "")
     except Exception as e:
         return f"Security Violation: {e}"
 
-def list_directory_with_policy(dir_path: str, role: str = "user", sso_token: str = None, spiffe_id: str = None, cert_pem: str = None) -> str:
+def list_directory_with_policy(dir_path: str, role: str = "user", sso_token: str = None, spiffe_id: str = None, cert_pem: str = None, session_id: str = None) -> str:
     """
     Lists files inside directories by delegating execution to the sandboxed 'list_directory' tool
     running inside the isolated 'filesystem-provider' subprocess.
@@ -81,13 +84,14 @@ def list_directory_with_policy(dir_path: str, role: str = "user", sso_token: str
             args=args,
             sso_token=sso_token,
             spiffe_id=spiffe_id,
-            cert_pem=cert_pem
+            cert_pem=cert_pem,
+            session_id=session_id
         )
         return resp.get("result", "")
     except Exception as e:
         return f"Security Violation: {e}"
 
-def keycloak_list_users_with_policy(sso_token: str = None, spiffe_id: str = None, cert_pem: str = None) -> str:
+def keycloak_list_users_with_policy(sso_token: str = None, spiffe_id: str = None, cert_pem: str = None, session_id: str = None) -> str:
     """
     Lists Keycloak users by delegating execution to the sandboxed 'keycloak_list_users' tool
     running inside the isolated 'keycloak-provider' subprocess.
@@ -99,13 +103,14 @@ def keycloak_list_users_with_policy(sso_token: str = None, spiffe_id: str = None
             args=args,
             sso_token=sso_token,
             spiffe_id=spiffe_id,
-            cert_pem=cert_pem
+            cert_pem=cert_pem,
+            session_id=session_id
         )
         return resp.get("result", "[]")
     except Exception as e:
         return f"Security Violation: {e}"
 
-def keycloak_revoke_user_sessions_with_policy(username: str = "", userId: str = "", sso_token: str = None, spiffe_id: str = None, cert_pem: str = None) -> str:
+def keycloak_revoke_user_sessions_with_policy(username: str = "", userId: str = "", sso_token: str = None, spiffe_id: str = None, cert_pem: str = None, session_id: str = None) -> str:
     """
     Revokes user sessions in Keycloak by delegating execution to the sandboxed 'keycloak_revoke_user_sessions' tool
     running inside the isolated 'keycloak-provider' subprocess.
@@ -126,13 +131,14 @@ def keycloak_revoke_user_sessions_with_policy(username: str = "", userId: str = 
             args=args,
             sso_token=sso_token,
             spiffe_id=spiffe_id,
-            cert_pem=cert_pem
+            cert_pem=cert_pem,
+            session_id=session_id
         )
         return resp.get("result", "")
     except Exception as e:
         return f"Security Violation: {e}"
 
-def keycloak_run_drills_with_policy(role: str = "user", sso_token: str = None, spiffe_id: str = None, cert_pem: str = None) -> str:
+def keycloak_run_drills_with_policy(role: str = "user", sso_token: str = None, spiffe_id: str = None, cert_pem: str = None, session_id: str = None) -> str:
     """
     Executes automated policy verification drills via the Shield Bridge proxy.
     """
@@ -143,13 +149,39 @@ def keycloak_run_drills_with_policy(role: str = "user", sso_token: str = None, s
             args=args,
             sso_token=sso_token,
             spiffe_id=spiffe_id,
-            cert_pem=cert_pem
+            cert_pem=cert_pem,
+            session_id=session_id
         )
         return resp.get("result", "")
     except Exception as e:
         return f"Security Violation: {e}"
 
-# LangChain Tool placeholders imported by main.py at load-time (overridden dynamically during agent run)
+def fetch_url_with_policy(url: str, sso_token: str = None, spiffe_id: str = None, cert_pem: str = None, session_id: str = None) -> str:
+    """
+    Fetches an external URL by delegating to the Shield Bridge.
+    The bridge's policy engine will evaluate this request against active rules.
+    """
+    try:
+        args = {"url": url}
+        resp = shield.call_tool(
+            tool_name="fetch_url",
+            args=args,
+            sso_token=sso_token,
+            spiffe_id=spiffe_id,
+            cert_pem=cert_pem,
+            session_id=session_id
+        )
+        return resp.get("result", "")
+    except Exception as e:
+        raise RuntimeError(f"Security Violation: {e}")
+
+
+fetch_url_tool = Tool(
+    name='FetchURL',
+    func=lambda x="": "Placeholder",
+    description="Placeholder"
+)
+
 get_current_user_tool = Tool(
     name='GetCurrentUser',
     func=lambda x="": "Placeholder",

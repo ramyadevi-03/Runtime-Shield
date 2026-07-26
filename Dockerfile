@@ -32,10 +32,11 @@ COPY --from=node-builder /app/node_modules ./node_modules
 COPY package*.json tsconfig.json ./
 
 # Copy other project code files
-COPY bridge.py telemetry.py database_mcp.py scanner_mcp.py system_monitor_mcp.py sse_bridge.cjs start.sh ./
+COPY bridge.py telemetry.py database_mcp.py scanner_mcp.py system_monitor_mcp.py audit_agent.py windows_sandbox.py ./
 COPY rules/ ./rules/
 COPY mcp-firewall.yaml ./mcp-firewall.yaml
 COPY mcp_firewall/ ./mcp_firewall/
+COPY governance_memory/ ./governance_memory/
 COPY shield_sdk.py dashboard_client.py ./
 COPY spire/ ./spire/
 

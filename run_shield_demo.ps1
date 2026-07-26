@@ -17,11 +17,9 @@ if ($ScriptDir) { Set-Location $ScriptDir }
 
 Write-Host "🧹 Cleaning up old processes and logs for a fresh start..." -ForegroundColor Yellow
 
-# Kill any ghost python or streamlit processes from previous runs using taskkill (more reliable on Windows)
-taskkill /f /im python.exe 2>$null
-taskkill /f /im streamlit.exe 2>$null
-Get-Process -Name "python" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Get-Process -Name "streamlit" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+# Kill lingering demo processes selectively instead of all python.exe instances
+Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%bridge.py%'" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%streamlit%'" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 # Remove old database files and logs
 Remove-Item -Path "telemetry.db*" -Force -ErrorAction SilentlyContinue
@@ -92,8 +90,8 @@ finally {
     if ($StreamlitProcess) {
         Stop-Process -Id $StreamlitProcess.Id -Force -ErrorAction SilentlyContinue
     }
-    # To be extra safe and ensure no orphaned python/streamlit processes are left:
-    taskkill /f /im python.exe 2>$null
-    taskkill /f /im streamlit.exe 2>$null
+    # To be extra safe and ensure no orphaned demo processes are left:
+    Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%bridge.py%'" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%streamlit%'" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Write-Host "✨ Shutdown complete. Have a secure day!" -ForegroundColor Green
 }

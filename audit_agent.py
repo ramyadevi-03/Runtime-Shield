@@ -12,6 +12,18 @@ LOG_PATH = os.path.join(PROJECT_DIR, "bridge.log")
 API_KEY = os.getenv("NVIDIA_API_KEY", "")
 BASE_URL = os.getenv("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
+# ── Governance Memory Layer ───────────────────────────────────────
+try:
+    from governance_memory.writer import MemoryWriter
+    from governance_memory.scanner import MemoryScanner
+    _memory_writer  = MemoryWriter(base_dir=PROJECT_DIR)
+    _memory_scanner = MemoryScanner(base_dir=PROJECT_DIR)
+except Exception as _mem_err:
+    _memory_writer  = None
+    _memory_scanner = None
+    print(f"[AuditAgent] ⚠️ Governance Memory not available: {_mem_err}", flush=True)
+# ────────────────────────────────────────────────────────────
+
 # Llama Guard 4 safety categories mapping
 LLAMA_GUARD_CATEGORIES = {
     "S1": "Violent Crimes",
@@ -69,6 +81,9 @@ class AuditAgent:
         # Bridge integration hooks (set when running as embedded thread)
         self.fraud_engine = fraud_engine
         self.dashboard_state = dashboard_state
+        # Governance Memory references (module-level singletons)
+        self.memory_writer  = _memory_writer
+        self.memory_scanner = _memory_scanner
 
     def _parse_guard_response(self, guard_text: str) -> tuple[bool, int, list[str]]:
         """
@@ -149,6 +164,12 @@ class AuditAgent:
 
         log_audit(f"🔍 Reconstructed conversation for Llama Guard audit:\n{cleaned_block}")
 
+        # ── 🧠 MEMORY CONTEXT: Read historical context before sending to Llama Guard ──
+        mem_context = self._lookup_memory_context(block)
+        if mem_context:
+            log_audit(f"🧠 Memory context: {mem_context}")
+        # ────────────────────────────────────────────────────────────────────────────
+
         endpoint = f"{self.base_url}/chat/completions"
         try:
             # Format the conversation for Llama Guard 4's expected input
@@ -172,6 +193,10 @@ class AuditAgent:
             if response.status_code == 200:
                 result = response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                 is_unsafe, score, categories = self._parse_guard_response(result)
+
+                # Store mem_context reference for _handle_audit_finding
+                self._current_mem_context = mem_context
+                self._current_block = block
                 
                 # --- ROLE-AWARE ADJUSTMENT ---
                 # Detect if the log block we just read belongs to an Admin
@@ -208,8 +233,11 @@ class AuditAgent:
             log_audit(f"Exception during Llama Guard audit: {e}")
 
     def _handle_audit_finding(self, score: int, description: str, categories: list[str] = None):
-        """Push audit findings to the dashboard and fraud engine when running embedded in bridge.py."""
+        """Push audit findings to the dashboard, fraud engine, AND governance memory."""
         if score < 3:
+            # 🧠 MEMORY: Even SAFE findings update agent trust if they have memory context
+            if hasattr(self, '_current_mem_context') and self._current_mem_context:
+                pass  # Future: log safe audit confirmation to session
             return  # Safe — nothing to report
 
         # Determine severity based on score
@@ -255,6 +283,112 @@ class AuditAgent:
                 log_audit(f"🚨 AUDIT AGENT: Fraud engine risk bumped by {risk_bump} across all agents")
             except Exception as e:
                 log_audit(f"⚠️ Failed to bump fraud engine risk: {e}")
+
+        # 3. 🧠 MEMORY: Write Llama Guard finding to governance memory
+        self._write_to_memory(score, description, categories or [])
+
+    # ── Governance Memory Methods ───────────────────────────────────────────
+
+    def _lookup_memory_context(self, block: str) -> str | None:
+        """
+        Before running Llama Guard, scan the memory files for context about
+        any agent IDs mentioned in this log block.
+
+        Returns a short human-readable context string, or None if no history.
+        """
+        if not self.memory_scanner:
+            return None
+
+        try:
+            # Try to extract an agent/SPIFFE ID from the log block
+            agent_match = re.search(r'spiffe://[^\s"\)]+', block)
+            agent_id = agent_match.group(0) if agent_match else None
+
+            if not agent_id:
+                return None
+
+            # Run a memory scan with a neutral tool name (audit context)
+            ctx = self.memory_scanner.scan(
+                agent_id=agent_id,
+                tool_name="(audit-agent)",
+                tool_args={},
+            )
+
+            if not ctx.agent_found_in_memory:
+                return None
+
+            parts = []
+            if ctx.agent_trust_level != "new":
+                parts.append(f"Agent trust: {ctx.agent_trust_level}")
+            if ctx.historical_blocks > 0:
+                parts.append(f"{ctx.historical_blocks} prior blocks")
+            if ctx.known_attack_match:
+                parts.append(f"known pattern: {ctx.known_attack_match}")
+
+            return " | ".join(parts) if parts else None
+
+        except Exception as e:
+            log_audit(f"[GovernanceMemory] ⚠️ Memory context lookup failed: {e}")
+            return None
+
+    def _write_to_memory(self, score: int, description: str, categories: list[str]):
+        """
+        Write every Llama Guard finding (score >= 3) to governance memory.
+
+        Writes to:
+          - long_term/incident_history.md  (severity log)
+          - long_term/agent_profiles.md    (agent profile update)
+          - short_term/active_threats.md   (if high severity)
+        """
+        if not self.memory_writer:
+            return
+
+        try:
+            # Determine severity label
+            if score >= 8:
+                severity = "critical"
+                action   = "deny"
+            elif score >= 5:
+                severity = "high"
+                action   = "deny"
+            else:
+                severity = "medium"
+                action   = "allow"
+
+            # Extract agent ID from current block if available
+            block = getattr(self, '_current_block', '')
+            agent_match = re.search(r'spiffe://[^\s"\)]+', block)
+            agent_id  = agent_match.group(0) if agent_match else "llama-guard-audit"
+
+            # Build reason string
+            cat_str = ", ".join(categories) if categories else "none"
+            reason  = f"Llama Guard Score {score}/10 — Categories: {cat_str} — {description[:120]}"
+
+            # Use a synthetic audit session ID so it shows up in the session log
+            session_id = f"audit-{int(time.time())}"
+
+            self.memory_writer.record_decision(
+                session_id=session_id,
+                agent_id=agent_id,
+                user_id="llama-guard-4",
+                user_role="audit-agent",
+                tool_name="(audit-agent)",
+                tool_args={"categories": cat_str, "score": str(score)},
+                action=action,
+                reason=reason,
+                severity=severity,
+                risk_score=score * 10,
+                memory_context=(
+                    {"known_attack_match": getattr(self, '_current_mem_context', None)}
+                    if getattr(self, '_current_mem_context', None) else None
+                ),
+            )
+
+            log_audit(f"🧠 Memory: Llama Guard finding written to governance memory (session: {session_id})")
+
+        except Exception as e:
+            log_audit(f"[GovernanceMemory] ⚠️ Non-fatal memory write error: {e}")
+    # ────────────────────────────────────────────────────────────────────────────
 
     def run(self):
         log_audit(f"Audit Agent active (Llama Guard 4). Monitoring {LOG_PATH}...")

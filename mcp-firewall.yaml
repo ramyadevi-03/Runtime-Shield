@@ -114,11 +114,12 @@ rules:
     message: "Sandbox Access: Authorized experiment zone operations."
 
   # 4. Block all other filesystem access for standard users (Defense in Depth)
+  # 4. Block all other filesystem access for standard and privileged users (Defense in Depth)
   - name: block-unauthorized-fs
     tool: "read_file|list_directory|write_file"
     match:
       arguments:
-        role: "user"
+        role: "user|privileged"
     action: deny
     message: "Security violation: Unauthorized filesystem access attempt."
 
@@ -147,11 +148,25 @@ rules:
     message: "CRITICAL VIOLATION: Access to internal system management tools is strictly prohibited."
     priority: critical
 
-  # 6. Default Allow for other tools (like Keycloak)
-  - name: allow-keycloak-tools
-    tool: "keycloak_*"
+  # 6. Restrict sensitive Keycloak administration tools to admin only
+  - name: allow-keycloak-admin
+    tool: "keycloak_list_users|keycloak_revoke_user_sessions|keycloak_run_drills|keycloak_generate_policy|keycloak_quarantine_user"
+    match:
+      arguments:
+        role: "admin"
     action: allow
-    message: "Governance: Identity management access granted."
+    message: "Governance: Admin authorized to manage Keycloak and run drills."
+
+  - name: deny-keycloak-admin
+    tool: "keycloak_list_users|keycloak_revoke_user_sessions|keycloak_run_drills|keycloak_generate_policy|keycloak_quarantine_user"
+    action: deny
+    message: "Access Denied: Keycloak administration is restricted to the administrator role."
+
+  # 6b. Allow general Keycloak user profile/event read tools for normal/privileged
+  - name: allow-keycloak-general
+    tool: "keycloak_get_user_events|keycloak_security_report"
+    action: allow
+    message: "Governance: Keycloak diagnostic events read granted."
     zone: staging # Default zone for these tools
 
   # 7. Default Allow for Sandboxed Database tools
@@ -176,11 +191,20 @@ rules:
     action: deny
     message: "Security Violation: Non-admin role cannot view host active connections."
 
-  # 10. Allow general scanner/monitor tools for standard operations
+  # 10. Allow general scanner/monitor tools only for admin and privileged users
   - name: allow-general-diagnostics
     tool: "ScanDependencies|ScanSecrets|GetSystemMetrics"
+    match:
+      arguments:
+        role: "admin|privileged"
     action: allow
-    message: "Governance: General diagnostic scans permitted."
+    message: "Governance: Diagnostic scans permitted for privileged and admin roles."
+
+  # 11. Block normal user role from running diagnostic scans
+  - name: deny-user-diagnostics
+    tool: "ScanDependencies|ScanSecrets|GetSystemMetrics"
+    action: deny
+    message: "Access Denied: Standard users cannot run diagnostic system scans."
 
 # Threat Feed Integration
 threat_feed:
@@ -251,3 +275,12 @@ mcp_servers:
         scope: "tool:keycloak_read"
       - name: "GetActiveConnections"
         scope: "tool:keycloak_read"
+
+# XAA Trusted Identity Providers configuration
+trusted_identity_providers:
+  - issuer: "https://external-idp.example.com"
+    client_id: "external-client"
+    jwks_url: "https://external-idp.example.com/oauth/jwks"
+    role_mappings:
+      "External-Admins": "Administrators"
+      "External-Users": "Normal-Users"

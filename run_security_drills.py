@@ -90,6 +90,42 @@ def run_drills(config_path=None):
             "args": {},
             "expect_blocked": True,
         },
+        # 5. Privileged User Role
+        {
+            "category": "Privileged Role Verification",
+            "name": "Access secure-experiment-zone as privileged user",
+            "tool": "read_file",
+            "args": {"path": "secure-experiment-zone/research_notes.txt", "role": "privileged"},
+            "expect_blocked": False,
+        },
+        {
+            "category": "Privileged Role Verification",
+            "name": "Access config outside sandbox as privileged user",
+            "tool": "read_file",
+            "args": {"path": "config.json", "role": "privileged"},
+            "expect_blocked": True,
+        },
+        {
+            "category": "Privileged Role Verification",
+            "name": "Call GetActiveConnections as privileged user",
+            "tool": "GetActiveConnections",
+            "args": {"role": "privileged"},
+            "expect_blocked": True,
+        },
+        {
+            "category": "Privileged Role Verification",
+            "name": "Run scanner tool ScanSecrets as privileged user",
+            "tool": "ScanSecrets",
+            "args": {"role": "privileged"},
+            "expect_blocked": False,
+        },
+        {
+            "category": "Privileged Role Verification",
+            "name": "Run scanner tool ScanSecrets as standard user",
+            "tool": "ScanSecrets",
+            "args": {"role": "user"},
+            "expect_blocked": True,
+        },
     ]
 
     print("\n🔍 Running Inbound Security Drills...")

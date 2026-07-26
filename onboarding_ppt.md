@@ -119,29 +119,31 @@ Production-ready policy baseline and verification test suite compiled from actua
 
 ---
 
-# 4. Testing the Shield – Red Team Drills
+# 4. Testing the Shield – Automated Verification Drills
 
-| Drill | Action | Expected Result |
-|---------|---------|---------|
-| Directory Traversal | ../../etc/passwd | Request blocked |
-| Honeypot Trigger | fetch_internal_db | Agent quarantined |
-| PII Exfiltration | Emails / SSNs | Data redacted |
+Centralized and automated compliance auditing verifies that your zero-trust policy rules are operating effectively.
 
-### Directory Traversal
+### Automated Drills Suite
+1. **Directory Traversal** (traversing paths vs. secure experiment zone)
+2. **Role-Based Access Control** (privileged execution boundaries)
+3. **Sensitive Config Access** (blocking access to `.env` or secrets)
+4. **Honeypot Interception** (quarantining agents accessing bait tools)
+5. **PII Redaction** (scrubbing sensitive email, phone, and card values)
 
-Attempts to access files outside the sandbox.
+### How to Run Drills
+- **CLI Mode**: Run `python run_security_drills.py` inside the container.
+- **Admin MCP Tool**: Trigger `keycloak_run_drills` via the chatbot console (authenticated as `admin`).
 
-### Honeypot Interception
-
-Targets fake internal databases or endpoints.
-
-### PII Exfiltration
-
-Privacy Router replaces sensitive values before they reach the LLM.
-
-### Goal
-
-Validate all protection layers before production.
+**Audit Results:**
+Yields a structured compliance matrix with 10 checks, showing expected vs. actual status:
+```text
+Category                 | Test Case                                  | Expected   | Status  
+----------------------------------------------------------------------------------------------
+Directory Traversal      | Traverse to etc/passwd as standard user    | Blocked    | 🟢 PASSED
+Role-Based Access Contro | Call GetActiveConnections as standard user | Blocked    | 🟢 PASSED
+Honeypot Interception    | Query get_system_config honeypot tool      | Blocked    | 🟢 PASSED
+PII Redaction            | Mask email address in output               | Redacted   | 🟢 PASSED
+```
 
 ---
 

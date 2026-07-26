@@ -15,14 +15,16 @@ Requires the following environment variables (no hardcoded defaults):
 import requests
 import os
 import sys
+import urllib3
 from dotenv import load_dotenv
 
 load_dotenv()
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def _require_env(name: str) -> str:
     val = os.getenv(name)
     if not val:
-        print(f"\n❌ Fatal: Missing required environment variable '{name}'.")
+        print(f"\n[FATAL] Missing required environment variable '{name}'.")
         print("   Please set it in your .env file before running this setup utility.")
         sys.exit(1)
     return val
@@ -57,13 +59,13 @@ class KeycloakSession:
             data["client_secret"] = CLIENT_SECRET
 
         try:
-            r = requests.post(url, data=data, timeout=10)
+            r = requests.post(url, data=data, timeout=10, verify=False)
             if r.status_code == 200:
                 self.token = r.json()["access_token"]
                 return
-            print(f"❌ Admin token request failed (HTTP {r.status_code}): {r.text}")
+            print(f"[ERROR] Admin token request failed (HTTP {r.status_code}): {r.text}")
         except requests.RequestException as e:
-            print(f"❌ Connection error while getting admin token: {e}")
+            print(f"[ERROR] Connection error while getting admin token: {e}")
         self.token = None
 
     def get_headers(self):
@@ -80,6 +82,7 @@ class KeycloakSession:
                 raise RuntimeError("Not authenticated")
 
         kwargs["headers"] = self.get_headers()
+        kwargs["verify"] = False
         r = requests.request(method, url, **kwargs)
 
         if r.status_code == 401:
@@ -88,6 +91,7 @@ class KeycloakSession:
             if not self.token:
                 raise RuntimeError("Re-authentication failed")
             kwargs["headers"] = self.get_headers()
+            kwargs["verify"] = False
             r = requests.request(method, url, **kwargs)
 
         return r
@@ -261,6 +265,159 @@ def configure_client_scopes(session: KeycloakSession):
                 print(f"[ERROR] Exception while associating scope '{scope_name}': {e}")
 
 
+def configure_groups_and_mappers(session: KeycloakSession):
+    """Ensure groups exist, assign users, and add group membership mapper to the client client."""
+    groups = ["Normal-Users", "Privileged-Users", "Administrators"]
+    group_ids = {}
+    
+    # 1. Create groups if they don't exist
+    groups_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/groups"
+    try:
+        r = session.request("GET", groups_url, timeout=10)
+        if r.status_code == 200:
+            existing_groups = {g["name"]: g["id"] for g in r.json() if "name" in g}
+        else:
+            existing_groups = {}
+    except Exception as e:
+        print(f"[ERROR] Failed to list groups: {e}")
+        existing_groups = {}
+
+    for gname in groups:
+        if gname in existing_groups:
+            group_ids[gname] = existing_groups[gname]
+            print(f"[INFO] Group '{gname}' already exists (ID: {group_ids[gname]})")
+        else:
+            try:
+                r = session.request("POST", groups_url, json={"name": gname}, timeout=10)
+                if r.status_code == 201:
+                    print(f"[OK] Created group '{gname}'")
+                    r_list = session.request("GET", groups_url, timeout=10)
+                    if r_list.status_code == 200:
+                        existing_groups = {g["name"]: g["id"] for g in r_list.json() if "name" in g}
+                        group_ids[gname] = existing_groups.get(gname)
+                else:
+                    print(f"[ERROR] Failed to create group '{gname}': {r.status_code} {r.text}")
+            except Exception as e:
+                print(f"[ERROR] Exception while creating group '{gname}': {e}")
+
+    # 2. Get client UUID
+    clients_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients?clientId={CLIENT_ID}"
+    try:
+        r = session.request("GET", clients_url, timeout=10)
+        if r.status_code != 200:
+            print(f"[ERROR] Failed to get client metadata: {r.status_code} {r.text}")
+            return
+        clients = r.json()
+        if not clients or not isinstance(clients, list):
+            print(f"[ERROR] Client '{CLIENT_ID}' not found or invalid format")
+            return
+        client_uuid = clients[0]["id"]
+    except Exception as e:
+        print(f"[ERROR] Exception retrieving client UUID: {e}")
+        return
+
+    # 3. Add Group Membership Mapper to the client
+    mappers_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{client_uuid}/protocol-mappers/models"
+    try:
+        r = session.request("GET", mappers_url, timeout=10)
+        existing_mappers = []
+        if r.status_code == 200:
+            existing_mappers = [m["name"] for m in r.json() if "name" in m]
+        
+        if "group-membership" in existing_mappers:
+            print("[INFO] Group membership mapper already exists for client")
+        else:
+            mapper_data = {
+                "name": "group-membership",
+                "protocol": "openid-connect",
+                "protocolMapper": "oidc-group-membership-mapper",
+                "config": {
+                    "full.path": "false",
+                    "id.token.claim": "true",
+                    "access.token.claim": "true",
+                    "claim.name": "groups",
+                    "userinfo.token.claim": "true"
+                }
+            }
+            r = session.request("POST", mappers_url, json=mapper_data, timeout=10)
+            if r.status_code == 201:
+                print("[OK] Created group membership mapper for client")
+            else:
+                print(f"[ERROR] Failed to create group mapper: {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"[ERROR] Exception creating group mapper: {e}")
+
+    # 4. User mapping function helper
+    def assign_user_to_group(username, gname):
+        user_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/users?username={username}"
+        try:
+            r = session.request("GET", user_url, timeout=10)
+            if r.status_code == 200 and r.json():
+                user_id = r.json()[0]["id"]
+                group_id = group_ids.get(gname)
+                if group_id:
+                    join_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/users/{user_id}/groups/{group_id}"
+                    r_join = session.request("PUT", join_url, timeout=10)
+                    if r_join.status_code in [200, 204]:
+                        print(f"[OK] Assigned user '{username}' to group '{gname}'")
+                    else:
+                        print(f"[ERROR] Failed to assign user '{username}' to group '{gname}': {r_join.status_code} {r_join.text}")
+            else:
+                print(f"[ERROR] User '{username}' not found for group assignment")
+        except Exception as e:
+            print(f"[ERROR] Exception assigning user '{username}' to group: {e}")
+
+    # Assign users to their respective groups
+    assign_user_to_group("admin", "Administrators")
+    assign_user_to_group("admin", "Privileged-Users")
+    assign_user_to_group("privileged", "Privileged-Users")
+    assign_user_to_group("user", "Normal-Users")
+
+
+def configure_trusted_idps(session: KeycloakSession):
+    """Ensure trusted external Identity Providers are configured in Keycloak."""
+    idp_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/identity-provider/instances"
+    try:
+        r = session.request("GET", idp_url, timeout=10)
+        existing_idps = []
+        if r.status_code == 200:
+            existing_idps = [idp["alias"] for idp in r.json() if "alias" in idp]
+        
+        idp_alias = "external-idp"
+        if idp_alias in existing_idps:
+            print(f"[INFO] Identity Provider '{idp_alias}' already exists")
+        else:
+            idp_data = {
+                "alias": idp_alias,
+                "displayName": "External IDP (XAA)",
+                "providerId": "keycloak-oidc",
+                "enabled": True,
+                "trustEmail": True,
+                "storeToken": True,
+                "addReadTokenRoleOnCreate": True,
+                "authenticateByDefault": False,
+                "linkOnly": False,
+                "firstBrokerLoginFlowAlias": "first broker login",
+                "config": {
+                    "clientId": "external-client",
+                    "clientSecret": "external-secret",
+                    "tokenUrl": "https://external-idp.example.com/oauth/token",
+                    "authorizationUrl": "https://external-idp.example.com/oauth/authorize",
+                    "userInfoUrl": "https://external-idp.example.com/oauth/userinfo",
+                    "jwksUrl": "https://external-idp.example.com/oauth/jwks",
+                    "useJwksUrl": "true"
+                }
+            }
+            r = session.request("POST", idp_url, json=idp_data, timeout=10)
+            if r.status_code == 201:
+                print(f"[OK] Registered External Identity Provider '{idp_alias}' for XAA support")
+            else:
+                # Keycloak might be offline or mocked during dev setup; output warning instead of hard crash
+                print(f"[WARNING] Could not register Identity Provider '{idp_alias}' (HTTP {r.status_code}): {r.text}")
+    except Exception as e:
+        print(f"[WARNING] Exception registering Identity Provider: {e}")
+
+
 def main():
     print("--- Keycloak Setup Utility ---")
     print(f"  URL:   {KEYCLOAK_URL}")
@@ -284,6 +441,13 @@ def main():
 
     update_user(session, "admin", ADMIN_PASS, "admin")
     update_user(session, "user", user_pass, "user")
+    update_user(session, "privileged", user_pass, "user")
+
+    # Configure Groups and Mappers
+    configure_groups_and_mappers(session)
+
+    # Configure Trusted Identity Providers for XAA
+    configure_trusted_idps(session)
 
     print("\n[OK] Keycloak setup complete.")
 

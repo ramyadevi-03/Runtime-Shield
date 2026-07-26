@@ -2303,11 +2303,62 @@ class JWTVerifier:
         self.jwks_url = jwks_url
         # PyJWKClient handles fetching and caching the keys dynamically from the JWKS endpoint
         self.jwk_client = jwt.PyJWKClient(self.jwks_url)
+        self.trusted_providers = []
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                full_config = yaml.safe_load(f) or {}
+                self.trusted_providers = full_config.get("trusted_identity_providers", [])
+        except Exception as e:
+            pass
 
     def verify(self, token):
         if not token:
             return None
         try:
+            # Check if this is an external XAA / ID-JAG identity assertion token
+            try:
+                unverified_claims = jwt.decode(token, options={"verify_signature": False})
+                iss = unverified_claims.get("iss")
+                
+                kc_url = os.getenv("KEYCLOAK_URL", "http://127.0.0.1:8080")
+                kc_realm = os.getenv("KEYCLOAK_REALM", "master")
+                expected_iss = f"{kc_url}/realms/{kc_realm}"
+                
+                if iss and iss != expected_iss:
+                    is_trusted = False
+                    for provider in self.trusted_providers:
+                        if provider.get("issuer") == iss:
+                            is_trusted = True
+                            log(f"🔑 XAA: Found matching trusted identity provider for issuer '{iss}'")
+                            is_dev = os.getenv("LOCAL_DEV_MODE", "false").lower() == "true"
+                            if is_dev:
+                                decoded = jwt.decode(
+                                    token,
+                                    "secret",
+                                    algorithms=["HS256"],
+                                    options={"verify_exp": False, "verify_aud": False}
+                                )
+                                log(f"✅ XAA ID-JAG Mock Token Verified (HS256) for federated user '{decoded.get('preferred_username', 'unknown')}' from issuer '{iss}'")
+                                
+                                # Apply role mappings
+                                role_mappings = provider.get("role_mappings", {})
+                                if role_mappings:
+                                    ext_groups = decoded.get("groups", [])
+                                    if isinstance(ext_groups, str):
+                                        ext_groups = [ext_groups]
+                                    mapped_groups = []
+                                    for g in ext_groups:
+                                        if g in role_mappings:
+                                            mapped_groups.append(role_mappings[g])
+                                    decoded["groups"] = list(set((decoded.get("groups", []) or []) + mapped_groups))
+                                
+                                return decoded
+                    if not is_trusted:
+                        log(f"🚫 JWT Verification Failed: Issuer '{iss}' is untrusted.")
+                        return None
+            except Exception as ex:
+                log(f"⚠️ Failed XAA assertion token check: {ex}")
+
             # 1. Dev Mode Quick Mock Login Bypass (when LOCAL_DEV_MODE=true and using HS256 mock tokens)
             is_dev = os.getenv("LOCAL_DEV_MODE", "false").lower() == "true"
             if is_dev:
@@ -2472,7 +2523,8 @@ def get_token_scopes(token):
         scopes = scopes.split(" ")
     
     roles = decoded.get("realm_access", {}).get("roles", []) or decoded.get("roles", [])
-    return list(set(scopes + roles))
+    groups = decoded.get("groups", []) or []
+    return list(set(scopes + roles + groups))
 
 def is_scope_allowed(required_scope, token_scopes):
     if not required_scope:
@@ -3394,7 +3446,16 @@ async def chat_completions_proxy(request: Request):
             user_sub = claims.get("sub") or ""
             log(f"JWT SUB: {user_sub}")
             roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
-            user_role = "admin" if "admin" in roles else "user"
+            groups = claims.get("groups", []) or []
+            scopes = claims.get("scope", "")
+            if isinstance(scopes, str):
+                scopes = scopes.split(" ")
+            if "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
+                user_role = "admin"
+            elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
+                user_role = "privileged"
+            else:
+                user_role = "user"
         except Exception as e:
             log(f"⚠️ Proxy failed to decode JWT token: {e}")
 
@@ -3986,6 +4047,7 @@ async def execute_tool_proxy(request: Request):
     global gateway_instance, nim_guard_instance, fraud_engine_instance
     global mcp_processes, tool_map, scope_map, pending_tool_futures
 
+    spiffe_id = "chatbot"
     incoming_headers = dict(request.headers)
     log(f"📋 [Tool REST Ingress] Incoming tool execution request: {incoming_headers}")
 
@@ -4090,10 +4152,16 @@ async def execute_tool_proxy(request: Request):
             user_sub = claims.get("sub") or ""
             log(f"JWT SUB inside tool execute: {user_sub}")
             roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
+            groups = claims.get("groups", []) or []
             scopes = claims.get("scope", "")
             if isinstance(scopes, str):
                 scopes = scopes.split(" ")
-            user_role = "admin" if ("admin" in roles or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes) else "user"
+            if "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
+                user_role = "admin"
+            elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
+                user_role = "privileged"
+            else:
+                user_role = "user"
         except Exception as e:
             log(f"⚠️ Tool REST Proxy failed to decode JWT token: {e}")
 

@@ -147,10 +147,16 @@ else:
                     import jwt
                     claims = jwt.decode(access_token, options={"verify_signature": False})
                     roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
+                    groups = claims.get("groups", []) or []
                     scopes = claims.get("scope", "")
                     if isinstance(scopes, str):
                         scopes = scopes.split(" ")
-                    st.session_state.role = "admin" if ("admin" in roles or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes) else "user"
+                    if "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
+                        st.session_state.role = "admin"
+                    elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
+                        st.session_state.role = "privileged"
+                    else:
+                        st.session_state.role = "user"
                     st.session_state.username = claims.get("preferred_username") or username_input
                     st.success("Successfully authenticated!")
                     st.rerun()
@@ -278,10 +284,16 @@ if prompt := st.chat_input(placeholder="Show my recent transactions"):
             claims = jwt.decode(token, options={"verify_signature": False})
             keycloak_sub = claims.get("sub") or ""
             roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
+            groups = claims.get("groups", []) or []
             scopes = claims.get("scope", "")
             if isinstance(scopes, str):
                 scopes = scopes.split(" ")
-            role = "admin" if ("admin" in roles or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes) else "user"
+            if "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
+                role = "admin"
+            elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
+                role = "privileged"
+            else:
+                role = "user"
             debug_mode = False
         except Exception:
             pass

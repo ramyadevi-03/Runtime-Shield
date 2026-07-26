@@ -21,6 +21,7 @@ class DashboardManager:
         self._start_time = time.time()
 
     async def connect(self, websocket: WebSocket):
+        self.loop = asyncio.get_running_loop()
         await websocket.accept()
         self.active_connections.append(websocket)
         stats = telemetry.get_metrics()
@@ -89,21 +90,18 @@ class DashboardState:
 
         # 2. Broadcast to live WebSockets
         try:
-            # We use the existing manager's broadcast logic
-            # Since this is called from the bridge's sync threads, we use the loop
-            # if one is already running, or we just rely on the next poll/connect.
-            import asyncio
-            loop = None
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                pass
-
-            if loop and loop.is_running():
-                loop.create_task(manager.broadcast_event(event))
+            if hasattr(manager, 'loop') and manager.loop and manager.loop.is_running():
+                asyncio.run_coroutine_threadsafe(manager.broadcast_event(event), manager.loop)
             else:
-                # Fallback: the next client that connects will see this in their 'init'
-                pass
+                import asyncio
+                loop = None
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    pass
+
+                if loop and loop.is_running():
+                    loop.create_task(manager.broadcast_event(event))
         except Exception as e:
             logger.error(f"Failed to broadcast live event: {e}")
 
@@ -269,6 +267,134 @@ async def remove_registry(mcp_id: str):
 
     return {"status": "ok"}
 
+
+# ════════════════════════════════════════════════════════════════════
+# 🧠 GOVERNANCE INTELLIGENCE API  (Phase 4 — Memory Layer)
+# ════════════════════════════════════════════════════════════════════
+
+def _get_advisor():
+    """Get or create a PolicyAdvisor instance (lazy, uses PROJECT_DIR from bridge)."""
+    import sys, os
+    bridge = sys.modules.get("bridge") or sys.modules.get("__main__")
+    base_dir = getattr(bridge, "PROJECT_DIR", None) or os.getcwd()
+    from governance_memory.policy_advisor import PolicyAdvisor
+    return PolicyAdvisor(base_dir=base_dir)
+
+@app.get("/api/memory/stats")
+async def get_memory_stats():
+    """Memory utilization — file counts, sizes, last consolidation time."""
+    try:
+        return {"status": "ok", "data": _get_advisor().get_memory_stats()}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/memory/recommendations")
+async def get_recommendations(status: str = None):
+    """All governance recommendations. Filter by ?status=PENDING|APPLIED|REJECTED."""
+    try:
+        return {"status": "ok", "data": _get_advisor().get_recommendations(status_filter=status)}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.patch("/api/memory/recommendations/{rec_id}")
+async def update_recommendation(rec_id: str, payload: Dict[str, Any]):
+    """Approve or reject a recommendation. Body: {status: 'APPLIED', applied_to: 'yaml'}"""
+    try:
+        new_status = payload.get("status", "APPLIED")
+        applied_to = payload.get("applied_to")
+        updated = _get_advisor().update_recommendation_status(rec_id, new_status, applied_to)
+        if updated:
+            return {"status": "ok", "message": f"Recommendation {rec_id} updated to {new_status}"}
+        return {"status": "error", "message": f"Recommendation {rec_id} not found"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/memory/patterns")
+async def get_attack_patterns():
+    """All confirmed attack patterns from long-term memory."""
+    try:
+        return {"status": "ok", "data": _get_advisor().get_attack_patterns()}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/memory/agents")
+async def get_agent_profiles():
+    """All agent behavioral profiles from long-term memory."""
+    try:
+        return {"status": "ok", "data": _get_advisor().get_agent_profiles()}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/memory/risk-state")
+async def get_risk_state():
+    """Live risk state summary from last consolidation cycle."""
+    try:
+        return {"status": "ok", "data": _get_advisor().get_risk_state()}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/memory/consolidate")
+async def trigger_consolidation():
+    """Trigger an immediate consolidation cycle (admin use)."""
+    import asyncio, sys
+    try:
+        bridge = sys.modules.get("bridge") or sys.modules.get("__main__")
+        consolidator = getattr(bridge, "memory_consolidator", None)
+        if consolidator:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, consolidator.run_once)
+            return {"status": "ok", "message": "Consolidation cycle completed"}
+        return {"status": "error", "message": "Consolidator not running in bridge process"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# ════════════════════════════════════════════════════════════════════
+# 🔒 DEDUP GUARD API  (Phase 6 — Deduplication)
+# ════════════════════════════════════════════════════════════════════
+
+def _get_dedup_guard():
+    """Lazy DedupGuard factory."""
+    import sys, os
+    bridge = sys.modules.get("bridge") or sys.modules.get("__main__")
+    base_dir = getattr(bridge, "PROJECT_DIR", None) or os.getcwd()
+    from governance_memory.dedup_guard import DedupGuard
+    return DedupGuard(base_dir=base_dir)
+
+@app.get("/api/memory/dedup-report")
+async def get_dedup_report():
+    """
+    Full dedup status: shows which PENDING recommendations are already
+    covered by active YAML/OPA rules and which are genuinely new.
+    """
+    try:
+        return {"status": "ok", "data": _get_dedup_guard().get_dedup_report()}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/memory/yaml-coverage")
+async def get_yaml_coverage():
+    """All active YAML rule names with their semantic fingerprints."""
+    try:
+        return {"status": "ok", "data": _get_dedup_guard().get_yaml_coverage()}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/memory/migration-check")
+async def migration_check(from_engine: str = "yaml", to_engine: str = "opa"):
+    """
+    Engine migration report. Checks every APPLIED/PENDING recommendation
+    against the destination engine to flag NEEDS_MIGRATION vs ALREADY_COVERED.
+    """
+    try:
+        report = _get_dedup_guard().check_migration(
+            from_engine=from_engine, to_engine=to_engine
+        )
+        return {"status": "ok", "from": from_engine, "to": to_engine, "data": report}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# ════════════════════════════════════════════════════════════════════
+
 @app.post("/api/registry/mcps/{provider_name}/sync")
 async def sync_mcp(provider_name: str):
     import sys
@@ -375,7 +501,7 @@ DASHBOARD_HTML = """
         <div class="nav-item" data-view="identity" onclick="switchNav(this)">Identity Mesh</div>
         <div class="nav-item" data-view="risk" onclick="switchNav(this)">Risk Graph</div>
         <div class="nav-item" data-view="registry" onclick="switchNav(this)">MCP Registry</div>
-        
+        <div class="nav-item" data-view="governance" onclick="switchNav(this); loadGovernanceData()">🧠 Governance Memory</div>
         <div class="recent-label">Recent Sessions</div>
         <div class="recent-item">demo-session (Active)</div>
         <div class="recent-item">security-audit-v1</div>
@@ -607,6 +733,66 @@ DASHBOARD_HTML = """
                 </div>
             </div>
         </div>
+
+        <!-- VIEW: GOVERNANCE INTELLIGENCE -->
+        <div id="view-governance" class="view-section">
+            <div style="padding: 0 40px 10px; display:flex; align-items:center; justify-content:space-between;">
+                <div style="font-size:0.7rem; color:var(--text-dim); text-transform:uppercase; font-weight:700; letter-spacing:1px;">🧠 Governance Memory Intelligence</div>
+                <div style="display:flex; gap:10px; align-items:center;">
+                    <span id="gov-last-sync" style="font-size:0.72rem; color:var(--text-dim);">Last sync: —</span>
+                    <button class="alert-btn" style="background:var(--accent);color:#fff;" onclick="triggerConsolidation()">⚡ Run Consolidation Now</button>
+                </div>
+            </div>
+
+            <!-- Row 1: Risk State Cards -->
+            <div style="display:flex; gap:16px; padding:0 40px 24px; flex-wrap:wrap;">
+                <div class="m-card" style="flex:1; min-width:140px;">
+                    <div class="m-label">SESSIONS SCANNED</div>
+                    <div class="m-value" id="gov-sessions" style="color:var(--accent)">—</div>
+                </div>
+                <div class="m-card" style="flex:1; min-width:140px;">
+                    <div class="m-label">TOTAL DENIES</div>
+                    <div class="m-value" id="gov-denies" style="color:var(--red)">—</div>
+                </div>
+                <div class="m-card" style="flex:1; min-width:140px;">
+                    <div class="m-label">KNOWN PATTERNS</div>
+                    <div class="m-value" id="gov-patterns" style="color:var(--orange)">—</div>
+                </div>
+                <div class="m-card" style="flex:1; min-width:140px;">
+                    <div class="m-label">HIGH-RISK SESSIONS</div>
+                    <div class="m-value" id="gov-highrisk" style="color:var(--red)">—</div>
+                </div>
+                <div class="m-card" style="flex:1; min-width:140px;">
+                    <div class="m-label">PENDING RECS</div>
+                    <div class="m-value" id="gov-pending" style="color:var(--green)">—</div>
+                </div>
+            </div>
+
+            <!-- Row 2: Attack Patterns -->
+            <div style="padding:0 40px 24px;">
+                <div style="font-size:0.7rem; color:var(--text-dim); text-transform:uppercase; letter-spacing:1px; margin-bottom:12px;">⚠️ Confirmed Attack Patterns (Long-Term Memory)</div>
+                <div id="gov-patterns-list" style="display:flex; flex-direction:column; gap:8px;">
+                    <div style="color:var(--text-dim); font-size:0.8rem;">Loading…</div>
+                </div>
+            </div>
+
+            <!-- Row 3: Agent Profiles -->
+            <div style="padding:0 40px 24px;">
+                <div style="font-size:0.7rem; color:var(--text-dim); text-transform:uppercase; letter-spacing:1px; margin-bottom:12px;">👤 Agent Behavioral Profiles</div>
+                <div id="gov-agents-list" style="display:flex; flex-direction:column; gap:6px; max-height:200px; overflow-y:auto;">
+                    <div style="color:var(--text-dim); font-size:0.8rem;">Loading…</div>
+                </div>
+            </div>
+
+            <!-- Row 4: Pending Recommendations -->
+            <div style="padding:0 40px 24px;">
+                <div style="font-size:0.7rem; color:var(--text-dim); text-transform:uppercase; letter-spacing:1px; margin-bottom:12px;">📋 Pending Policy Recommendations</div>
+                <div id="gov-recs-list" style="display:flex; flex-direction:column; gap:10px;">
+                    <div style="color:var(--text-dim); font-size:0.8rem;">Loading…</div>
+                </div>
+            </div>
+        </div>
+
     </div>
 
     <script>
@@ -614,6 +800,124 @@ DASHBOARD_HTML = """
         let currentEvents = [];
         let riskScore = 0;
         let riskChart;
+
+        // ── Governance Intelligence ─────────────────────────────────────
+        async function loadGovernanceData() {
+            try {
+                const [riskRes, patternsRes, agentsRes, recsRes] = await Promise.all([
+                    fetch('/api/memory/risk-state').then(r => r.json()),
+                    fetch('/api/memory/patterns').then(r => r.json()),
+                    fetch('/api/memory/agents').then(r => r.json()),
+                    fetch('/api/memory/recommendations?status=PENDING').then(r => r.json()),
+                ]);
+
+                // Risk State cards
+                const rs = riskRes.data || {};
+                document.getElementById('gov-sessions').textContent = rs.active_sessions_scanned ?? '—';
+                document.getElementById('gov-denies').textContent   = rs.total_denies_this_window ?? '—';
+                document.getElementById('gov-patterns').textContent = rs.known_patterns_in_long_term ?? '—';
+                document.getElementById('gov-highrisk').textContent = rs['high_risk_sessions_≥3_blocks'] ?? rs.high_risk_sessions ?? '—';
+                if (rs.last_updated) document.getElementById('gov-last-sync').textContent = 'Last sync: ' + rs.last_updated;
+
+                // Pending recommendations count
+                const recs = recsRes.data || [];
+                document.getElementById('gov-pending').textContent = recs.length;
+
+                // Attack Patterns
+                const patterns = patternsRes.data || [];
+                const pEl = document.getElementById('gov-patterns-list');
+                if (patterns.length === 0) {
+                    pEl.innerHTML = '<div style="color:var(--text-dim);font-size:0.8rem;">No confirmed patterns yet — run consolidation after multiple sessions.</div>';
+                } else {
+                    pEl.innerHTML = patterns.map(p => `
+                        <div style="background:rgba(248,113,113,0.08); border:1px solid rgba(248,113,113,0.2); border-radius:8px; padding:12px 16px; display:flex; justify-content:space-between; align-items:center;">
+                            <div>
+                                <div style="font-size:0.82rem; font-weight:600; color:var(--text);">${p.name || p.pattern_key}</div>
+                                <div style="font-size:0.72rem; color:var(--text-dim); margin-top:3px;">Tool: <code style="background:#333;padding:1px 5px;border-radius:3px;">${p.tool}</code> · Category: ${p.category} · ${p.session_count || 0} sessions · ${p.total_attempts || 0} attempts</div>
+                            </div>
+                            <div style="font-size:0.72rem; color:var(--red); font-weight:600;">${p.agent_count || 0} agents</div>
+                        </div>
+                    `).join('');
+                }
+
+                // Agent Profiles
+                const agents = agentsRes.data || [];
+                const aEl = document.getElementById('gov-agents-list');
+                if (agents.length === 0) {
+                    aEl.innerHTML = '<div style="color:var(--text-dim);font-size:0.8rem;">No agent profiles yet.</div>';
+                } else {
+                    const trustColor = {trusted:'var(--green)', new:'var(--text-dim)', suspicious:'var(--orange)', 'high-risk':'var(--red)'};
+                    aEl.innerHTML = agents.map(a => `
+                        <div style="background:var(--sidebar-bg); border:1px solid var(--border); border-radius:6px; padding:10px 14px; display:flex; justify-content:space-between; align-items:center;">
+                            <div>
+                                <div style="font-size:0.78rem; color:var(--text); font-family:'JetBrains Mono',monospace;">${a.agent_id}</div>
+                                <div style="font-size:0.7rem; color:var(--text-dim); margin-top:2px;">Calls: ${a.total_calls||0} · Blocked: ${a.blocked_attempts||0} · Risk: ${a.current_risk_score||0}</div>
+                            </div>
+                            <span style="font-size:0.7rem; font-weight:700; color:${trustColor[a.trust_level]||'var(--text-dim)'}; text-transform:uppercase;">${a.trust_level||'new'}</span>
+                        </div>
+                    `).join('');
+                }
+
+                // Pending Recommendations
+                const rEl = document.getElementById('gov-recs-list');
+                if (recs.length === 0) {
+                    rEl.innerHTML = '<div style="color:var(--green);font-size:0.82rem;">✅ No pending recommendations — governance is up to date.</div>';
+                } else {
+                    rEl.innerHTML = recs.map(r => `
+                        <div style="background:rgba(251,191,36,0.06); border:1px solid rgba(251,191,36,0.25); border-radius:8px; padding:14px 16px;">
+                            <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:6px;">
+                                <div>
+                                    <span style="font-size:0.7rem; color:var(--orange); font-weight:700; font-family:'JetBrains Mono',monospace;">${r.id}</span>
+                                    <span style="margin-left:10px; font-size:0.7rem; background:rgba(251,191,36,0.15); color:var(--orange); padding:2px 8px; border-radius:4px;">PENDING</span>
+                                </div>
+                                <div style="display:flex; gap:8px;">
+                                    <button onclick="applyRec('${r.id}','REJECTED')" style="background:rgba(248,113,113,0.15);border:1px solid rgba(248,113,113,0.3);color:var(--red);padding:4px 12px;border-radius:5px;cursor:pointer;font-size:0.72rem;">Reject</button>
+                                    <button onclick="applyRec('${r.id}','APPLIED')" style="background:rgba(74,222,128,0.15);border:1px solid rgba(74,222,128,0.3);color:var(--green);padding:4px 12px;border-radius:5px;cursor:pointer;font-size:0.72rem;">✓ Apply</button>
+                                </div>
+                            </div>
+                            <div style="font-size:0.8rem; color:var(--text); margin-bottom:4px;">${r.suggested_rule || r.pattern || ''}</div>
+                            <div style="font-size:0.7rem; color:var(--text-dim);">Fingerprint: <code style="background:#333;padding:1px 5px;border-radius:3px;">${r.fingerprint||''}</code> · Source: ${r.source||''}</div>
+                        </div>
+                    `).join('');
+                }
+
+            } catch(e) {
+                console.error('Governance data load failed:', e);
+            }
+        }
+
+        async function applyRec(recId, status) {
+            try {
+                const res = await fetch('/api/memory/recommendations/' + recId, {
+                    method: 'PATCH',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({status, applied_to: status === 'APPLIED' ? 'yaml' : 'none'})
+                });
+                const data = await res.json();
+                if (data.status === 'ok') loadGovernanceData();
+                else alert('Error: ' + data.message);
+            } catch(e) { console.error(e); }
+        }
+
+        async function triggerConsolidation() {
+            const btn = event.target;
+            btn.textContent = '⏳ Running…';
+            btn.disabled = true;
+            try {
+                const res = await fetch('/api/memory/consolidate', {method:'POST'});
+                const data = await res.json();
+                btn.textContent = data.status === 'ok' ? '✅ Done!' : '❌ Error';
+                setTimeout(() => {
+                    btn.textContent = '⚡ Run Consolidation Now';
+                    btn.disabled = false;
+                    loadGovernanceData();
+                }, 2000);
+            } catch(e) {
+                btn.textContent = '⚡ Run Consolidation Now';
+                btn.disabled = false;
+            }
+        }
+        // ────────────────────────────────────────────────────────────────
 
         function initChart() {
             const ctx = document.getElementById('riskChart').getContext('2d');

@@ -1,0 +1,22 @@
+version: 1.3.13
+
+cache: true
+
+endpoints:
+  custom:
+    - name: "RuntimeShield"
+      apiKey: "${HUGGINGFACE_TOKEN}"
+      baseURL: "http://gateway:5001/v1"
+      headers:
+        X-SPIFFE-ID: "spiffe://runtime-shield/llm-agent"
+      models:
+        default:
+          - "huggingface/meta-llama/Meta-Llama-3-8B-Instruct"
+          - "huggingface/google/gemma-1.1-7b-it"
+          - "huggingface/mistralai/Mistral-7B-Instruct-v0.2"
+          - "huggingface/Qwen/Qwen2.5-7B-Instruct"
+      fetch: false
+      titleConvo: true
+      titleModel: "huggingface/meta-llama/Meta-Llama-3-8B-Instruct"
+      dropParams: ["top_p"]
+      modelDisplayLabel: "RuntimeShield"

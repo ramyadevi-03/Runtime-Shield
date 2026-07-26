@@ -40,10 +40,13 @@ class PolicyEngine(InboundStage):
                 is_absolute = normalized.startswith("/") or ":" in normalized or normalized.startswith("//")
                 
                 if has_traversal or has_trailing_dot or is_absolute:
-                    return self._deny(
-                        "Security violation: Potential directory traversal or absolute path escape detected.",
-                        severity=Severity.HIGH
-                    )
+                    msg = "Security violation: Potential directory traversal or absolute path escape detected."
+                    if request.tool_name == "vuln_read_file":
+                        if has_traversal or has_trailing_dot:
+                            msg = "🛡️ Shield Block [Lab 1]: Directory traversal attack detected! Path escape via '../' is denied by Runtime Shield Policy Firewall."
+                        else:
+                            msg = "🛡️ Shield Block [Lab 1]: Absolute path to OS directory detected and denied by Runtime Shield."
+                    return self._deny(msg, severity=Severity.HIGH)
                 
                 # Apply normalization
                 norm_path = os.path.normpath(path_val)

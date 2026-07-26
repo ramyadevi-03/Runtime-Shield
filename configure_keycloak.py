@@ -435,9 +435,10 @@ def main():
         print("[ERROR] KEYCLOAK_USER_PASSWORD is not set in .env — skipping user password updates.")
         sys.exit(1)
 
-    update_user(session, "admin", ADMIN_PASS, "admin")
+    update_user(session, "admin", "admin", "admin")
     update_user(session, "user", user_pass, "user")
     update_user(session, "privileged", user_pass, "user")
+    update_user(session, "user1", user_pass, "user")
 
     # Configure Groups and Mappers
     configure_groups_and_mappers(session)

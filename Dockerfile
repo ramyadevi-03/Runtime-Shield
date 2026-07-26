@@ -32,7 +32,7 @@ COPY --from=node-builder /app/node_modules ./node_modules
 COPY package*.json tsconfig.json ./
 
 # Copy other project code files
-COPY bridge.py telemetry.py database_mcp.py scanner_mcp.py system_monitor_mcp.py ./
+COPY bridge.py telemetry.py database_mcp.py scanner_mcp.py system_monitor_mcp.py sse_bridge.cjs start.sh ./
 COPY rules/ ./rules/
 COPY mcp-firewall.yaml ./mcp-firewall.yaml
 COPY mcp_firewall/ ./mcp_firewall/
@@ -45,8 +45,9 @@ ENV PYTHONUNBUFFERED=1 \
     SPIFFE_ENABLED=true \
     SPIRE_AGENT_SOCKET=/run/spire/sockets/agent.sock
 
-# Expose ports for proxy (5001) and dashboard (9090)
+# Expose ports for proxy (5001), dashboard (9090), and sse-bridge (5002)
 EXPOSE 5001
 EXPOSE 9090
+EXPOSE 5002
 
-ENTRYPOINT ["python", "bridge.py"]
+ENTRYPOINT ["/bin/bash", "start.sh"]

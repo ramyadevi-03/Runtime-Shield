@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  librechat:
+    image: ghcr.io/danny-avila/librechat:latest
+    container_name: LibreChat
+    ports:
+      - "3080:3080"
+    env_file:
+      - .env
+    volumes:
+      - ./librechat.yaml:/app/librechat.yaml
+    depends_on:
+      - mongodb
+    restart: always
+    networks:
+      - shield-net
+
+  mongodb:
+    image: mongo:latest
+    container_name: mongodb
+    restart: always
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - shield-net
+
+volumes:
+  mongodb_data:
+
+networks:
+  shield-net:
+    name: runtime-shield_shield-net
+    external: true

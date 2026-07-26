@@ -1,4 +1,5 @@
 node_modules/
+node_modules/
 .env
 venv/
 .venv/
@@ -6,12 +7,12 @@ venv/
 dist/
 keycloak_data/
 telemetry.db*
+__pycache__/
 
 # Test & scratch artifacts
 tests/
 scratch/
 temp_repo/
-__pycache__/
 .pytest_cache/
 
 # Large binaries

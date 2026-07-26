@@ -38,6 +38,7 @@ COPY mcp-firewall.yaml ./mcp-firewall.yaml
 COPY mcp_firewall/ ./mcp_firewall/
 COPY governance_memory/ ./governance_memory/
 COPY shield_sdk.py dashboard_client.py ./
+COPY src/ ./src/
 COPY spire/ ./spire/
 
 # Set environment defaults

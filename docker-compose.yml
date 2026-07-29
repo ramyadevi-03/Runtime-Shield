@@ -84,7 +84,6 @@ services:
     volumes:
       - spire-agent-socket:/run/spire/sockets:ro
       - ./spire/certs:/app/spire/certs:ro
-      - ./.env:/app/.env
     depends_on:
       - keycloak
       - spire-agent

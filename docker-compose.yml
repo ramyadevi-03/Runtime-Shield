@@ -10,7 +10,7 @@ services:
       KC_BOOTSTRAP_ADMIN_PASSWORD: kavss
       KC_PROXY_HEADERS: xforwarded
     ports:
-      - "8080:8080"
+      - "8083:8080"
     volumes:
       - ./keycloak_data:/opt/keycloak/data
     networks:
@@ -29,7 +29,7 @@ services:
       - ./spire/certs:/run/spire/certs:ro
       - spire-server-data:/opt/spire/data
     ports:
-      - "8081:8081"
+      - "8082:8081"
     networks:
       - shield-net
     restart: always

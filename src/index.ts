@@ -77,12 +77,12 @@ function applyNodeRuntimeContainment() {
       const portNum = typeof port === "string" ? parseInt(port, 10) : port;
       
       const isLocalhost = host === "localhost" || host === "127.0.0.1" || host === "::1";
-      if (!isLocalhost || portNum !== 8080) {
-        throw new Error(`Security Violation: Connection to '${host}:${portNum}' is blocked for keycloak-provider. ONLY connection to localhost:8080 is allowed.`);
+      if (!isLocalhost || (portNum !== 8080 && portNum !== 8083)) {
+        throw new Error(`Security Violation: Connection to '${host}:${portNum}' is blocked for keycloak-provider. ONLY connection to localhost:8080 or localhost:8083 is allowed.`);
       }
       return originalConnect.apply(this, arguments as any);
     };
-    console.error("🔒 [Node Hardening Gateway] Outbound TCP network calls restricted ONLY to localhost:8080 for keycloak-provider.");
+    console.error("🔒 [Node Hardening Gateway] Outbound TCP network calls restricted ONLY to localhost:8080 or localhost:8083 for keycloak-provider.");
   }
 }
 

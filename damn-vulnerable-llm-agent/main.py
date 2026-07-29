@@ -101,12 +101,37 @@ import uuid
 if "session_id" not in st.session_state:
     st.session_state.session_id = f"session_{uuid.uuid4().hex[:8]}"
 
-if "keycloak_token" not in st.session_state:
-    st.session_state.keycloak_token = None
-if "role" not in st.session_state:
-    st.session_state.role = "user"
-if "username" not in st.session_state:
-    st.session_state.username = "Guest"
+if "keycloak_token" not in st.session_state or st.session_state.keycloak_token is None:
+    env_token = os.getenv("KEYCLOAK_TOKEN")
+    if env_token and env_token.strip() and env_token != "None":
+        st.session_state.keycloak_token = env_token.strip("'\"")
+        try:
+            import jwt
+            claims = jwt.decode(st.session_state.keycloak_token, options={"verify_signature": False})
+            roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
+            groups = claims.get("groups", []) or []
+            scopes = claims.get("scope", "")
+            if isinstance(scopes, str):
+                scopes = scopes.split(" ")
+            if "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
+                st.session_state.role = "admin"
+            elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
+                st.session_state.role = "privileged"
+            else:
+                st.session_state.role = "user"
+            st.session_state.username = claims.get("preferred_username") or "DemoUser"
+        except Exception:
+            st.session_state.role = "user"
+            st.session_state.username = "Guest"
+    else:
+        st.session_state.keycloak_token = None
+        st.session_state.role = "user"
+        st.session_state.username = "Guest"
+else:
+    if "role" not in st.session_state:
+        st.session_state.role = "user"
+    if "username" not in st.session_state:
+        st.session_state.username = "Guest"
 
 # Sidebar Login Form (always show if not authenticated)
 if st.session_state.keycloak_token and st.session_state.username != "Guest":

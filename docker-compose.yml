@@ -13,9 +13,6 @@ services:
       - "8083:8080"
     volumes:
       - ./keycloak_data:/opt/keycloak/data
-    networks:
-      - shield-net
-      - dokploy-network
     restart: always
 
 
@@ -29,8 +26,6 @@ services:
       - ./spire/server:/run/spire/config
       - ./spire/certs:/run/spire/certs:ro
       - spire-server-data:/opt/spire/data
-    networks:
-      - shield-net
     restart: always
 
 
@@ -49,8 +44,6 @@ services:
       - spire-agent-socket:/run/spire/sockets
     depends_on:
       - spire-server
-    networks:
-      - shield-net
     restart: always
 
 
@@ -88,9 +81,6 @@ services:
     depends_on:
       - keycloak
       - spire-agent
-    networks:
-      - shield-net
-      - dokploy-network
     restart: always
 
 
@@ -118,9 +108,6 @@ services:
       - ./spire/certs:/app/spire/certs:ro
     depends_on:
       - gateway
-    networks:
-      - shield-net
-      - dokploy-network
     restart: always
 
 
@@ -130,7 +117,6 @@ volumes:
   spire-agent-socket:
 
 networks:
-  shield-net:
-    driver: bridge
-  dokploy-network:
+  default:
+    name: dokploy-network
     external: true

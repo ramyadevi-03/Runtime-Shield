@@ -15,6 +15,7 @@ services:
       - ./keycloak_data:/opt/keycloak/data
     networks:
       - shield-net
+      - dokploy-network
     restart: always
 
 
@@ -89,6 +90,7 @@ services:
       - spire-agent
     networks:
       - shield-net
+      - dokploy-network
     restart: always
 
 
@@ -118,6 +120,7 @@ services:
       - gateway
     networks:
       - shield-net
+      - dokploy-network
     restart: always
 
 
@@ -129,3 +132,5 @@ volumes:
 networks:
   shield-net:
     driver: bridge
+  dokploy-network:
+    external: true

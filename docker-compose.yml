@@ -28,8 +28,6 @@ services:
       - ./spire/server:/run/spire/config
       - ./spire/certs:/run/spire/certs:ro
       - spire-server-data:/opt/spire/data
-    ports:
-      - "8082:8081"
     networks:
       - shield-net
     restart: always

@@ -172,40 +172,79 @@ if st.session_state.keycloak_token and st.session_state.username != "Guest":
         st.session_state.steps = {}
         st.rerun()
 else:
-    with st.sidebar.form("login_form"):
-        st.write("Sign in to Keycloak:")
-        username_input = st.text_input("Username")
-        password_input = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign In")
-        
-        if submitted:
-            # Call Keycloak Token API dynamically
-            kc_url = os.getenv("KEYCLOAK_URL", "http://127.0.0.1:8080")
-            realm = os.getenv("KEYCLOAK_REALM", "master")
-            client_id = os.getenv("KEYCLOAK_CLIENT_ID", "admin-cli")
-            client_secret = os.getenv("KEYCLOAK_CLIENT_SECRET")
+    tab1, tab2 = st.sidebar.tabs(["Credentials", "Federated SSO (XAA)"])
+    
+    with tab1:
+        with st.form("login_form"):
+            st.write("Sign in to Keycloak:")
+            username_input = st.text_input("Username")
+            password_input = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign In")
             
-            token_url = f"{kc_url}/realms/{realm}/protocol/openid-connect/token"
-            data = {
-                "grant_type": "password",
-                "client_id": client_id,
-                "username": username_input,
-                "password": password_input,
-                "scope": "openid profile email tool:read_file tool:write_file tool:list_directory tool:keycloak_read tool:keycloak_admin tool:keycloak_report tool:admin_internal"
-            }
-            if client_secret:
-                data["client_secret"] = client_secret
+            if submitted:
+                # Call Keycloak Token API dynamically
+                kc_url = os.getenv("KEYCLOAK_URL", "http://127.0.0.1:8080")
+                realm = os.getenv("KEYCLOAK_REALM", "master")
+                client_id = os.getenv("KEYCLOAK_CLIENT_ID", "admin-cli")
+                client_secret = os.getenv("KEYCLOAK_CLIENT_SECRET")
                 
-            try:
-                import requests
-                import urllib3
-                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-                r = requests.post(token_url, data=data, timeout=5, verify=False)
-                if r.status_code == 200:
-                    token_info = r.json()
-                    access_token = token_info["access_token"]
-                    st.session_state.keycloak_token = access_token
+                token_url = f"{kc_url}/realms/{realm}/protocol/openid-connect/token"
+                data = {
+                    "grant_type": "password",
+                    "client_id": client_id,
+                    "username": username_input,
+                    "password": password_input,
+                    "scope": "openid profile email tool:read_file tool:write_file tool:list_directory tool:keycloak_read tool:keycloak_admin tool:keycloak_report tool:admin_internal"
+                }
+                if client_secret:
+                    data["client_secret"] = client_secret
                     
+                try:
+                    import requests
+                    import urllib3
+                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                    r = requests.post(token_url, data=data, timeout=5, verify=False)
+                    if r.status_code == 200:
+                        token_info = r.json()
+                        access_token = token_info["access_token"]
+                        st.session_state.keycloak_token = access_token
+                        
+                        claims = get_claims_with_userinfo(access_token)
+                        roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
+                        groups = claims.get("groups", []) or []
+                        scopes = claims.get("scope", "")
+                        if isinstance(scopes, str):
+                            scopes = scopes.split(" ")
+                        if "Normal-Users" in groups:
+                            st.session_state.role = "user"
+                        elif "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
+                            st.session_state.role = "admin"
+                        elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
+                            st.session_state.role = "privileged"
+                        else:
+                            st.session_state.role = "user"
+                        st.session_state.username = claims.get("preferred_username") or username_input
+                        st.success("Successfully authenticated!")
+                        st.rerun()
+                    else:
+                        try:
+                            err_detail = r.json().get("error_description") or r.json().get("error") or r.text
+                        except Exception:
+                            err_detail = r.text
+                        st.error(f"Authentication failed ({r.status_code}): {err_detail}")
+                except Exception as e:
+                    st.error(f"Error connecting to Keycloak: {e}")
+                    
+    with tab2:
+        with st.form("token_login_form"):
+            st.write("Paste SSO / JIT token:")
+            token_input = st.text_area("JWT Token", height=120)
+            token_submitted = st.form_submit_button("SSO Token Login")
+            
+            if token_submitted and token_input.strip():
+                try:
+                    access_token = token_input.strip()
+                    st.session_state.keycloak_token = access_token
                     claims = get_claims_with_userinfo(access_token)
                     roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
                     groups = claims.get("groups", []) or []
@@ -220,17 +259,11 @@ else:
                         st.session_state.role = "privileged"
                     else:
                         st.session_state.role = "user"
-                    st.session_state.username = claims.get("preferred_username") or username_input
-                    st.success("Successfully authenticated!")
+                    st.session_state.username = claims.get("preferred_username") or claims.get("sub") or "FederatedUser"
+                    st.success("SSO Authentication Successful!")
                     st.rerun()
-                else:
-                    try:
-                        err_detail = r.json().get("error_description") or r.json().get("error") or r.text
-                    except Exception:
-                        err_detail = r.text
-                    st.error(f"Authentication failed ({r.status_code}): {err_detail}")
-            except Exception as e:
-                st.error(f"Error connecting to Keycloak: {e}")
+                except Exception as ex:
+                    st.error(f"Failed to decode token: {ex}")
 
 # --- SPIFFE Workload Status ---
 st.sidebar.markdown("---")

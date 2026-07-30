@@ -110,9 +110,13 @@ def get_claims_with_userinfo(token):
         
         # If userinfo claims are missing, fetch them from Keycloak
         if not claims.get("preferred_username") or "groups" not in claims:
-            kc_url = os.getenv("KEYCLOAK_URL", "http://127.0.0.1:8080")
-            realm = os.getenv("KEYCLOAK_REALM", "master")
-            userinfo_url = f"{kc_url.rstrip('/')}/realms/{realm}/protocol/openid-connect/userinfo"
+            iss = claims.get("iss")
+            if iss:
+                userinfo_url = f"{iss.rstrip('/')}/protocol/openid-connect/userinfo"
+            else:
+                kc_url = os.getenv("KEYCLOAK_URL", "http://127.0.0.1:8080")
+                realm = os.getenv("KEYCLOAK_REALM", "master")
+                userinfo_url = f"{kc_url.rstrip('/')}/realms/{realm}/protocol/openid-connect/userinfo"
             import requests
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)

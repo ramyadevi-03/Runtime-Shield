@@ -2501,6 +2501,23 @@ class JWTVerifier:
                 }
             )
             log(f"✅ Keycloak JWT Signature and Claims Verified via JWKS for user: {decoded.get('preferred_username', 'unknown')}")
+            
+            # Fetch UserInfo if username or groups are missing from access token (lightweight token handling)
+            if not decoded.get("preferred_username") or "groups" not in decoded:
+                try:
+                    userinfo_url = f"{kc_url.rstrip('/')}/realms/{kc_realm}/protocol/openid-connect/userinfo"
+                    import urllib3
+                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                    ui_resp = requests.get(userinfo_url, headers={"Authorization": f"Bearer {token}"}, timeout=3.0, verify=False)
+                    if ui_resp.status_code == 200:
+                        ui_claims = ui_resp.json()
+                        for k, v in ui_claims.items():
+                            if k not in decoded or not decoded[k]:
+                                decoded[k] = v
+                        log(f"✅ Keycloak UserInfo synced successfully for: {decoded.get('preferred_username')}")
+                except Exception as ui_ex:
+                    log(f"⚠️ Failed to fetch UserInfo from Keycloak: {ui_ex}")
+            
             return decoded
         except Exception as e:
             log(f"❌ JWT Verification Failed: {e}")

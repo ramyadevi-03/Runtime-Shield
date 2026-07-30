@@ -101,13 +101,37 @@ import uuid
 if "session_id" not in st.session_state:
     st.session_state.session_id = f"session_{uuid.uuid4().hex[:8]}"
 
+def get_claims_with_userinfo(token):
+    if not token or token == "None":
+        return {}
+    try:
+        import jwt
+        claims = jwt.decode(token, options={"verify_signature": False})
+        
+        # If userinfo claims are missing, fetch them from Keycloak
+        if not claims.get("preferred_username") or "groups" not in claims:
+            kc_url = os.getenv("KEYCLOAK_URL", "http://127.0.0.1:8080")
+            realm = os.getenv("KEYCLOAK_REALM", "master")
+            userinfo_url = f"{kc_url.rstrip('/')}/realms/{realm}/protocol/openid-connect/userinfo"
+            import requests
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            r = requests.get(userinfo_url, headers={"Authorization": f"Bearer {token}"}, timeout=3.0, verify=False)
+            if r.status_code == 200:
+                ui_claims = r.json()
+                for k, v in ui_claims.items():
+                    if k not in claims or not claims[k]:
+                        claims[k] = v
+        return claims
+    except Exception:
+        return {}
+
 if "keycloak_token" not in st.session_state or st.session_state.keycloak_token is None:
     env_token = os.getenv("KEYCLOAK_TOKEN")
     if env_token and env_token.strip() and env_token != "None":
         st.session_state.keycloak_token = env_token.strip("'\"")
         try:
-            import jwt
-            claims = jwt.decode(st.session_state.keycloak_token, options={"verify_signature": False})
+            claims = get_claims_with_userinfo(st.session_state.keycloak_token)
             roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
             groups = claims.get("groups", []) or []
             scopes = claims.get("scope", "")
@@ -182,8 +206,7 @@ else:
                     access_token = token_info["access_token"]
                     st.session_state.keycloak_token = access_token
                     
-                    import jwt
-                    claims = jwt.decode(access_token, options={"verify_signature": False})
+                    claims = get_claims_with_userinfo(access_token)
                     roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
                     groups = claims.get("groups", []) or []
                     scopes = claims.get("scope", "")
@@ -321,8 +344,7 @@ if prompt := st.chat_input(placeholder="Show my recent transactions"):
 
     if token:
         try:
-            import jwt
-            claims = jwt.decode(token, options={"verify_signature": False})
+            claims = get_claims_with_userinfo(token)
             keycloak_sub = claims.get("sub") or ""
             roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
             groups = claims.get("groups", []) or []

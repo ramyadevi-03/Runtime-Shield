@@ -75,8 +75,9 @@ class ShieldStub:
             
         # 3. Synchronously POST to the Bridge's execution API
         try:
-            print(f"🛡️ [Shield SDK] Dispatching payload to {self.proxy_url} for verification...")
-            resp = requests.post(self.proxy_url, json=request_payload, headers=headers, timeout=30)
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            resp = requests.post(self.proxy_url, json=request_payload, headers=headers, timeout=30, verify=False)
             
             if resp.status_code == 403:
                 # Firewall Block or RBAC Block

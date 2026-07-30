@@ -113,7 +113,9 @@ if "keycloak_token" not in st.session_state or st.session_state.keycloak_token i
             scopes = claims.get("scope", "")
             if isinstance(scopes, str):
                 scopes = scopes.split(" ")
-            if "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
+            if "Normal-Users" in groups:
+                st.session_state.role = "user"
+            elif "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
                 st.session_state.role = "admin"
             elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
                 st.session_state.role = "privileged"
@@ -172,7 +174,9 @@ else:
                 
             try:
                 import requests
-                r = requests.post(token_url, data=data, timeout=5)
+                import urllib3
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                r = requests.post(token_url, data=data, timeout=5, verify=False)
                 if r.status_code == 200:
                     token_info = r.json()
                     access_token = token_info["access_token"]
@@ -185,7 +189,9 @@ else:
                     scopes = claims.get("scope", "")
                     if isinstance(scopes, str):
                         scopes = scopes.split(" ")
-                    if "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
+                    if "Normal-Users" in groups:
+                        st.session_state.role = "user"
+                    elif "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
                         st.session_state.role = "admin"
                     elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
                         st.session_state.role = "privileged"
@@ -323,7 +329,9 @@ if prompt := st.chat_input(placeholder="Show my recent transactions"):
             scopes = claims.get("scope", "")
             if isinstance(scopes, str):
                 scopes = scopes.split(" ")
-            if "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
+            if "Normal-Users" in groups:
+                role = "user"
+            elif "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
                 role = "admin"
             elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
                 role = "privileged"

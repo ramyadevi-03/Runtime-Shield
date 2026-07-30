@@ -97,7 +97,9 @@ def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[d
         scopes = claims.get("scope", "")
         if isinstance(scopes, str):
             scopes = scopes.split(" ")
-        if "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
+        if "Normal-Users" in groups:
+            resolved_user_role = "user"
+        elif "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
             resolved_user_role = "admin"
         elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
             resolved_user_role = "privileged"
@@ -2396,7 +2398,12 @@ class JWTVerifier:
     def __init__(self, jwks_url):
         self.jwks_url = jwks_url
         # PyJWKClient handles fetching and caching the keys dynamically from the JWKS endpoint
-        self.jwk_client = jwt.PyJWKClient(self.jwks_url)
+        # Use ssl_context to disable SSL certificate verification in dev/sandbox environments
+        import ssl
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        self.jwk_client = jwt.PyJWKClient(self.jwks_url, ssl_context=ssl_context)
         self.trusted_providers = []
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -2542,12 +2549,15 @@ class JITTokenManager:
         }
         
         # 2. Authenticate the client and POST parameters to Keycloak token URL
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         resp = requests.post(
             self.url, 
             data=data, 
             auth=(self.client_id, self.client_secret),
             headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=5
+            timeout=5,
+            verify=False
         )
         
         # 3. Explicit error handling (strictly fail-closed on verification/exchange failure)

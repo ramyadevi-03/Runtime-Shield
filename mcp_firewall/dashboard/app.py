@@ -156,6 +156,19 @@ async def receive_event(event: Dict[str, Any]):
     await manager.broadcast_event(event)
     return {"status": "ok"}
 
+@app.get("/api/telemetry/clear")
+async def clear_telemetry():
+    import sqlite3
+    import telemetry
+    try:
+        conn = sqlite3.connect(telemetry.DB_PATH, timeout=60)
+        conn.execute("DELETE FROM telemetry_events")
+        conn.commit()
+        conn.close()
+        return {"status": "success", "message": "Telemetry database cleared successfully!"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
 @app.get("/api/registry/mcps")
 async def get_registry():
     import telemetry

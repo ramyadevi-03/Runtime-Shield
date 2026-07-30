@@ -318,28 +318,30 @@ def configure_groups_and_mappers(session: KeycloakSession):
         r = session.request("GET", mappers_url, timeout=10)
         existing_mappers = []
         if r.status_code == 200:
-            existing_mappers = [m["name"] for m in r.json() if "name" in m]
+            for mapper in r.json():
+                if mapper.get("name") == "group-membership":
+                    del_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{client_uuid}/protocol-mappers/models/{mapper['id']}"
+                    session.request("DELETE", del_url, timeout=10)
+                    print("[INFO] Deleted old group membership mapper to refresh config")
         
-        if "group-membership" in existing_mappers:
-            print("[INFO] Group membership mapper already exists for client")
-        else:
-            mapper_data = {
-                "name": "group-membership",
-                "protocol": "openid-connect",
-                "protocolMapper": "oidc-group-membership-mapper",
-                "config": {
-                    "full.path": "false",
-                    "id.token.claim": "true",
-                    "access.token.claim": "true",
-                    "claim.name": "groups",
-                    "userinfo.token.claim": "true"
-                }
+        # Create fresh mapper with correct token/userinfo configs
+        mapper_data = {
+            "name": "group-membership",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-group-membership-mapper",
+            "config": {
+                "full.path": "false",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "claim.name": "groups",
+                "userinfo.token.claim": "true"
             }
-            r = session.request("POST", mappers_url, json=mapper_data, timeout=10)
-            if r.status_code == 201:
-                print("[OK] Created group membership mapper for client")
-            else:
-                print(f"[ERROR] Failed to create group mapper: {r.status_code} {r.text}")
+        }
+        r = session.request("POST", mappers_url, json=mapper_data, timeout=10)
+        if r.status_code == 201:
+            print("[OK] Created group membership mapper for client")
+        else:
+            print(f"[ERROR] Failed to create group mapper: {r.status_code} {r.text}")
     except Exception as e:
         print(f"[ERROR] Exception creating group mapper: {e}")
 

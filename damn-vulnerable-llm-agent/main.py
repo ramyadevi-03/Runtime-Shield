@@ -122,6 +122,17 @@ def get_claims_with_userinfo(token):
                 for k, v in ui_claims.items():
                     if k not in claims or not claims[k]:
                         claims[k] = v
+        # Apply XAA Federated Role Mapping on client-side
+        if claims.get("iss") == "https://external-idp.example.com":
+            ext_groups = claims.get("groups", [])
+            mapped_groups = []
+            for g in ext_groups:
+                if g == "External-Admins":
+                    mapped_groups.append("Administrators")
+                elif g == "External-Users":
+                    mapped_groups.append("Normal-Users")
+            claims["groups"] = list(set((claims.get("groups", []) or []) + mapped_groups))
+            
         return claims
     except Exception:
         return {}

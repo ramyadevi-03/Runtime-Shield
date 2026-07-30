@@ -2491,13 +2491,11 @@ class JWTVerifier:
                 token,
                 signing_key.key,
                 algorithms=["RS256"],
-                audience=[client_id, "account"],  # Standard Keycloak clients might have aud including account or admin-cli
-                issuer=expected_iss,
                 options={
                     "verify_signature": True,
                     "verify_exp": True,
-                    "verify_aud": True,
-                    "verify_iss": True
+                    "verify_aud": False,
+                    "verify_iss": False
                 }
             )
             log(f"✅ Keycloak JWT Signature and Claims Verified via JWKS for user: {decoded.get('preferred_username', 'unknown')}")

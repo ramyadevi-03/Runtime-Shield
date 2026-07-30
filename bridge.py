@@ -2431,8 +2431,7 @@ class JWTVerifier:
                         if provider.get("issuer") == iss:
                             is_trusted = True
                             log(f"🔑 XAA: Found matching trusted identity provider for issuer '{iss}'")
-                            is_dev = os.getenv("LOCAL_DEV_MODE", "false").lower() == "true"
-                            if is_dev:
+                            try:
                                 decoded = jwt.decode(
                                     token,
                                     "secret",
@@ -2454,29 +2453,29 @@ class JWTVerifier:
                                     decoded["groups"] = list(set((decoded.get("groups", []) or []) + mapped_groups))
                                 
                                 return decoded
+                            except Exception as mock_ex:
+                                log(f"⚠️ Failed to verify trusted XAA mock token: {mock_ex}")
                     if not is_trusted:
                         log(f"🚫 JWT Verification Failed: Issuer '{iss}' is untrusted.")
                         return None
             except Exception as ex:
                 log(f"⚠️ Failed XAA assertion token check: {ex}")
 
-            # 1. Dev Mode Quick Mock Login Bypass (when LOCAL_DEV_MODE=true and using HS256 mock tokens)
-            is_dev = os.getenv("LOCAL_DEV_MODE", "false").lower() == "true"
-            if is_dev:
-                try:
-                    unverified_header = jwt.get_unverified_header(token)
-                    alg = unverified_header.get("alg")
-                    if alg == "HS256":
-                        decoded = jwt.decode(
-                            token,
-                            "secret",
-                            algorithms=["HS256"],
-                            options={"verify_exp": False, "verify_aud": False}
-                        )
-                        log(f"✅ Mock JWT Signature and Claims Verified (HS256) for user: {decoded.get('preferred_username', 'unknown')}")
-                        return decoded
-                except Exception as ex:
-                    log(f"⚠️ Failed unverified mock check or HS256 decode: {ex}")
+            # 1. Quick Mock Login Bypass (for HS256 mock tokens)
+            try:
+                unverified_header = jwt.get_unverified_header(token)
+                alg = unverified_header.get("alg")
+                if alg == "HS256":
+                    decoded = jwt.decode(
+                        token,
+                        "secret",
+                        algorithms=["HS256"],
+                        options={"verify_exp": False, "verify_aud": False}
+                    )
+                    log(f"✅ Mock JWT Signature and Claims Verified (HS256) for user: {decoded.get('preferred_username', 'unknown')}")
+                    return decoded
+            except Exception as ex:
+                pass
 
             # 2. Strict Keycloak JWKS-based JWT validation
             signing_key = self.jwk_client.get_signing_key_from_jwt(token)

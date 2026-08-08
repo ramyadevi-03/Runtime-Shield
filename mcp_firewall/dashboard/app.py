@@ -130,7 +130,7 @@ async def get_policy_status():
 
     # --- Read from shared DashboardState.policy_state (set by bridge after engine init) ---
     # Falls back to os.environ if bridge hasn't updated the state yet.
-    active_backend = state.policy_state.get("active_backend") or os.getenv("POLICY_BACKEND", "yaml").lower()
+    active_backend = "opa"
     shadow_backend = state.policy_state.get("shadow_backend") or "none"
     if shadow_backend in ["", "false", "off"]:
         shadow_backend = "none"

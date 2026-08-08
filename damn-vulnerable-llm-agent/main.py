@@ -120,7 +120,7 @@ def get_claims_with_userinfo(token):
             import requests
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            r = requests.get(userinfo_url, headers={"Authorization": f"Bearer {token}"}, timeout=3.0, verify=False)
+            r = requests.get(userinfo_url, headers={"Authorization": f"Bearer {token}"}, timeout=1.0, verify=False)
             if r.status_code == 200:
                 ui_claims = r.json()
                 for k, v in ui_claims.items():
@@ -141,44 +141,21 @@ def get_claims_with_userinfo(token):
     except Exception:
         return {}
 
-if "keycloak_token" not in st.session_state or st.session_state.keycloak_token is None:
-    env_token = os.getenv("KEYCLOAK_TOKEN")
-    if env_token and env_token.strip() and env_token != "None":
-        st.session_state.keycloak_token = env_token.strip("'\"")
-        try:
-            claims = get_claims_with_userinfo(st.session_state.keycloak_token)
-            roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
-            groups = claims.get("groups", []) or []
-            scopes = claims.get("scope", "")
-            if isinstance(scopes, str):
-                scopes = scopes.split(" ")
-            if "Normal-Users" in groups:
-                st.session_state.role = "user"
-            elif "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
-                st.session_state.role = "admin"
-            elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
-                st.session_state.role = "privileged"
-            else:
-                st.session_state.role = "user"
-            st.session_state.username = claims.get("preferred_username") or "DemoUser"
-        except Exception:
-            st.session_state.role = "user"
-            st.session_state.username = "Guest"
-    else:
-        st.session_state.keycloak_token = None
-        st.session_state.role = "user"
-        st.session_state.username = "Guest"
-else:
-    if "role" not in st.session_state:
-        st.session_state.role = "user"
-    if "username" not in st.session_state:
-        st.session_state.username = "Guest"
+# Force manual sign-in on first load by ignoring .env token unless explicitly initialized
+if "keycloak_token" not in st.session_state:
+    st.session_state.keycloak_token = None
+    st.session_state.role = "user"
+    st.session_state.username = "Guest"
 
 # Sidebar Login Form (always show if not authenticated)
 if st.session_state.keycloak_token and st.session_state.username != "Guest":
     st.sidebar.success(f"Logged in as: **{st.session_state.username}**")
     st.sidebar.info(f"Role: **{st.session_state.role.upper()}**")
     if st.sidebar.button("🚪 Logout"):
+        # Explicitly clear the token from the env file to log out from backend too
+        from dotenv import set_key
+        set_key(parent_dotenv, "KEYCLOAK_TOKEN", "")
+        
         st.session_state.keycloak_token = None
         st.session_state.role = "user"
         st.session_state.username = "Guest"

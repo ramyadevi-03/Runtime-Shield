@@ -88,24 +88,14 @@ def save_and_resolve(access_token):
         all_claims = list(set(roles + resource_roles + scopes))
         print(f"DEBUG: All claims found in token: {all_claims}")
         
-        role = "user"
-
-        for r in ["admin", "user"]:
-            if r in [c.lower() for c in all_claims]:
-                role = r
-                break
-        # 🛡️ DYNAMIC ROLE SELECTION (Demo Fallback)
-        if role == "user":
-            print("\n⚠️ Explicit role not found in Keycloak token.")
-            print("Select your Dynamic Persona for this session:")
-            print("1. Administrator (👑 Full Control)")
-            print("2. Standard User (🛡️ Restricted Access)")
-            r_choice = input("[1/2]: ")
-            role = "admin" if r_choice == "1" else "user"
+        # Determine role based on the token's preferred_username claim
+        preferred = decoded.get('preferred_username', '').lower()
+        role = 'admin' if preferred == 'admin' else 'user'
         
-        set_key(DOTENV_PATH, "RUNTIME_ROLE", role)
-        if os.path.exists(MAIN_DOTENV_PATH):
-            set_key(MAIN_DOTENV_PATH, "RUNTIME_ROLE", role)
+        # The runtime role is derived from the token; avoid overwriting it.
+        # set_key(DOTENV_PATH, "RUNTIME_ROLE", role)
+        # if os.path.exists(MAIN_DOTENV_PATH):
+        #     set_key(MAIN_DOTENV_PATH, "RUNTIME_ROLE", role)
         print(f"Identity Resolved: {decoded.get('preferred_username', 'Unknown')} (Role: {role})")
         print("\nSUCCESS: You are now dynamically authenticated.")
         print("You can now RESTART Claude Desktop.")

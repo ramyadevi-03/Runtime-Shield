@@ -370,6 +370,7 @@ def configure_groups_and_mappers(session: KeycloakSession):
     assign_user_to_group("admin", "Privileged-Users")
     assign_user_to_group("privileged", "Privileged-Users")
     assign_user_to_group("user", "Normal-Users")
+    assign_user_to_group("user1", "Normal-Users")
 
 
 def configure_trusted_idps(session: KeycloakSession):

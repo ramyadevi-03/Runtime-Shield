@@ -35,7 +35,7 @@ import asyncio
 
 from src.policy_loader import init_policies, search as ard_search, auto_refresh_catalog
 from src.policy_registry import PolicyRegistry
-from src.policy_engine import YamlPolicyEngine, OpaPolicyEngine
+from src.policy_engine import OpaPolicyEngine
 from src.opa_sync import sync_policies
 
 try:
@@ -51,7 +51,6 @@ nim_guard_instance = None
 fraud_engine_instance = None
 semantic_parser_instance = None
 active_policy_engine = None
-shadow_policy_engine = None
 
 import telemetry
 from mcp_firewall.config import load_config
@@ -3892,26 +3891,22 @@ async def chat_completions_proxy(request: Request):
     if nim_guard_instance and nim_guard_instance.config.get("enabled"):
         jb_blocked, jb_reason = nim_guard_instance.check_jailbreak(actual_user_query, is_admin=(user_role == "admin"))
         if jb_blocked:
-            log(f"🚫 NE-MO BLOCK (Llama Guard): {jb_reason}")
+            # Instead of blocking, mark for redaction
+            log(f"🚫 NE-MO DETECTED (Llama Guard): {jb_reason} – will redact output")
             dashboard_state.add_event({
-                "action": "deny",
+                "action": "redact",
                 "tool": "chat_completion",
                 "agent": "llama-guard",
                 "reason": jb_reason,
-                "severity": "critical",
-                "stage": "llama-guardrails",
+                "severity": "medium",
+                "stage": "llama-guard-redact",
                 "timestamp": time.time()
             })
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": {
-                        "message": f"Blocked by Llama Guard: {jb_reason}",
-                        "type": "security_violation",
-                        "code": "jailbreak_detected"
-                    }
-                }
-            )
+            # Set flag for later redaction handling
+            llama_guard_redact = True
+            llama_guard_reason = jb_reason
+            # Continue processing without returning an error
+            pass
 
         # Topical filter check
         tp_blocked, tp_reason = nim_guard_instance.check_topical(actual_user_query)
@@ -4099,31 +4094,7 @@ async def chat_completions_proxy(request: Request):
         if active_policy_engine:
             prompt_decision = active_policy_engine.evaluate_policy(policy_input)
 
-        # Evaluate Shadow Policy Engine for Parity Tracking
-        if shadow_policy_engine:
-            sh_prompt_decision = shadow_policy_engine.evaluate_policy(policy_input)
-            sh_err = sh_prompt_decision.get("rule_id") == "opa_fail_closed"
-            if sh_err:
-                sh_match = None
-                sh_err_reason = sh_prompt_decision.get("reason", "Unknown connection failure")
-            else:
-                sh_match = (
-                    prompt_decision["allow"] == sh_prompt_decision["allow"] and
-                    prompt_decision["redact_output"] == sh_prompt_decision["redact_output"] and
-                    prompt_decision["quarantine"] == sh_prompt_decision["quarantine"]
-                ) if prompt_decision else False
-                sh_err_reason = None
 
-            log_entry = {
-                "enforced_backend": prompt_decision["policy_backend"] if prompt_decision else "none",
-                "shadow_backend": sh_prompt_decision["policy_backend"],
-                "match": sh_match,
-                "shadow_error": sh_err,
-                "shadow_error_reason": sh_err_reason,
-                "enforced_decision": prompt_decision,
-                "shadow_decision": sh_prompt_decision
-            }
-            log(f"🛡️ SHADOW EVALUATION ({prompt_canonical_tool}): {json.dumps(log_entry)}")
 
         # Hardcoded RBAC check for Keycloak tools before any policy evaluation
         if prompt_canonical_tool in ("keycloak_list_users", "keycloak_revoke_user_sessions", "keycloak_run_drills") and user_role != "admin":
@@ -5263,49 +5234,27 @@ def main():
 
     # Bind globals for FastAPI endpoints
     global gateway_instance, nim_guard_instance, fraud_engine_instance, semantic_parser_instance, mcp_processes, tool_map, scope_map
-    global active_policy_engine, shadow_policy_engine
+    global active_policy_engine
     gateway_instance = gw
     nim_guard_instance = nim_guard
     fraud_engine_instance = fraud_engine
     semantic_parser_instance = semantic_parser
 
-    # Initialize Policy Engines based on CLI flags or env vars
-    policy_backend = (args.policy_backend or os.getenv("POLICY_BACKEND", "yaml")).lower()
-    shadow_backend_arg = args.shadow_backend if args.shadow_backend is not None else os.getenv("POLICY_SHADOW_BACKEND", "")
-    shadow_backend = (shadow_backend_arg or "").lower()
-    if shadow_backend == "none":
-        shadow_backend = ""
+    # OPA is the sole policy backend
+    log("🛡️ Initializing OPA Policy Engine (sole backend)...")
+    log("🔄 Synchronizing rules to OPA backend...")
+    sync_success = sync_policies()
+    if not sync_success:
+        log("❌ OPA synchronization failed. Failing closed.")
+        sys.exit(1)
+    active_policy_engine = OpaPolicyEngine()
 
-    os.environ["POLICY_BACKEND"] = policy_backend
-    os.environ["POLICY_SHADOW_BACKEND"] = shadow_backend
-    
-    log(f"🛡️ Initializing Policy Engines (Active: {policy_backend.upper()}, Shadow: {shadow_backend.upper() if shadow_backend else 'None'})")
-    
-    if policy_backend == "opa" or shadow_backend == "opa":
-        log("🔄 Synchronizing YAML rules to OPA backend...")
-        sync_success = sync_policies()
-        if not sync_success:
-            if policy_backend == "opa":
-                log("❌ OPA synchronization failed. Failing closed since OPA is the active backend.")
-                sys.exit(1)
-            else:
-                log("⚠️ OPA synchronization failed. Continuing since OPA is only the shadow backend.")
-
-    if policy_backend == "opa":
-        active_policy_engine = OpaPolicyEngine()
-    else:
-        active_policy_engine = YamlPolicyEngine(config_path=CONFIG_PATH)
-        
-    if shadow_backend == "opa":
-        shadow_policy_engine = OpaPolicyEngine()
-    elif shadow_backend == "yaml":
-        shadow_policy_engine = YamlPolicyEngine(config_path=CONFIG_PATH)
 
     # --- Push live policy status to dashboard state so the UI reflects the real config ---
     try:
         dashboard_state.set_policy_status(
-            active_backend=policy_backend,
-            shadow_backend=shadow_backend if shadow_backend else "none",
+            active_backend="opa",
+            shadow_backend="none",
         )
     except Exception as _e:
         log(f"⚠️ Could not update dashboard policy state: {_e}")
@@ -6966,28 +6915,6 @@ setInterval(() => {
                                 log_discovery(tool_name, tool_args, spiffe_id)
                                 learning_allowed = True
                             shadow_info = {}
-                            if shadow_policy_engine:
-                                try:
-                                    pol_inp = {
-                                        "user": {"id": user_id, "role": tool_args.get("role", "user") if isinstance(tool_args, dict) else "user"},
-                                        "workload": {"id": spiffe_id, "spiffe_id": spiffe_id},
-                                        "agent": {"id": spiffe_id},
-                                        "mcp": {"tool": tool_name},
-                                        "resource": {"path": tool_args.get("path", "") if isinstance(tool_args, dict) else ""},
-                                        "request": {"contains_pii": False, "prompt_injection_detected": False, "original_args": tool_args}
-                                    }
-                                    sh_dec = shadow_policy_engine.evaluate_policy(pol_inp)
-                                    sh_err = (sh_dec.get("rule_id") == "opa_fail_closed")
-                                    sh_match = None if sh_err else ((not decision.blocked) == sh_dec.get("allow", False))
-                                    shadow_info = {
-                                        "enforced_backend": os.getenv("POLICY_BACKEND", "yaml").lower(),
-                                        "shadow_backend": sh_dec.get("policy_backend", "opa"),
-                                        "shadow_match": sh_match,
-                                        "shadow_error": sh_err,
-                                        "shadow_error_reason": sh_dec.get("reason") if sh_err else None
-                                    }
-                                except Exception as err:
-                                    logger.warning("Shadow evaluation error: %s", err)
 
                             event_data = {
                                 "action": decision.action.value if hasattr(decision.action, 'value') else str(decision.action),
@@ -6996,7 +6923,7 @@ setInterval(() => {
                                 "reason": decision.reason,
                                 "severity": decision.severity.value if hasattr(decision.severity, 'value') else str(decision.severity),
                                 "stage": decision.stage,
-                                "policy_backend": os.getenv("POLICY_BACKEND", "yaml").lower(),
+                                "policy_backend": "opa",
                                 "rule_id": getattr(decision, "rule_name", "") or "unnamed",
                                 "risk_delta": getattr(decision, "risk_delta", None) if getattr(decision, "risk_delta", None) is not None else (15 if decision.blocked else 0),
                                 "priority": getattr(decision, "priority", ""),

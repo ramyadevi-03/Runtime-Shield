@@ -214,10 +214,16 @@ def _arguments_match(arguments: dict[str, Any], matchers: dict[str, Any]) -> boo
             return False
 
         if isinstance(pattern, str) and isinstance(value, str):
-            # Support glob patterns with **
-            glob_pattern = pattern.replace("**", "GLOBSTAR").replace("*", "[^/]*")
-            glob_pattern = glob_pattern.replace("GLOBSTAR", ".*")
-            if not re.match(glob_pattern, value):
+            # Check pipe alternations first if present
+            sub_patterns = pattern.split("|")
+            matched_any = False
+            for sub_pat in sub_patterns:
+                glob_pattern = sub_pat.replace("**", "GLOBSTAR").replace("*", "[^/]*")
+                glob_pattern = glob_pattern.replace("GLOBSTAR", ".*")
+                if re.match(f"^{glob_pattern}$", value):
+                    matched_any = True
+                    break
+            if not matched_any:
                 return False
         elif pattern != value:
             return False

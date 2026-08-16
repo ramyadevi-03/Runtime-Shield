@@ -133,9 +133,40 @@ def run_drills(config_path=None):
     total_count = len(test_cases)
     results = []
     
+    opa_engine = None
+    try:
+        from src.policy_engine import OpaPolicyEngine
+        opa_engine = OpaPolicyEngine()
+    except Exception:
+        pass
+
     for tc in test_cases:
-        decision = gw.check(tool_name=tc["tool"], arguments=tc["args"])
-        is_blocked = decision.blocked
+        is_blocked = False
+        reason = ""
+        evaluated_via_opa = False
+        if opa_engine:
+            role = tc["args"].get("role", "user")
+            path = tc["args"].get("path", "")
+            policy_input = {
+                "user": {"id": "user", "role": role, "scopes": []},
+                "workload": {"spiffe_id": "spiffe://runtime-shield/workload/mock-llm"},
+                "agent": {"id": "spiffe://runtime-shield/workload/mock-llm", "risk_score": 0},
+                "mcp": {"server": "keycloak-provider", "tool": tc["tool"], "action": "call"},
+                "resource": {"path": path},
+                "request": {"original_args": tc["args"]}
+            }
+            try:
+                dec = opa_engine.evaluate_policy(policy_input)
+                is_blocked = not dec.get("allow", False)
+                reason = dec.get("reason", "")
+                evaluated_via_opa = True
+            except Exception:
+                evaluated_via_opa = False
+
+        if not evaluated_via_opa:
+            decision = gw.check(tool_name=tc["tool"], arguments=tc["args"])
+            is_blocked = decision.blocked
+            reason = decision.reason if is_blocked else ""
         
         status = "🟢 PASSED" if is_blocked == tc["expect_blocked"] else "🔴 FAILED"
         if status == "🟢 PASSED":
@@ -149,7 +180,7 @@ def run_drills(config_path=None):
             "expected": "Blocked" if tc["expect_blocked"] else "Allowed",
             "actual": "Blocked" if is_blocked else "Allowed",
             "status": status,
-            "reason": decision.reason if is_blocked else ""
+            "reason": reason
         })
         
     # 5. Outbound PII/Sensitive Data Scan Drill

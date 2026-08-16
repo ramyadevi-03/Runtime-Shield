@@ -179,6 +179,10 @@ if st.session_state.keycloak_token and st.session_state.username != "Guest":
     st.sidebar.success(f"Logged in as: **{st.session_state.username}**")
     st.sidebar.info(f"Role: **{st.session_state.role.upper()}**")
     if st.sidebar.button("🚪 Logout"):
+        # Explicitly clear the token from the env file to log out from backend too
+        from dotenv import set_key
+        set_key(parent_dotenv, "KEYCLOAK_TOKEN", "")
+        
         st.session_state.keycloak_token = None
         st.session_state.role = "user"
         st.session_state.username = "Guest"

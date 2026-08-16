@@ -73,11 +73,17 @@ Once the bridge is active, you can monitor all tool calls, risk levels, and reda
 
 The Runtime Shield features a pluggable policy engine architecture allowing for seamless migration and parity checking between internal and enterprise policy backends.
 
-*   **YAML Mode (`POLICY_BACKEND=yaml`)**: The default engine. Enforces rules defined directly in `mcp-firewall.yaml`.
-*   **OPA Mode (`POLICY_BACKEND=opa`)**: The enterprise engine. Evaluates standard policy inputs against an external OPA server via its REST API. To configure the endpoint, set `OPA_URL`.
-*   **Shadow Mode (`POLICY_SHADOW_BACKEND=opa`)**: Allows evaluating requests against both the active engine and a shadow engine without enforcing the shadow engine's decision. This outputs a comparison log (`match`: true/false) which is critical for verifying policy parity before fully migrating.
+## OPA/Rego Policy Engine
 
-**Avoiding Duplication**: The architecture prevents manual rule duplication by standardizing the input data and keeping the active YAML rules as the single source of truth for generating normalized policy data, which is then provided to the OPA server.
+Runtime Shield uses OPA/Rego as its sole policy engine.
+
+- Policy logic: `rules/runtime_shield.rego`
+- Policy data: `rules/runtime_shield_data.json`
+- OPA decision endpoint: configured through `OPA_URL`
+- Default behaviour: deny when no policy rule matches
+- Fail-closed behaviour: deny requests if OPA is unavailable, returns an error, or returns an invalid decision
+
+`mcp-firewall.yaml` is retained only for operational configuration such as MCP server definitions, NeMo guardrails, PII and secrets settings, tool scopes, and trusted identity providers. It is not used as a policy-rule source.
 
 ### Final Enforcement Flow
 ```text

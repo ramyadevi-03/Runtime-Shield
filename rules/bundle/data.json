@@ -1,0 +1,316 @@
+{
+  "runtime_shield": {
+    "rules": [
+      {
+        "name": "block-traversal",
+        "tool": "read_file|list_directory|write_file",
+        "action": "deny",
+        "message": "Security violation: Potential directory traversal detected.",
+        "priority": "high",
+        "risk_delta": 15,
+        "match": {
+          "path": ".*/\\.\\./.*",
+          "role": "user"
+        }
+      },
+      {
+        "name": "block-admin-access",
+        "tool": "read_file|list_directory",
+        "action": "deny",
+        "message": "Access denied: The 'admin/' directory is off-limits.",
+        "priority": "high",
+        "risk_delta": 15,
+        "match": {
+          "path": "admin/.*",
+          "role": "user"
+        }
+      },
+      {
+        "name": "allow-claude-files",
+        "tool": "read_file|list_directory|write_file",
+        "action": "allow",
+        "message": "Workspace Access: Internal configuration tools permitted.",
+        "priority": "",
+        "risk_delta": 0,
+        "match": {
+          "path": "secure\\-experiment\\-zone/claude\\-desktop.*"
+        }
+      },
+      {
+        "name": "allow-experiment-zone-access",
+        "tool": "read_file|list_directory|write_file",
+        "action": "allow",
+        "message": "Sandbox Access: Authorized experiment zone operations.",
+        "priority": "",
+        "risk_delta": 0,
+        "match": {
+          "path": "secure\\-experiment\\-zone.*"
+        }
+      },
+      {
+        "name": "allow-external-send",
+        "tool": "http_post|fetch_url|curl|wget|send_request|http_request",
+        "action": "allow",
+        "message": "External send tools are permitted for normal users (required for dangerous\u2011chain demo).",
+        "priority": "",
+        "risk_delta": 0,
+        "match": {
+          "role": "user"
+        }
+      },
+      {
+        "name": "block-unauthorized-fs",
+        "tool": "read_file|list_directory|write_file",
+        "action": "deny",
+        "message": "Security violation: Unauthorized filesystem access attempt.",
+        "priority": "high",
+        "risk_delta": 15,
+        "match": {
+          "role": "user|privileged"
+        }
+      },
+      {
+        "name": "block-env-access",
+        "tool": "read_file|write_file",
+        "action": "deny",
+        "message": "Security exception: Access to environment credential files (.env) is strictly prohibited for all roles.",
+        "priority": "high",
+        "risk_delta": 20,
+        "match": {
+          "path": ".*\\.env.*"
+        }
+      },
+      {
+        "name": "allow-admin-unrestricted-fs",
+        "tool": "read_file|list_directory|write_file",
+        "action": "allow",
+        "message": "Admin Access: Unrestricted filesystem access permitted.",
+        "priority": "",
+        "risk_delta": 0,
+        "match": {
+          "role": "admin"
+        }
+      },
+      {
+        "name": "block-honeypots",
+        "tool": "get_system_config|fetch_internal_db",
+        "action": "deny",
+        "message": "CRITICAL VIOLATION: Access to internal system management tools is strictly prohibited.",
+        "priority": "critical",
+        "risk_delta": 100
+      },
+      {
+        "name": "allow-keycloak-admin",
+        "tool": "keycloak_list_users|keycloak_list_user_sessions|keycloak_revoke_user_sessions|keycloak_run_drills|keycloak_generate_policy|keycloak_quarantine_user",
+        "action": "allow",
+        "message": "Governance: Admin authorized to manage Keycloak and run drills.",
+        "priority": "",
+        "risk_delta": 0,
+        "match": {
+          "role": "admin"
+        }
+      },
+      {
+        "name": "deny-keycloak-admin",
+        "tool": "keycloak_list_users|keycloak_list_user_sessions|keycloak_revoke_user_sessions|keycloak_run_drills|keycloak_generate_policy|keycloak_quarantine_user",
+        "action": "deny",
+        "message": "Access Denied: Keycloak administration is restricted to the administrator role.",
+        "priority": "high",
+        "risk_delta": 15
+      },
+      {
+        "name": "allow-keycloak-general",
+        "tool": "keycloak_get_user_events|keycloak_security_report",
+        "action": "allow",
+        "message": "Governance: Keycloak diagnostic events read granted.",
+        "priority": "",
+        "risk_delta": 0
+      },
+      {
+        "name": "deny-keycloak-tools-fallback",
+        "tool": "keycloak_.*",
+        "action": "deny",
+        "message": "Role violation: Keycloak governance tools require the 'admin' role.",
+        "priority": "high",
+        "risk_delta": 15
+      },
+      {
+        "name": "allow-database-tools",
+        "tool": "GetCurrentUser|GetUserTransactions",
+        "action": "allow",
+        "message": "Governance: Jailed database operations permitted.",
+        "priority": "",
+        "risk_delta": 0
+      },
+      {
+        "name": "allow-admin-active-connections",
+        "tool": "GetActiveConnections",
+        "action": "allow",
+        "message": "Security: Admin authorized to read diagnostic active connections.",
+        "priority": "",
+        "risk_delta": 0,
+        "match": {
+          "role": "admin"
+        }
+      },
+      {
+        "name": "deny-user-active-connections",
+        "tool": "GetActiveConnections",
+        "action": "deny",
+        "message": "Security Violation: Non-admin role cannot view host active connections.",
+        "priority": "high",
+        "risk_delta": 15
+      },
+      {
+        "name": "allow-general-diagnostics",
+        "tool": "ScanDependencies|ScanSecrets|GetSystemMetrics",
+        "action": "allow",
+        "message": "Governance: Diagnostic scans permitted for privileged and admin roles.",
+        "priority": "",
+        "risk_delta": 0,
+        "match": {
+          "role": "admin|privileged"
+        }
+      },
+      {
+        "name": "deny-user-diagnostics",
+        "tool": "ScanDependencies|ScanSecrets|GetSystemMetrics",
+        "action": "deny",
+        "message": "Access Denied: Standard users cannot run diagnostic system scans.",
+        "priority": "high",
+        "risk_delta": 15
+      },
+      {
+        "name": "block-vuln-fs-traversal",
+        "tool": "vuln_read_file",
+        "action": "deny",
+        "message": "\ud83d\udee1\ufe0f Shield Block [Lab 1]: Directory traversal attack detected! Path escape via '../' is denied by Runtime Shield Policy Firewall.",
+        "priority": "critical",
+        "risk_delta": 15,
+        "match": {
+          "path": ".*/\\.\\./.*"
+        }
+      },
+      {
+        "name": "block-vuln-fs-absolute",
+        "tool": "vuln_read_file",
+        "action": "deny",
+        "message": "\ud83d\udee1\ufe0f Shield Block [Lab 1]: Absolute path to OS directory detected and denied by Runtime Shield.",
+        "priority": "critical",
+        "risk_delta": 15,
+        "match": {
+          "path": "/etc/.*"
+        }
+      },
+      {
+        "name": "block-vuln-fs-all-default",
+        "tool": "vuln_read_file",
+        "action": "deny",
+        "message": "\ud83d\udee1\ufe0f Shield Block [Lab 1]: Unauthorized file path. Vulnerable filesystem MCP access is blocked by Runtime Shield policy.",
+        "priority": "high",
+        "risk_delta": 15
+      },
+      {
+        "name": "block-eval-injection-process",
+        "tool": "vuln_get_qotd",
+        "action": "deny",
+        "message": "\ud83d\udee1\ufe0f Shield Block [Lab 2]: eval() code injection payload detected! 'process' object access via format parameter is denied by Runtime Shield.",
+        "priority": "critical",
+        "risk_delta": 15,
+        "match": {
+          "format": ".*process.*"
+        }
+      },
+      {
+        "name": "block-eval-injection-require",
+        "tool": "vuln_get_qotd",
+        "action": "deny",
+        "message": "\ud83d\udee1\ufe0f Shield Block [Lab 2]: eval() code injection payload detected! 'require()' access via format parameter is denied by Runtime Shield.",
+        "priority": "critical",
+        "risk_delta": 15,
+        "match": {
+          "format": ".*require.*"
+        }
+      },
+      {
+        "name": "block-eval-injection-constructor",
+        "tool": "vuln_get_qotd",
+        "action": "deny",
+        "message": "\ud83d\udee1\ufe0f Shield Block [Lab 2]: eval() code injection payload detected! Prototype chain exploit via 'constructor' is denied by Runtime Shield.",
+        "priority": "critical",
+        "risk_delta": 15,
+        "match": {
+          "format": ".*constructor.*"
+        }
+      },
+      {
+        "name": "block-ip-leakage",
+        "tool": "vuln_get_current_ip",
+        "action": "deny",
+        "message": "\ud83d\udee1\ufe0f Shield Block [Lab 3]: Server IP/infrastructure disclosure denied by Runtime Shield. This tool exposes sensitive server metadata.",
+        "priority": "high",
+        "risk_delta": 15
+      },
+      {
+        "name": "block-cmd-injection-semicolon",
+        "tool": "vuln_run_diagnostic",
+        "action": "deny",
+        "message": "\ud83d\udee1\ufe0f Shield Block [Lab 4]: Command injection payload detected! Shell metacharacter ';' in diagnostic operation is denied by Runtime Shield.",
+        "priority": "critical",
+        "risk_delta": 15,
+        "match": {
+          "operation": ".*;.*"
+        }
+      },
+      {
+        "name": "block-cmd-injection-pipe",
+        "tool": "vuln_run_diagnostic",
+        "action": "deny",
+        "message": "\ud83d\udee1\ufe0f Shield Block [Lab 4]: Command injection payload detected! Shell metacharacter '|' in diagnostic operation is denied by Runtime Shield.",
+        "priority": "critical",
+        "risk_delta": 15,
+        "match": {
+          "operation": ".*\\|.*"
+        }
+      },
+      {
+        "name": "block-cmd-injection-backtick",
+        "tool": "vuln_run_diagnostic",
+        "action": "deny",
+        "message": "\ud83d\udee1\ufe0f Shield Block [Lab 4]: Command injection payload detected! Backtick subshell in diagnostic operation is denied by Runtime Shield.",
+        "priority": "critical",
+        "risk_delta": 15,
+        "match": {
+          "operation": ".*`.*"
+        }
+      },
+      {
+        "name": "allow-safe-diagnostic",
+        "tool": "vuln_run_diagnostic",
+        "action": "allow",
+        "message": "Governance: Safe diagnostic operation forwarded to vulnerable MCP.",
+        "priority": "",
+        "risk_delta": 0
+      },
+      {
+        "name": "allow-atlassian-status",
+        "tool": "vuln_get_atlassian_status",
+        "action": "allow",
+        "message": "Governance: Atlassian status tool allowed (demonstrates prompt injection in tool response).",
+        "priority": "",
+        "risk_delta": 0
+      },
+      {
+        "name": "admin_fetch_url",
+        "tool": "fetch_url",
+        "action": "allow",
+        "message": "Dashboard fetch_url allowed for admin",
+        "priority": "",
+        "risk_delta": 0,
+        "match": {
+          "role": "admin"
+        }
+      }
+    ]
+  }
+}

@@ -14,6 +14,8 @@ DB_PATH = os.path.join(BASE_DIR, "telemetry.db")
 SCHEMA_PATH = os.path.join(BASE_DIR, "mcp_firewall", "schema", "schema_v2.sql")
 LOG_PATH = os.path.join(BASE_DIR, "telemetry.log")
 
+import requests
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -24,6 +26,104 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("telemetry")
+
+class SuperloglabsExporter:
+    def __init__(self, endpoint: Optional[str] = None):
+        self.endpoint = endpoint or os.getenv("SUPERLOGLABS_ENDPOINT")
+        self.api_key = os.getenv("SUPERLOGLABS_API_KEY")
+        
+    def export_event(self, event: Dict[str, Any]):
+        """
+        Formats event as an OpenTelemetry log record / trace span
+        and sends/logs it to Superloglabs.
+        """
+        # Format as standard OTel Log Record
+        otel_log = {
+            "timeUnixNano": int(event["timestamp"] * 1e9),
+            "severityNumber": self._map_severity_number(event["severity"]),
+            "severityText": event["severity"].upper(),
+            "body": {
+                "stringValue": f"Security Action: {event['action'].upper()} by {event['engine']} on tool {event.get('tool')}"
+            },
+            "attributes": [
+                {"key": "identity", "value": {"stringValue": event["identity"]}},
+                {"key": "trace_id", "value": {"stringValue": event["trace_id"]}},
+                {"key": "request_id", "value": {"stringValue": event["request_id"]}},
+                {"key": "session_id", "value": {"stringValue": event["session_id"]}},
+                {"key": "tenant_id", "value": {"stringValue": event["tenant_id"]}},
+                {"key": "engine", "value": {"stringValue": event["engine"]}},
+                {"key": "action", "value": {"stringValue": event["action"]}},
+                {"key": "reason", "value": {"stringValue": event.get("reason", "")}},
+                {"key": "tool", "value": {"stringValue": event.get("tool", "")}},
+            ],
+            "traceId": event["trace_id"],
+            "spanId": event["request_id"][:16] # Mock span ID from request ID
+        }
+        
+        # If tool execution failed or blocked, run a root-cause analysis
+        if event["action"] == "deny" or event["severity"] == "critical" or "fail" in event.get("reason", "").lower():
+            rca_result = self.run_root_cause_analysis(event)
+            otel_log["attributes"].append({"key": "superloglabs.rca", "value": {"stringValue": json.dumps(rca_result)}})
+            
+            # Print the root-cause analysis findings to help debugging
+            logger.info(f"🚨 [Superloglabs RCA] Root Cause Analysis performed on tool failure:")
+            logger.info(f"   - Trigger Event: {event['event_type']} on {event.get('tool')}")
+            logger.info(f"   - Root Cause: {rca_result['root_cause']}")
+            logger.info(f"   - Recommendation: {rca_result['recommendation']}")
+            if rca_result.get("pr_prepared"):
+                logger.info(f"   - [AUTO-FIX] Prepared PR Fix: {rca_result['pr_fix_summary']}")
+        
+        if self.endpoint:
+            try:
+                headers = {"Content-Type": "application/json"}
+                if self.api_key:
+                    headers["Authorization"] = f"Bearer {self.api_key}"
+                requests.post(self.endpoint, json=otel_log, headers=headers, timeout=2.0)
+            except Exception:
+                pass
+                
+    def _map_severity_number(self, sev: str) -> int:
+        s = sev.lower()
+        if s == "info": return 9
+        if s == "warning": return 13
+        if s == "critical": return 17
+        return 9
+        
+    def run_root_cause_analysis(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyzes tool failures/blocks to perform root-cause analysis
+        and automatically prepare code fixes (as simulated PRs).
+        """
+        tool = event.get("tool", "unknown")
+        reason = event.get("reason", "")
+        
+        rca = {
+            "analyzed_at": time.time(),
+            "event_id": event["event_id"],
+            "tool": tool,
+            "root_cause": "Unknown tool execution failure.",
+            "recommendation": "Check upstream server availability.",
+            "pr_prepared": False
+        }
+        
+        # Analyze known failure signatures (e.g. policy violations, path traversals, internal tool bugs)
+        if "directory traversal" in reason.lower() or "../" in str(event.get("resource", "")):
+            rca["root_cause"] = "Agent attempted to escape sandbox workspace via path traversal (../../)."
+            rca["recommendation"] = "Enforce stricter path validation inside the tool wrapper."
+            rca["pr_prepared"] = True
+            rca["pr_fix_summary"] = "Stricter path sanitization using os.path.realpath and boundary checking."
+        elif "rbac_deny" in event["event_type"].lower() or "deny" in event["action"]:
+            rca["root_cause"] = f"Insufficient scope/role for tool '{tool}'. Standard user tried to invoke restricted tool."
+            rca["recommendation"] = "Assign proper OAuth/Keycloak scopes or map user to the admin group."
+            rca["pr_prepared"] = False
+        elif "pii" in event["event_type"].lower():
+            rca["root_cause"] = "Data loss prevention filter blocked transmission of sensitive PII data."
+            rca["recommendation"] = "Enable inline redaction instead of blocking, or strip PII before sending to LLM."
+            rca["pr_prepared"] = False
+            
+        return rca
+
+superloglabs_exporter = SuperloglabsExporter()
 
 class TelemetryEventBus:
     def __init__(self, db_path: str = DB_PATH):
@@ -146,12 +246,66 @@ class TelemetryEventBus:
                     # This will be refined when risk_engine.py is implemented
                     pass
 
+                # 4. Superloglabs: Automatically group repeating alert noise into single "incidents"
+                if is_blocked or event["severity"] == "critical":
+                    try:
+                        self._correlate_incident(cursor, event)
+                    except Exception as inc_err:
+                        logger.error(f"⚠️ Failed to correlate incident: {inc_err}")
+
                 conn.commit()
+                
+            # 5. Export to Superloglabs Observability Layer (OTel Format)
+            try:
+                superloglabs_exporter.export_event(event)
+            except Exception as exp_err:
+                pass
+                
         except Exception as e:
             logger.error(f"❌ Failed to write event to DB: {e}")
             # Fallback to file log on DB failure
             with open(LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(f"FALLBACK: {json.dumps(event)}\n")
+
+    def _correlate_incident(self, cursor, event: Dict[str, Any]):
+        """
+        Automatically group repeating alert noise into single 'incidents'.
+        Checks if an open incident exists for the same tenant & engine within the last 5 minutes.
+        """
+        now = event["timestamp"]
+        window = 300 # 5 minutes
+        
+        # Search for an open incident for the same tenant and severity/engine within the window
+        cursor.execute('''
+            SELECT incident_id, affected_sessions, description FROM security_incidents
+            WHERE tenant_id = ? AND status = 'open' AND start_time >= ?
+            LIMIT 1
+        ''', (event["tenant_id"], now - window))
+        
+        row = cursor.fetchone()
+        if row:
+            # Group into existing incident
+            incident_id, affected_sessions, description = row
+            sessions = set(affected_sessions.split(",")) if affected_sessions else set()
+            sessions.add(event["session_id"])
+            new_sessions = ",".join(sessions)
+            
+            # Update the incident's end time and list of affected sessions
+            cursor.execute('''
+                UPDATE security_incidents
+                SET end_time = ?, affected_sessions = ?
+                WHERE incident_id = ?
+            ''', (now, new_sessions, incident_id))
+            logger.info(f"🚨 [Superloglabs] Grouped event {event['event_id']} into existing Incident {incident_id}")
+        else:
+            # Create a new aggregated incident
+            incident_id = str(uuid.uuid4())
+            description = f"Aggregated security alerts from {event['engine']} engine. Reason: {event.get('reason', 'None')}"
+            cursor.execute('''
+                INSERT INTO security_incidents (incident_id, tenant_id, start_time, end_time, status, severity, description, affected_sessions)
+                VALUES (?, ?, ?, ?, 'open', ?, ?, ?)
+            ''', (incident_id, event["tenant_id"], now, now, event["severity"], description, event["session_id"]))
+            logger.info(f"🚨 [Superloglabs] Created new aggregated security Incident {incident_id} for tenant {event['tenant_id']}")
 
     def get_recent_events(self, limit: int = 100, tenant_id: str = None) -> List[Dict[str, Any]]:
         try:

@@ -12,7 +12,7 @@ services:
     ports:
       - "8083:8080"
     volumes:
-      - ./keycloak_data:/opt/keycloak/data
+      - keycloak-data:/opt/keycloak/data
     restart: always
 
 
@@ -115,6 +115,7 @@ volumes:
   spire-server-data:
   spire-agent-data:
   spire-agent-socket:
+  keycloak-data:
 
 networks:
   default:

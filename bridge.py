@@ -51,6 +51,7 @@ nim_guard_instance = None
 fraud_engine_instance = None
 semantic_parser_instance = None
 active_policy_engine = None
+shadow_policy_engine = None
 
 import telemetry
 from mcp_firewall.config import load_config
@@ -134,6 +135,7 @@ mcp_remote_clients = {}
 tool_map = {}
 scope_map = {}
 pending_tool_futures = {}  # req_id -> asyncio.Future
+pending_approvals = {}     # req_id -> dict with asyncio.Event
 stdout_lock = threading.Lock()
 
 def reload_tool_mappings():
@@ -1753,9 +1755,93 @@ class WindowsJailer(BaseJailer):
                 log(f"⚠️ [WARNING] Windows process jailer script not found at {sandbox_script}. Running '{self.provider_name}' without sandboxing.")
         return kwargs
 
+class OpenSandboxJailer(BaseJailer):
+    """
+    OpenSandbox: A cross-platform gVisor-based container jailer.
+    Runs commands in an isolated Docker container with the runsc (gVisor) runtime,
+    hiding host OS files and isolating the filesystem.
+    """
+    def get_popen_kwargs(self, cmd):
+        docker_bin = shutil.which("docker")
+        if not docker_bin:
+            log(f"⚠️ [OpenSandbox] docker executable not found. Falling back to host jailer.")
+            return super().get_popen_kwargs(cmd)
+            
+        use_gvisor = os.getenv("OPENSANDBOX_USE_GVISOR", "true").lower() == "true"
+        container_workspace = "/workspace"
+        
+        volumes = [f"{self.cwd}:{container_workspace}"]
+        if self.allowed_paths:
+            for idx, path in enumerate(self.allowed_paths):
+                abs_path = os.path.abspath(path)
+                if os.path.exists(abs_path):
+                    if not abs_path.startswith(self.cwd):
+                        # Mount external paths read-only
+                        volumes.append(f"{abs_path}:/allowed_path_{idx}:ro")
+                        
+        docker_cmd = [
+            docker_bin, "run", "--rm",
+            "-i", # Keep stdin open
+        ]
+        
+        # Check if gVisor (runsc) is available in docker info
+        if use_gvisor:
+            has_runsc = False
+            try:
+                res = subprocess.run([docker_bin, "info"], capture_output=True, text=True, timeout=3)
+                if "runsc" in res.stdout or "gvisor" in res.stdout:
+                    has_runsc = True
+            except Exception:
+                pass
+                
+            if has_runsc:
+                docker_cmd.extend(["--runtime", "runsc"])
+                log(f"🛡️ [OpenSandbox] Using gVisor (runsc) runtime for kernel-level virtualization.")
+            else:
+                log(f"⚠️ [OpenSandbox] gVisor (runsc) runtime not configured in Docker. Falling back to standard container sandbox.")
+                
+        for vol in volumes:
+            docker_cmd.extend(["-v", vol])
+            
+        docker_cmd.extend(["-w", container_workspace])
+        
+        # Pass environment variables
+        for k, v in self.env.items():
+            if v is not None:
+                docker_cmd.extend(["-e", f"{k}={v}"])
+                
+        # Choose node or python image
+        if cmd and "node" in cmd[0]:
+            image = os.getenv("OPENSANDBOX_NODE_IMAGE", "node:20-slim")
+        else:
+            image = os.getenv("OPENSANDBOX_PYTHON_IMAGE", "python:3.11-slim")
+            
+        docker_cmd.append(image)
+        
+        # Map command paths
+        new_cmd_parts = []
+        for part in cmd:
+            if part.startswith(self.cwd):
+                rel = os.path.relpath(part, self.cwd)
+                rel_forward = rel.replace("\\", "/")
+                new_cmd_parts.append(f"./{rel_forward}")
+            else:
+                new_cmd_parts.append(part)
+                
+        docker_cmd.extend(new_cmd_parts)
+        cmd[:] = docker_cmd
+        
+        log(f"🐳 [OpenSandbox] Containerized isolation active: running via Docker image '{image}'")
+        return super().get_popen_kwargs(cmd)
+
 class JailFactory:
     @staticmethod
     def get_jailer(provider_name, cwd, env, allowed_paths):
+        # 1. OpenSandbox is the primary cross-platform isolated runtime
+        if shutil.which("docker"):
+            return OpenSandboxJailer(provider_name, cwd, env, allowed_paths)
+            
+        # 2. Fallbacks
         is_linux = sys.platform.startswith('linux')
         
         if is_linux:
@@ -2403,6 +2489,11 @@ class JWTVerifier:
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
         self.jwk_client = jwt.PyJWKClient(self.jwks_url, ssl_context=ssl_context)
+        
+        # Setup Google JWK client dynamically to verify Google OIDC tokens
+        self.google_jwks_url = "https://www.googleapis.com/oauth2/v3/certs"
+        self.google_jwk_client = jwt.PyJWKClient(self.google_jwks_url, ssl_context=ssl_context)
+        
         self.trusted_providers = []
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -2415,6 +2506,56 @@ class JWTVerifier:
         if not token:
             return None
         try:
+            # Check if this is a Google OIDC token
+            try:
+                unverified_claims = jwt.decode(token, options={"verify_signature": False})
+                iss = unverified_claims.get("iss")
+                if iss in ("https://accounts.google.com", "accounts.google.com"):
+                    # Check if mock token (HS256) or real Google token
+                    unverified_header = jwt.get_unverified_header(token)
+                    alg = unverified_header.get("alg")
+                    if alg == "HS256":
+                        decoded = jwt.decode(
+                            token,
+                            "secret",
+                            algorithms=["HS256"],
+                            options={"verify_exp": False, "verify_aud": False}
+                        )
+                        log(f"✅ Mock Google JWT Signature and Claims Verified (HS256) for user: {decoded.get('email', 'unknown')}")
+                    else:
+                        signing_key = self.google_jwk_client.get_signing_key_from_jwt(token)
+                        google_client_id = os.getenv("GOOGLE_CLIENT_ID")
+                        verify_aud = bool(google_client_id)
+                        
+                        decoded = jwt.decode(
+                            token,
+                            signing_key.key,
+                            algorithms=["RS256"],
+                            audience=google_client_id if verify_aud else None,
+                            options={
+                                "verify_signature": True,
+                                "verify_exp": True,
+                                "verify_aud": verify_aud,
+                                "verify_iss": False
+                            }
+                        )
+                        log(f"✅ Google OIDC Token Verified via JWKS for user: {decoded.get('email', 'unknown')}")
+                    
+                    # Apply Google OIDC mapping
+                    google_admin_emails_raw = os.getenv("GOOGLE_ADMIN_EMAILS", "admin@deeptrustxai.com,admin@example.com")
+                    google_admins = [email.strip().lower() for email in google_admin_emails_raw.split(",")]
+                    
+                    email = decoded.get("email", "").lower()
+                    if email in google_admins or (decoded.get("email_verified") and email in google_admins):
+                        decoded["roles"] = ["admin"]
+                        decoded["groups"] = ["Administrators"]
+                    else:
+                        decoded["roles"] = ["user"]
+                        decoded["groups"] = ["Normal-Users"]
+                    decoded["preferred_username"] = email or decoded.get("name") or decoded.get("sub")
+                    return decoded
+            except Exception as google_ex:
+                log(f"⚠️ Google OIDC verification check failed: {google_ex}")
             # Check if this is an external XAA / ID-JAG identity assertion token
             try:
                 unverified_claims = jwt.decode(token, options={"verify_signature": False})
@@ -4523,6 +4664,58 @@ async def chat_completions_proxy(request: Request):
             return JSONResponse(content=resp_data)
 
 
+@dashboard_app.get("/api/approvals/pending")
+async def get_pending_approvals():
+    res = []
+    for req_id, data in pending_approvals.items():
+        res.append({
+            "req_id": data["req_id"],
+            "tool_name": data["tool_name"],
+            "tool_args": data["tool_args"],
+            "user_id": data["user_id"],
+            "user_role": data["user_role"],
+            "risk_score": data["risk_score"],
+            "status": data["status"],
+            "timestamp": data["timestamp"]
+        })
+    return JSONResponse(content=res)
+
+
+@dashboard_app.post("/api/approvals/{req_id}/action")
+async def handle_approval_action(req_id: str, request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        
+    action = payload.get("action")
+    if req_id not in pending_approvals:
+        raise HTTPException(status_code=404, detail="Approval request not found or expired")
+        
+    if action not in ("approve", "deny", "block"):
+        raise HTTPException(status_code=400, detail="Invalid action. Must be 'approve', 'deny', or 'block'")
+        
+    approval_data = pending_approvals[req_id]
+    approval_data["decision"] = action
+    approval_data["status"] = action
+    
+    # Notify dashboard of decision
+    dashboard_state.add_event({
+        "action": action,
+        "tool": approval_data["tool_name"],
+        "agent": "admin-hitl",
+        "reason": f"HITL Approval Decision: {action.upper()}",
+        "severity": "info" if action == "approve" else "high",
+        "stage": "hitl-approval",
+        "user_role": approval_data["user_role"],
+        "timestamp": time.time()
+    })
+    
+    # Set the event to wake up the waiting coroutine
+    approval_data["event"].set()
+    return JSONResponse(content={"status": "success", "message": f"Action {action} processed."})
+
+
 @dashboard_app.post("/v1/tool/execute")
 async def execute_tool_proxy(request: Request):
     global gateway_instance, nim_guard_instance, fraud_engine_instance
@@ -4932,6 +5125,60 @@ async def execute_tool_proxy(request: Request):
         log(f"🚫 Blocked REST tool '{tool_name}' ({decision['policy_backend']}): {decision['reason']}")
         return JSONResponse(status_code=403, content={"error": f"Tool blocked by policy: {decision['reason']}"})
 
+    # --- HUMAN IN THE LOOP (HITL) APPROVAL INTERCEPTION ---
+    HIGH_RISK_TOOLS = {"write_file", "keycloak_revoke_user_sessions", "keycloak_quarantine_user", "ScanSecrets"}
+    is_high_risk = (
+        tool_name in HIGH_RISK_TOOLS or 
+        decision.get("risk_delta", 0) >= 10 or
+        decision.get("quarantine", False)
+    )
+    
+    if is_high_risk:
+        event = asyncio.Event()
+        pending_approvals[req_id] = {
+            "req_id": req_id,
+            "tool_name": tool_name,
+            "tool_args": tool_args,
+            "user_id": user_id,
+            "user_role": user_role,
+            "risk_score": decision.get("risk_delta", 10),
+            "status": "pending",
+            "event": event,
+            "decision": None,
+            "timestamp": time.time(),
+            "body": body
+        }
+        
+        log(f"⏸️ [HITL] High-Risk Tool Call '{tool_name}' paused (req_id={req_id}). Waiting for Admin approval...")
+        
+        # Log to dashboard
+        dashboard_state.add_event({
+            "action": "pending",
+            "tool": tool_name,
+            "agent": spiffe_id,
+            "reason": f"HITL approval pending for high-risk tool: {tool_name}",
+            "severity": "high",
+            "stage": "hitl-approval",
+            "user_role": user_role,
+            "session_id": session_id,
+            "timestamp": time.time()
+        })
+        
+        try:
+            # Wait for admin approval with a 30 second timeout
+            await asyncio.wait_for(event.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
+            log(f"❌ [HITL] Approval timeout for request {req_id}. Denying action (fail-closed).")
+            pending_approvals.pop(req_id, None)
+            return JSONResponse(status_code=403, content={"error": "HITL Approval Timeout. Action denied."})
+            
+        approval_state = pending_approvals.pop(req_id, None)
+        if not approval_state or approval_state["decision"] != "approve":
+            log(f"🚫 [HITL] Admin DENIED/BLOCKED execution of tool '{tool_name}' (req_id={req_id})")
+            return JSONResponse(status_code=403, content={"error": "Action denied by administrator approval."})
+            
+        log(f"✅ [HITL] Admin APPROVED execution of tool '{tool_name}' (req_id={req_id}). Resuming...")
+
     # Intercept fetch_url execution directly in Bridge
     if tool_name == "fetch_url":
         url = tool_args.get("url", "")
@@ -5247,7 +5494,8 @@ def main():
     if not sync_success:
         log("❌ OPA synchronization failed. Failing closed.")
         sys.exit(1)
-    active_policy_engine = OpaPolicyEngine()
+    from src.policy_engine import SemanticCachePolicyEngine
+    active_policy_engine = SemanticCachePolicyEngine(OpaPolicyEngine())
 
 
     # --- Push live policy status to dashboard state so the UI reflects the real config ---

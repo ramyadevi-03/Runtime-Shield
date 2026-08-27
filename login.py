@@ -165,6 +165,8 @@ def run_login():
         print("2. Standard Researcher (Sandboxed)")
         print("3. Restricted Auditor (No Scopes - Test Layer 1)")
         print("4. Custom Test User (Modified Sandbox - Test Layer 3)")
+        print("5. Google Admin (👑 Federated Admin)")
+        print("6. Google Researcher (Sandboxed User)")
         choice = input("> ")
         
         if choice == "1":
@@ -195,6 +197,28 @@ def run_login():
                 "scope": "openid profile files:list",
                 "allowed_paths": [new_path]
             }
+        elif choice == "5":
+            user_info = {
+                "sub": "google-admin-999",
+                "name": "Google Security Admin",
+                "email": "admin@deeptrustxai.com",
+                "email_verified": True,
+                "iss": "https://accounts.google.com",
+                "aud": "google-mock-client-id",
+                "scope": "openid email profile",
+                "allowed_paths": ["./"]
+            }
+        elif choice == "6":
+            user_info = {
+                "sub": "google-user-777",
+                "name": "Google Standard User",
+                "email": "researcher@deeptrustxai.com",
+                "email_verified": True,
+                "iss": "https://accounts.google.com",
+                "aud": "google-mock-client-id",
+                "scope": "openid email profile",
+                "allowed_paths": ["./secure-experiment-zone"]
+            }
         else:
             user_info = {
                 "sub": "user-456",
@@ -213,7 +237,13 @@ def run_login():
         if os.path.exists(MAIN_DOTENV_PATH):
             set_key(MAIN_DOTENV_PATH, "KEYCLOAK_TOKEN", mock_token)
             
-        role = user_info["preferred_username"]
+        if choice == "5":
+            role = "admin"
+        elif choice == "6":
+            role = "user"
+        else:
+            role = user_info["preferred_username"]
+            
         set_key(DOTENV_PATH, "RUNTIME_ROLE", role)
         if os.path.exists(MAIN_DOTENV_PATH):
             set_key(MAIN_DOTENV_PATH, "RUNTIME_ROLE", role)

@@ -158,7 +158,21 @@ Department: [Your Department]
 
 ---
 
-### Slide 5: Summary & Pilot Roadmap
+### Slide 5: Unified Governance Dashboard & Console
+```text
+# Unified Governance Dashboard & Console
+
+- **Live Audit Panel:** Real-time log of every tool execution, parameters, and action (Allow/Deny/Redact).
+- **Policy Engine Panel:** Manages active YAML firewall files, OPA sync states, and policy parity logs.
+- **Identity Mesh Panel:** Lists and validates cryptographically verified container nodes (SPIFFE SVIDs).
+- **Risk Graph Panel:** Conducts threat analysis on agent behavior, tracking risk scores and identity drift.
+- **MCP Registry Panel:** Registers, syncs, and manages local (stdio) and remote (SSE) tool server endpoints.
+```
+* **Speaker Notes:** *"The administrator console is our central pane of glass. The Live Audit log tracks every tool execution, the Policy Engine runs YAML validation, the Identity Mesh verifies container certificates, the Risk Graph monitors behavioral risk, and the MCP Registry lets us sync and scale new tools."*
+
+---
+
+### Slide 6: Summary & Pilot Roadmap
 ```text
 # Ready for Enterprise Pilot
 

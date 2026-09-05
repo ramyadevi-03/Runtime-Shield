@@ -1,10 +1,5 @@
 # 🛡️ Runtime Shield: Centralized LLM-Agnostic Runtime Governance for Agentic Systems
 
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Node.js 18+](https://img.shields.io/badge/Node.js-18%2B-green.svg)](https://nodejs.org/)
-[![Docker Ready](https://img.shields.io/badge/Docker-Ready-2496ED.svg)](https://www.docker.com/)
-[![OPA Rego](https://img.shields.io/badge/Policy%20Engine-OPA%20%2F%20Rego-gray.svg)](https://www.openpolicyagent.org/)
-[![OpenTelemetry](https://img.shields.io/badge/Observability-OpenTelemetry-orange.svg)](https://opentelemetry.io/)
 
 **Runtime Shield** is a high-performance, identity-aware security gateway providing **Centralized LLM-Agnostic Runtime Governance** for autonomous AI agents (such as LibreChat, Claude Desktop, LangChain/LlamaIndex ReAct loops, and custom agents). 
 

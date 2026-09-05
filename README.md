@@ -1,4 +1,4 @@
-# 🛡️ Runtime Shield: Centralized LLM-Agnostic Runtime Governance for Agentic Systems
+# Runtime Shield: Centralized LLM-Agnostic Runtime Governance for Agentic Systems
 
 
 **Runtime Shield** is a high-performance, identity-aware security gateway providing **Centralized LLM-Agnostic Runtime Governance** for autonomous AI agents (such as LibreChat, Claude Desktop, LangChain/LlamaIndex ReAct loops, and custom agents). 
@@ -7,22 +7,22 @@ It acts as a stateful, unified interception gateway between AI clients and execu
 
 ---
 
-## 🏗️ Architecture Overview
+##  Architecture Overview
 
 The diagram below illustrates how an incoming tool call or chat completion traverses the Runtime Shield's defensive layers, semantic cache, OPA policy engine, and HITL approval queue before executing inside an isolated sandbox.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor LLM as 🤖 LLM Client / Agent<br/>(LibreChat / LangChain)
-    participant REST as 🔌 Gateway Ingress & Proxy<br/>(bridge.py :5001)
-    participant Auth as 🔑 Layer 2: Identity & Auth<br/>(JWT JWKS & SPIFFE SVID)
-    participant Cache as ⚡ Semantic Cache & Clearance<br/>(spaCy Vector Cosine Match)
-    participant OPA as 🛡️ Layer 3: Policy Engine<br/>(OPA / Rego Backend)
-    participant HITL as 🧑‍💻 Layer 4.5: HITL Approvals<br/>(Async Event Registry)
-    participant Jail as 📦 Layer 1: Isolation Sandbox<br/>(Docker + gVisor runsc)
-    participant Redact as 🕵️ Layer 5: Privacy Router<br/>(Presidio NLP Redaction)
-    participant OTel as 📊 Observability & RCA<br/>(Superloglabs OTel)
+    actor LLM as  LLM Client / Agent<br/>(LibreChat / LangChain)
+    participant REST as  Gateway Ingress & Proxy<br/>(bridge.py :5001)
+    participant Auth as  Layer 2: Identity & Auth<br/>(JWT JWKS & SPIFFE SVID)
+    participant Cache as Semantic Cache & Clearance<br/>(spaCy Vector Cosine Match)
+    participant OPA as  Layer 3: Policy Engine<br/>(OPA / Rego Backend)
+    participant HITL as  Layer 4.5: HITL Approvals<br/>(Async Event Registry)
+    participant Jail as  Layer 1: Isolation Sandbox<br/>(Docker + gVisor runsc)
+    participant Redact as  Layer 5: Privacy Router<br/>(Presidio NLP Redaction)
+    participant OTel as  Observability & RCA<br/>(Superloglabs OTel)
 
     LLM->>REST: POST /v1/tool/execute or /v1/chat/completions (Tool / Prompt, JWT, SVID)
     
@@ -76,7 +76,7 @@ sequenceDiagram
 
 ---
 
-## 🛡️ Multi-Layer Defense-in-Depth Mechanics
+##  Multi-Layer Defense-in-Depth Mechanics
 
 ### 1. Layer 1: Infrastructure Isolation & OpenSandbox
 - **Containerized Sandboxing:** Spawns tool execution inside dynamic container environments via [`OpenSandboxJailer`](file:///c:/Users/kavya/OneDrive/Desktop/Runtime-shield-for-agentic-systems/bridge.py) managed by `JailFactory`.
@@ -119,7 +119,7 @@ sequenceDiagram
 
 ---
 
-## 📁 Codebase Structure
+##  Codebase Structure
 
 ```text
 ├── bridge.py                 # Core unified gateway, REST proxy, HITL endpoints & OpenSandbox jailer
@@ -146,7 +146,7 @@ sequenceDiagram
 
 ---
 
-## 🚀 Getting Started
+##  Getting Started
 
 ### Prerequisites
 - **Python 3.10+**
@@ -214,7 +214,7 @@ chmod +x run_shield_demo.sh
 
 ---
 
-## 🧪 Security & Compliance Drills
+##  Security & Compliance Drills
 
 Run the automated security test suite to validate all layers (path traversal guardrails, RBAC, honeypot traps, and PII redaction):
 
@@ -225,7 +225,7 @@ python run_security_drills.py
 ### Verification Suite Results Example:
 ```text
 ==========================================================================================
-🛡️  RUNTIME SHIELD: POLICY VERIFICATION COMPLIANCE REPORT
+  RUNTIME SHIELD: POLICY VERIFICATION COMPLIANCE REPORT
 ==========================================================================================
 Result: 10/10 drills passed.
 
@@ -246,7 +246,7 @@ Privileged Role Verif.   | Run scanner tool ScanSecrets as user       | Blocked 
 
 ---
 
-## 🔑 Human-in-the-Loop (HITL) API Reference
+##  Human-in-the-Loop (HITL) API Reference
 
 When high-risk tool calls are paused by the gateway, administrators can query and approve actions via the REST API or UI Dashboard:
 
@@ -285,7 +285,7 @@ Content-Type: application/json
 
 ---
 
-## ⚙️ Configuration Reference
+##  Configuration Reference
 
 Key configuration settings in `.env`:
 
@@ -302,7 +302,7 @@ Key configuration settings in `.env`:
 
 ---
 
-## 🤝 Contributing & License
+##  Contributing & License
 
 Contributions are welcome! Please open an issue or pull request for review.
 

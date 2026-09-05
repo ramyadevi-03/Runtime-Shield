@@ -1,6 +1,5 @@
 # 🛡️ Runtime Shield: Centralized LLM-Agnostic Runtime Governance for Agentic Systems
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Node.js 18+](https://img.shields.io/badge/Node.js-18%2B-green.svg)](https://nodejs.org/)
 [![Docker Ready](https://img.shields.io/badge/Docker-Ready-2496ED.svg)](https://www.docker.com/)
@@ -20,15 +19,15 @@ The diagram below illustrates how an incoming tool call or chat completion trave
 ```mermaid
 sequenceDiagram
     autonumber
-    actor LLM as "🤖 LLM Client / Agent<br/>(LibreChat / LangChain)"
-    participant REST as "🔌 Gateway Ingress & Proxy<br/>(bridge.py :5001)"
-    participant Auth as "🔑 Layer 2: Identity & Auth<br/>(JWT JWKS & SPIFFE SVID)"
-    participant Cache as "⚡ Semantic Cache & Clearance<br/>(spaCy Vector Cosine Match)"
-    participant OPA as "🛡️ Layer 3: Policy Engine<br/>(OPA / Rego Backend)"
-    participant HITL as "🧑‍💻 Layer 4.5: HITL Approvals<br/>(Async Event Registry)"
-    participant Jail as "📦 Layer 1: Isolation Sandbox<br/>(Docker + gVisor runsc)"
-    participant Redact as "🕵️ Layer 5: Privacy Router<br/>(Presidio NLP Redaction)"
-    participant OTel as "📊 Observability & RCA<br/>(Superloglabs OTel)"
+    actor LLM as 🤖 LLM Client / Agent<br/>(LibreChat / LangChain)
+    participant REST as 🔌 Gateway Ingress & Proxy<br/>(bridge.py :5001)
+    participant Auth as 🔑 Layer 2: Identity & Auth<br/>(JWT JWKS & SPIFFE SVID)
+    participant Cache as ⚡ Semantic Cache & Clearance<br/>(spaCy Vector Cosine Match)
+    participant OPA as 🛡️ Layer 3: Policy Engine<br/>(OPA / Rego Backend)
+    participant HITL as 🧑‍💻 Layer 4.5: HITL Approvals<br/>(Async Event Registry)
+    participant Jail as 📦 Layer 1: Isolation Sandbox<br/>(Docker + gVisor runsc)
+    participant Redact as 🕵️ Layer 5: Privacy Router<br/>(Presidio NLP Redaction)
+    participant OTel as 📊 Observability & RCA<br/>(Superloglabs OTel)
 
     LLM->>REST: POST /v1/tool/execute or /v1/chat/completions (Tool / Prompt, JWT, SVID)
     

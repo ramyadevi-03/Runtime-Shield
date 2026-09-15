@@ -84,7 +84,12 @@ def get_session_key(session_id: str, user_id: str, spiffe_id: str) -> str:
     return build_chain_context_id(session_id=session_id, user_id=user_id, spiffe_id=spiffe_id)
 
 
-def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[dict], user_id: str, user_sub: str, user_role: str, raw_user: str = "", prompt_text: str = "") -> Tuple[str, str, str]:
+def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[dict], user_id: str, user_sub: str, user_role: str, raw_user: str = "", prompt_text: str = "", header_role: str = "") -> Tuple[str, str, str]:
+    if header_role and header_role.lower() == "admin":
+        return "Admin", "admin", "admin-sub"
+    elif header_role and header_role.lower() in ("user", "standard"):
+        return "Standard-User", "user", "user-sub"
+
     resolved_user_id = user_id
     resolved_user_role = user_role
     resolved_user_sub = user_sub
@@ -107,25 +112,25 @@ def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[d
             resolved_user_role = "user"
     elif raw_user and raw_user.strip():
         u = raw_user.strip().lower()
-        resolved_user_id = raw_user.strip()
         google_admins_raw = os.getenv("GOOGLE_ADMIN_EMAILS", "admin@deeptrustxai.com,admin@example.com")
         google_admins = [e.strip().lower() for e in google_admins_raw.split(",")]
         
         if u in google_admins or "admin" in u:
             resolved_user_role = "admin"
+            resolved_user_id = "Admin"
         elif "research" in u or "priv" in u:
             resolved_user_role = "privileged"
+            resolved_user_id = "Privileged-User"
         else:
             resolved_user_role = "user"
+            resolved_user_id = "Standard-User"
     elif not token:
         env_role = (env_role or "user").strip().lower().replace("'", "").replace('"', '')
         if resolved_user_role != "admin" and env_role == "admin":
             resolved_user_role = "admin"
             if resolved_user_id == "anonymous_user":
-                resolved_user_id = "admin"
+                resolved_user_id = "Admin"
 
-    # Zero-Trust: Prompt text can NEVER escalate privileges.
-    # Privileges must strictly originate from verified cryptographic JWTs, SSO identity, or server env config.
     return resolved_user_id, resolved_user_role, resolved_user_sub
 
 # ── Governance Memory Layer ──────────────────────────────────────────────────
@@ -1440,6 +1445,7 @@ def redact_pii_with_presidio(text: str, is_raw: bool = False, skip_headers: bool
         
         # Apply exclude list and confidence threshold (ignore low-confidence false positives)
         results = [r for r in results if r.score >= 0.3]
+        results = [r for r in results if not any(kw in text[r.start:r.end].lower() for kw in ["keycloak", "spiffe", "opa", "runtime-shield", "runtime_shield"])]
         if exclude_entities:
             results = [r for r in results if r.entity_type not in exclude_entities]
 
@@ -4149,6 +4155,7 @@ async def list_models():
         "gpt-4",
         "gpt-3.5-turbo",
         "runtime-shield-agent",
+        "runtime-shield-admin",
         "claude-3-5-sonnet-20241022"
     ]
     data = [
@@ -4305,6 +4312,15 @@ async def chat_completions_proxy(request: Request):
             prompt_extract = msg.get("content", "") or ""
             break
 
+    # Read role header / model override from LibreChat endpoints
+    header_role = request.headers.get("X-User-Role") or request.headers.get("x-user-role") or ""
+    req_model = body.get("model", "")
+    if not header_role:
+        if "admin" in req_model.lower():
+            header_role = "admin"
+        elif "agent" in req_model.lower() or "user" in req_model.lower():
+            header_role = "user"
+
     # Resolve identity/role from the token when available; only use the env override
     # as a fallback when the request is unauthenticated.
     raw_user_val = body.get("user") or request.headers.get("X-User-Email") or request.headers.get("x-user-email") or ""
@@ -4317,6 +4333,7 @@ async def chat_completions_proxy(request: Request):
         user_role=user_role,
         raw_user=raw_user_val,
         prompt_text=prompt_extract,
+        header_role=header_role,
     )
     if token and claims and user_role != "admin":
         log(f"🧭 Resolved request identity from token: user={user_id}, role={user_role}")

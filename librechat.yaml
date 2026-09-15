@@ -6,33 +6,60 @@ cache: true
 # Custom Endpoints configuring Runtime Shield Gateway
 endpoints:
   custom:
-    - name: "Runtime Shield Gateway"
-      apiKey: "runtime-shield-session-token"
+    - name: "Runtime Shield (User)"
+      apiKey: "user-session-token"
       baseURL: "http://gateway:5001/v1"
       models:
         default:
-          - "meta-llama/Llama-3-8b-instruct"
-          - "gpt-4o"
           - "runtime-shield-agent"
+          - "meta-llama/Llama-3-8b-instruct"
         fetch: true
       titleConvo: true
       titleModel: "meta-llama/Llama-3-8b-instruct"
       summarize: false
       summaryModel: "meta-llama/Llama-3-8b-instruct"
       forcePrompt: false
-      modelDisplayLabel: "Runtime Shield Gateway"
+      modelDisplayLabel: "Runtime Shield Gateway (User)"
       headers:
         X-SPIFFE-ID: "spiffe://runtime-shield/llm-agent"
+        X-User-Role: "user"
+
+    - name: "Runtime Shield (Admin)"
+      apiKey: "admin-session-token"
+      baseURL: "http://gateway:5001/v1"
+      models:
+        default:
+          - "runtime-shield-admin"
+          - "meta-llama/Llama-3-8b-instruct"
+        fetch: true
+      titleConvo: true
+      titleModel: "meta-llama/Llama-3-8b-instruct"
+      summarize: false
+      summaryModel: "meta-llama/Llama-3-8b-instruct"
+      forcePrompt: false
+      modelDisplayLabel: "Runtime Shield Gateway (Admin)"
+      headers:
+        X-SPIFFE-ID: "spiffe://runtime-shield/llm-agent"
+        X-User-Role: "admin"
 
 # Model Specifications for Guided Workshop UX
 modelSpecs:
   enforce: false
   list:
     - name: "runtime-shield-agent"
-      label: "Runtime Shield Agent"
-      description: "Protected agent with real-time OPA authz, presidio PII masking, and sandboxed MCP tools."
+      label: "Runtime Shield (Standard User)"
+      description: "Standard tenant clearance. Sandboxed within secure-experiment-zone. Governance drills blocked by RBAC."
       preset:
-        endpoint: "Runtime Shield Gateway"
-        model: "meta-llama/Llama-3-8b-instruct"
+        endpoint: "Runtime Shield (User)"
+        model: "runtime-shield-agent"
         temperature: 0
         systemPrompt: "You are an intelligent banking and research assistant at Meridian HealthTech protected by Secure Runtime Shield. Answer user queries concisely."
+
+    - name: "runtime-shield-admin"
+      label: "Runtime Shield (Admin Clearance)"
+      description: "Privileged administrator clearance. Authorized to execute Keycloak security compliance drills and directory audits."
+      preset:
+        endpoint: "Runtime Shield (Admin)"
+        model: "runtime-shield-admin"
+        temperature: 0
+        systemPrompt: "You are a senior security governance administrator operating the Secure Runtime Shield Gateway."

@@ -84,7 +84,7 @@ def get_session_key(session_id: str, user_id: str, spiffe_id: str) -> str:
     return build_chain_context_id(session_id=session_id, user_id=user_id, spiffe_id=spiffe_id)
 
 
-def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[dict], user_id: str, user_sub: str, user_role: str) -> Tuple[str, str, str]:
+def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[dict], user_id: str, user_sub: str, user_role: str, raw_user: str = "") -> Tuple[str, str, str]:
     resolved_user_id = user_id
     resolved_user_role = user_role
     resolved_user_sub = user_sub
@@ -102,6 +102,18 @@ def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[d
         elif "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
             resolved_user_role = "admin"
         elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
+            resolved_user_role = "privileged"
+        else:
+            resolved_user_role = "user"
+    elif raw_user and raw_user.strip():
+        u = raw_user.strip().lower()
+        resolved_user_id = raw_user.strip()
+        google_admins_raw = os.getenv("GOOGLE_ADMIN_EMAILS", "admin@deeptrustxai.com,admin@example.com")
+        google_admins = [e.strip().lower() for e in google_admins_raw.split(",")]
+        
+        if u in google_admins or "admin" in u:
+            resolved_user_role = "admin"
+        elif "research" in u or "priv" in u:
             resolved_user_role = "privileged"
         else:
             resolved_user_role = "user"
@@ -4004,6 +4016,7 @@ async def chat_completions_proxy(request: Request):
 
     # Resolve identity/role from the token when available; only use the env override
     # as a fallback when the request is unauthenticated.
+    raw_user_val = body.get("user") or request.headers.get("X-User-Email") or request.headers.get("x-user-email") or ""
     user_id, user_role, user_sub = resolve_user_context(
         token=token,
         env_role=env_role,
@@ -4011,6 +4024,7 @@ async def chat_completions_proxy(request: Request):
         user_id=user_id,
         user_sub=user_sub,
         user_role=user_role,
+        raw_user=raw_user_val,
     )
     if token and claims and user_role != "admin":
         log(f"🧭 Resolved request identity from token: user={user_id}, role={user_role}")
@@ -4902,6 +4916,7 @@ async def execute_tool_proxy(request: Request):
 
     # Resolve identity/role from the token when available; only use the env override
     # as a fallback when the request is unauthenticated.
+    raw_user_val = (params.get("_meta", {}) or {}).get("user") or request.headers.get("X-User-Email") or request.headers.get("x-user-email") or ""
     user_id, user_role, user_sub = resolve_user_context(
         token=token,
         env_role=os.getenv("RUNTIME_ROLE", "user"),
@@ -4909,6 +4924,7 @@ async def execute_tool_proxy(request: Request):
         user_id=user_id,
         user_sub=user_sub,
         user_role=user_role,
+        raw_user=raw_user_val,
     )
 
     # REST-level RBAC: block non-admin direct tool calls for Keycloak management tools before any JIT

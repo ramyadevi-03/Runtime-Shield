@@ -20,7 +20,7 @@ endpoints:
       summarize: false
       summaryModel: "meta-llama/Llama-3-8b-instruct"
       forcePrompt: false
-      modelDisplayLabel: "🛡️ Runtime Shield Gateway"
+      modelDisplayLabel: "Runtime Shield Gateway"
       headers:
         X-SPIFFE-ID: "spiffe://runtime-shield/llm-agent"
 
@@ -29,7 +29,7 @@ modelSpecs:
   enforce: false
   list:
     - name: "runtime-shield-agent"
-      label: "🛡️ Meridian Runtime Shield Agent"
+      label: "Runtime Shield Agent"
       description: "Protected agent with real-time OPA authz, presidio PII masking, and sandboxed MCP tools."
       preset:
         endpoint: "Runtime Shield Gateway"

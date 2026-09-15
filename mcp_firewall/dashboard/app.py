@@ -156,6 +156,12 @@ async def receive_event(event: Dict[str, Any]):
     await manager.broadcast_event(event)
     return {"status": "ok"}
 
+@app.post("/api/events/clear")
+@app.get("/api/events/clear")
+async def clear_events_endpoint():
+    telemetry.clear_events()
+    return {"status": "cleared", "message": "Telemetry history cleared successfully"}
+
 @app.get("/api/registry/mcps")
 async def get_registry():
     import telemetry

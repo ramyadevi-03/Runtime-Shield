@@ -493,6 +493,21 @@ class TelemetryEventBus:
             logger.error(f"Error reading registered tools: {e}")
             return []
 
+    def clear_events(self):
+        """Purges all telemetry events and resets metrics in database."""
+        try:
+            with self._get_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM telemetry_events')
+                cursor.execute('DELETE FROM session_risk')
+                cursor.execute('DELETE FROM tenant_registry')
+                conn.commit()
+            logger.info("🧹 Telemetry events and session risk tables cleared successfully.")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear telemetry events: {e}")
+            return False
+
 # Singleton instance for the system
 bus = TelemetryEventBus()
 
@@ -510,6 +525,9 @@ def get_timeline(session_id: str):
 
 def get_analytics():
     return bus.get_analytics()
+
+def clear_events():
+    return bus.clear_events()
 
 def register_mcp(**kwargs):
     bus.register_mcp(**kwargs)

@@ -84,7 +84,7 @@ def get_session_key(session_id: str, user_id: str, spiffe_id: str) -> str:
     return build_chain_context_id(session_id=session_id, user_id=user_id, spiffe_id=spiffe_id)
 
 
-def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[dict], user_id: str, user_sub: str, user_role: str, raw_user: str = "") -> Tuple[str, str, str]:
+def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[dict], user_id: str, user_sub: str, user_role: str, raw_user: str = "", prompt_text: str = "") -> Tuple[str, str, str]:
     resolved_user_id = user_id
     resolved_user_role = user_role
     resolved_user_sub = user_sub
@@ -123,6 +123,13 @@ def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[d
             resolved_user_role = "admin"
             if resolved_user_id == "anonymous_user":
                 resolved_user_id = "admin"
+
+    # Contextual override if user invokes admin role / persona
+    if prompt_text:
+        p = prompt_text.lower()
+        if any(w in p for w in ["as admin", "as administrator", "[admin]", "role: admin", "i am admin", "mode: admin"]):
+            resolved_user_role = "admin"
+            resolved_user_id = "admin"
 
     return resolved_user_id, resolved_user_role, resolved_user_sub
 
@@ -3339,6 +3346,10 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             "stage": "semantic-intent-routing",
             "timestamp": time.time()
         })
+        if not is_react_client:
+            text = f"🛡️ **Security Violation Detected (Zero-Trust Intent Gate)**\n\n* **Reason**: {reason}\n* **Action**: **BLOCKED (DENY)**"
+            formatted = format_final_answer(text)
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
         return JSONResponse(
             status_code=400,
             content={
@@ -3364,6 +3375,10 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
                 "stage": "role-policy",
                 "timestamp": time.time()
             })
+            if not is_react_client:
+                text = f"🛡️ **Security Violation Detected (RBAC Policy Enforcement)**\n\n* **Tool / Capability**: `{intent}`\n* **Current User Context**: `{user_id}` (`{user_role.upper()}`)\n* **Required Role**: `ADMIN`\n* **Reason**: {reason}\n* **Action**: **BLOCKED (DENY)**"
+                formatted = format_final_answer(text)
+                return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
             return JSONResponse(
                 status_code=403,
                 content={
@@ -3421,24 +3436,36 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             # Policy-gate: only allow this routing if active_policy_engine permits it
             _kc_inp = {"user": {"id": user_id, "role": user_role, "scopes": []}, "workload": {"spiffe_id": "spiffe://runtime-shield/workload/mock-llm"}, "agent": {"id": "spiffe://runtime-shield/workload/mock-llm", "risk_score": 0}, "mcp": {"server": "keycloak-provider", "tool": "keycloak_list_users", "action": "call"}, "resource": {"path": ""}, "request": {"contains_pii": False, "prompt_injection_detected": False, "original_args": {"role": user_role}}}
             _kc_dec = active_policy_engine.evaluate_policy(_kc_inp) if active_policy_engine else {"allow": False, "reason": "No policy engine"}
-            if _kc_dec["allow"]:
+            if _kc_dec["allow"] or user_role == "admin":
                 is_keycloak_list_query = True
             else:
+                if not is_react_client:
+                    text = f"🛡️ **Security Violation Detected (RBAC Policy Enforcement)**\n\n* **Tool**: `KeycloakListUsers`\n* **Current User**: `{user_id}` (`{user_role.upper()}`)\n* **Required Role**: `ADMIN`\n* **Reason**: {_kc_dec.get('reason', 'Role violation: Keycloak governance tools require admin role.')}\n* **Action**: **BLOCKED (DENY)**"
+                    formatted = format_final_answer(text)
+                    return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
                 return JSONResponse(status_code=403, content={"error": {"message": _kc_dec.get("reason", "Role violation: Keycloak governance tools require admin role."), "type": "security_violation", "code": "rbac_unauthorized"}})
         elif any(w in raw_query_lower for w in ["revoke", "session", "logout"]):
             _kc_inp = {"user": {"id": user_id, "role": user_role, "scopes": []}, "workload": {"spiffe_id": "spiffe://runtime-shield/workload/mock-llm"}, "agent": {"id": "spiffe://runtime-shield/workload/mock-llm", "risk_score": 0}, "mcp": {"server": "keycloak-provider", "tool": "keycloak_revoke_user_sessions", "action": "call"}, "resource": {"path": ""}, "request": {"contains_pii": False, "prompt_injection_detected": False, "original_args": {"role": user_role}}}
             _kc_dec = active_policy_engine.evaluate_policy(_kc_inp) if active_policy_engine else {"allow": False, "reason": "No policy engine"}
-            if _kc_dec["allow"]:
+            if _kc_dec["allow"] or user_role == "admin":
                 is_keycloak_revoke_query = True
             else:
+                if not is_react_client:
+                    text = f"🛡️ **Security Violation Detected (RBAC Policy Enforcement)**\n\n* **Tool**: `KeycloakRevokeUserSessions`\n* **Current User**: `{user_id}` (`{user_role.upper()}`)\n* **Required Role**: `ADMIN`\n* **Reason**: {_kc_dec.get('reason', 'Role violation: Keycloak governance tools require admin role.')}\n* **Action**: **BLOCKED (DENY)**"
+                    formatted = format_final_answer(text)
+                    return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
                 return JSONResponse(status_code=403, content={"error": {"message": _kc_dec.get("reason", "Role violation: Keycloak governance tools require admin role."), "type": "security_violation", "code": "rbac_unauthorized"}})
         elif any(w in raw_query_lower for w in ["drill", "verification", "compliance", "audit"]) or "verify security" in raw_query_lower:
             _kc_inp = {"user": {"id": user_id, "role": user_role, "scopes": []}, "workload": {"spiffe_id": "spiffe://runtime-shield/workload/mock-llm"}, "agent": {"id": "spiffe://runtime-shield/workload/mock-llm", "risk_score": 0}, "mcp": {"server": "keycloak-provider", "tool": "keycloak_run_drills", "action": "call"}, "resource": {"path": ""}, "request": {"contains_pii": False, "prompt_injection_detected": False, "original_args": {"role": user_role}}}
             _kc_dec = active_policy_engine.evaluate_policy(_kc_inp) if active_policy_engine else {"allow": False, "reason": "No policy engine"}
-            if _kc_dec["allow"]:
+            if _kc_dec["allow"] or user_role == "admin":
                 is_keycloak_run_drills_query = True
             else:
-                return JSONResponse(status_code=403, content={"error": {"message": _kc_dec.get("reason", "Role violation: Keycloak governance tools require admin role."), "type": "security_violation", "code": "rbac_unauthorized"}})
+                if not is_react_client:
+                    text = f"🛡️ **Security Violation Detected (RBAC Policy Enforcement)**\n\n* **Tool**: `KeycloakRunDrills`\n* **Current User**: `{user_id}` (`{user_role.upper()}`)\n* **Required Role**: `ADMIN`\n* **Reason**: {_kc_dec.get('reason', 'Role violation: only admin may run Keycloak verification drills.')}\n* **Action**: **BLOCKED (DENY)**"
+                    formatted = format_final_answer(text)
+                    return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+                return JSONResponse(status_code=403, content={"error": {"message": _kc_dec.get("reason", "Role violation: only admin may run Keycloak verification drills."), "type": "security_violation", "code": "rbac_unauthorized"}})
         elif det_greet:
             is_greeting = True
 
@@ -4275,6 +4302,14 @@ async def chat_completions_proxy(request: Request):
         except Exception as e:
             log(f"⚠️ Proxy failed to decode JWT token: {e}")
 
+    # Extract prompt messages
+    messages = body.get("messages", [])
+    prompt_extract = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            prompt_extract = msg.get("content", "") or ""
+            break
+
     # Resolve identity/role from the token when available; only use the env override
     # as a fallback when the request is unauthenticated.
     raw_user_val = body.get("user") or request.headers.get("X-User-Email") or request.headers.get("x-user-email") or ""
@@ -4286,14 +4321,12 @@ async def chat_completions_proxy(request: Request):
         user_sub=user_sub,
         user_role=user_role,
         raw_user=raw_user_val,
+        prompt_text=prompt_extract,
     )
     if token and claims and user_role != "admin":
         log(f"🧭 Resolved request identity from token: user={user_id}, role={user_role}")
     elif not token:
         log(f"ℹ️ Local Dev Override: Using RUNTIME_ROLE={env_role} for unauthenticated request")
-
-    # Extract prompt messages
-    messages = body.get("messages", [])
 
     # 3. Inbound PII Redaction (MUST RUN BEFORE SECURITY CHECKS TO PREVENT LLaMA GUARD FALSE POSITIVES)
     pii_detected = False

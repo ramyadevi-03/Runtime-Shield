@@ -1837,7 +1837,11 @@ class OpenSandboxJailer(BaseJailer):
 class JailFactory:
     @staticmethod
     def get_jailer(provider_name, cwd, env, allowed_paths):
-        # 1. OpenSandbox is the primary cross-platform isolated runtime
+        # When running inside a container (e.g. Docker / Dokploy), internal MCP servers run directly
+        if os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER", "false").lower() == "true":
+            return BaseJailer(provider_name, cwd, env, allowed_paths)
+
+        # 1. OpenSandbox is the primary cross-platform isolated runtime on host machines
         if shutil.which("docker"):
             return OpenSandboxJailer(provider_name, cwd, env, allowed_paths)
             

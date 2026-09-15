@@ -108,16 +108,18 @@ services:
     container_name: chatbot_mcp
     image: ghcr.io/danny-avila/librechat:latest
     ports:
-      - "3080:3080"
-      - "8501:3080"
+      - "8501:8501"
+      - "3080:8501"
     environment:
       - HOST=0.0.0.0
-      - PORT=3080
+      - PORT=8501
       - MONGO_URI=mongodb://mongodb:27017/LibreChat
       - DOMAIN_CLIENT=https://chat.sc.deeptrustxai.com
       - DOMAIN_SERVER=https://chat.sc.deeptrustxai.com
       - JWT_SECRET=runtime_shield_jwt_secret_super_secure_123
       - JWT_REFRESH_SECRET=runtime_shield_refresh_secret_456
+      - CREDS_KEY=f34be427ebb29de8d88c107a71546019685ed8b241d8f2ed00c3f31798823b19
+      - CREDS_IV=e234cd426303d7788fa7a7a451a345f8
       - CONFIG_PATH=/app/librechat.yaml
       - OPENID_CLIENT_ID=admin-cli
       - OPENID_CLIENT_SECRET=vsIwGjbvAqpk1tdDeZGEUZAaFPR0ItG3
@@ -125,6 +127,7 @@ services:
       - OPENID_SESSION_SECRET=openid_session_secret_789
       - OPENID_BUTTON_LABEL=Keycloak Login
       - ALLOW_REGISTRATION=true
+      - ALLOW_EMAIL_LOGIN=true
       - ALLOW_SOCIAL_LOGIN=true
       - ALLOW_SOCIAL_REGISTRATION=true
       - SESSION_EXPIRY=86400000

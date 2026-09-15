@@ -104,8 +104,8 @@ services:
       - mongo-data:/data/db
     restart: always
 
-  librechat:
-    container_name: librechat_mcp
+  chatbot:
+    container_name: chatbot_mcp
     image: ghcr.io/danny-avila/librechat:latest
     ports:
       - "3080:3080"
@@ -114,8 +114,8 @@ services:
       - HOST=0.0.0.0
       - PORT=3080
       - MONGO_URI=mongodb://mongodb:27017/LibreChat
-      - DOMAIN_CLIENT=http://localhost:3080
-      - DOMAIN_SERVER=http://localhost:3080
+      - DOMAIN_CLIENT=https://chat.sc.deeptrustxai.com
+      - DOMAIN_SERVER=https://chat.sc.deeptrustxai.com
       - JWT_SECRET=runtime_shield_jwt_secret_super_secure_123
       - JWT_REFRESH_SECRET=runtime_shield_refresh_secret_456
       - CONFIG_PATH=/app/librechat.yaml

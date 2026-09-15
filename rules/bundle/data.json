@@ -33,7 +33,7 @@
         "priority": "",
         "risk_delta": 0,
         "match": {
-          "path": "secure\\-experiment\\-zone/claude\\-desktop.*"
+          "path": "secure-experiment-zone/claude-desktop.*"
         }
       },
       {
@@ -44,7 +44,7 @@
         "priority": "",
         "risk_delta": 0,
         "match": {
-          "path": "secure\\-experiment\\-zone.*"
+          "path": "secure-experiment-zone.*"
         }
       },
       {

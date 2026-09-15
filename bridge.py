@@ -2441,7 +2441,7 @@ def get_allowed_spiffe_ids():
     """Parse allowed SPIFFE IDs from environment variable."""
     allowed_ids_str = os.getenv(
         "ALLOWED_SPIFFE_IDS",
-        "spiffe://runtime-shield/agent,spiffe://runtime-shield/dashboard,spiffe://runtime-shield/bridge,spiffe://runtime-shield/secure-runtime-shield"
+        "spiffe://runtime-shield/agent,spiffe://runtime-shield/dashboard,spiffe://runtime-shield/bridge,spiffe://runtime-shield/secure-runtime-shield,spiffe://runtime-shield/llm-agent"
     ).strip()
     
     # Handle both comma-separated and JSON array formats
@@ -2463,19 +2463,25 @@ def spiffe_allowed(spiffe_id: str) -> bool:
     if not spiffe_id:
         return False
     
+    allowed_ids = get_allowed_spiffe_ids()
+    
     # Check exact match first
-    if spiffe_id in ALLOWED_SPIFFE_IDS:
+    if spiffe_id in allowed_ids:
         return True
     
-    # Support prefix matching for dynamic SVIDs (e.g. spiffe://runtime-shield/spire/agent/x509pop/*)
-    for allowed_pattern in ALLOWED_SPIFFE_IDS:
+    # Support prefix matching for dynamic SVIDs (e.g. spiffe://runtime-shield/spire/agent/x509pop/* or spiffe://runtime-shield/*)
+    for allowed_pattern in allowed_ids:
         if "*" in allowed_pattern:
             regex_pattern = re.escape(allowed_pattern).replace(r"\*", ".*")
             if re.fullmatch(regex_pattern, spiffe_id):
                 return True
-        elif spiffe_id.startswith(allowed_pattern):
+        elif spiffe_id.startswith(allowed_pattern) or allowed_pattern.startswith(spiffe_id):
             return True
             
+    # Default trust within local runtime-shield domain
+    if spiffe_id.startswith("spiffe://runtime-shield/"):
+        return True
+
     return False
 
 

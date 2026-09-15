@@ -11,7 +11,20 @@ import sys
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_DIR = os.path.dirname(_HERE)  # one level up: Runtime-shield-for-agentic-systems/
-_CERTS_DIR = os.path.join(_PROJECT_DIR, "spire", "certs")
+
+_CERTS_DIR = os.getenv("SPIFFE_CERTS_DIR")
+if not _CERTS_DIR or not os.path.exists(_CERTS_DIR):
+    for candidate in [
+        os.path.join(_PROJECT_DIR, "spire", "certs"),
+        os.path.join(_HERE, "spire", "certs"),
+        "/app/spire/certs",
+        os.path.join(os.getcwd(), "spire", "certs"),
+    ]:
+        if os.path.exists(candidate):
+            _CERTS_DIR = candidate
+            break
+    if not _CERTS_DIR:
+        _CERTS_DIR = os.path.join(_PROJECT_DIR, "spire", "certs")
 
 LLM_AGENT_SVID_CRT = os.path.join(_CERTS_DIR, "llm-agent.crt")
 LLM_AGENT_SVID_KEY = os.path.join(_CERTS_DIR, "llm-agent.key")

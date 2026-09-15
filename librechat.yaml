@@ -1,0 +1,38 @@
+version: 1.0.8
+
+# Cache settings
+cache: true
+
+# Custom Endpoints configuring Runtime Shield Gateway
+endpoints:
+  custom:
+    - name: "Runtime Shield Gateway"
+      apiKey: "runtime-shield-session-token"
+      baseURL: "http://gateway:5001/v1"
+      models:
+        default:
+          - "meta-llama/Llama-3-8b-instruct"
+          - "gpt-4o"
+          - "runtime-shield-agent"
+        fetch: true
+      titleConvo: true
+      titleModel: "meta-llama/Llama-3-8b-instruct"
+      summarize: false
+      summaryModel: "meta-llama/Llama-3-8b-instruct"
+      forcePrompt: false
+      modelDisplayLabel: "🛡️ Runtime Shield Gateway"
+      headers:
+        X-SPIFFE-ID: "spiffe://runtime-shield/llm-agent"
+
+# Model Specifications for Guided Workshop UX
+modelSpecs:
+  enforce: false
+  list:
+    - name: "runtime-shield-agent"
+      label: "🛡️ Meridian Runtime Shield Agent"
+      description: "Protected agent with real-time OPA authz, presidio PII masking, and sandboxed MCP tools."
+      preset:
+        endpoint: "Runtime Shield Gateway"
+        model: "meta-llama/Llama-3-8b-instruct"
+        temperature: 0
+        systemPrompt: "You are an intelligent banking and research assistant at Meridian HealthTech protected by Secure Runtime Shield. Answer user queries concisely."

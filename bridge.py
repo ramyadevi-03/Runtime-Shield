@@ -3844,6 +3844,33 @@ async def patch_nemo_config(request: Request):
     })
 
 
+@dashboard_app.get("/v1/models")
+@dashboard_app.get("/models")
+async def list_models():
+    """Standard OpenAI-compatible models discovery endpoint for LibreChat and OpenAI SDKs."""
+    model_ids = [
+        "meta-llama/Llama-3-8b-instruct",
+        "gpt-4o",
+        "gpt-4",
+        "gpt-3.5-turbo",
+        "runtime-shield-agent",
+        "claude-3-5-sonnet-20241022"
+    ]
+    data = [
+        {
+            "id": mid,
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "runtime-shield",
+            "permission": [],
+            "root": mid,
+            "parent": None
+        }
+        for mid in model_ids
+    ]
+    return JSONResponse(content={"object": "list", "data": data})
+
+
 @dashboard_app.post("/v1/chat/completions")
 async def chat_completions_proxy(request: Request):
     global gateway_instance, nim_guard_instance, fraud_engine_instance

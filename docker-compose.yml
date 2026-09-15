@@ -97,30 +97,49 @@ services:
     restart: always
 
 
-  chatbot:
-    container_name: chatbot_mcp
-    build:
-      context: ./damn-vulnerable-llm-agent
-      dockerfile: Dockerfile
-    ports:
-      - "8501:8501"
-    environment:
-      - KEYCLOAK_URL=http://keycloak:8080
-      - KEYCLOAK_REALM=master
-      - KEYCLOAK_CLIENT_ID=admin-cli
-      - KEYCLOAK_CLIENT_SECRET=vsIwGjbvAqpk1tdDeZGEUZAaFPR0ItG3
-      - SHIELD_API_URL=http://gateway:5001/v1
-      - SHIELD_PROXY_URL=http://gateway:5001/v1/tool/execute
-      - SPIFFE_LLM_ID=spiffe://runtime-shield/llm-agent
-      - SPIRE_AGENT_SOCKET=/run/spire/sockets/agent.sock
-      - NVIDIA_API_KEY=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
-      - NIM_BASE_URL=https://integrate.api.nvidia.com/v1
-      - OPENAI_API_KEY=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
+  mongodb:
+    container_name: mongodb_mcp
+    image: mongo:latest
     volumes:
+      - mongo-data:/data/db
+    restart: always
+
+  librechat:
+    container_name: librechat_mcp
+    image: ghcr.io/danny-avila/librechat:latest
+    ports:
+      - "3080:3080"
+      - "8501:3080"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=3080
+      - MONGO_URI=mongodb://mongodb:27017/LibreChat
+      - DOMAIN_CLIENT=http://localhost:3080
+      - DOMAIN_SERVER=http://localhost:3080
+      - JWT_SECRET=runtime_shield_jwt_secret_super_secure_123
+      - JWT_REFRESH_SECRET=runtime_shield_refresh_secret_456
+      - CONFIG_PATH=/app/librechat.yaml
+      - OPENID_CLIENT_ID=admin-cli
+      - OPENID_CLIENT_SECRET=vsIwGjbvAqpk1tdDeZGEUZAaFPR0ItG3
+      - OPENID_ISSUER=http://keycloak:8080/realms/master
+      - OPENID_SESSION_SECRET=openid_session_secret_789
+      - OPENID_BUTTON_LABEL=Keycloak Login
+      - ALLOW_REGISTRATION=true
+      - ALLOW_SOCIAL_LOGIN=true
+      - ALLOW_SOCIAL_REGISTRATION=true
+      - SESSION_EXPIRY=86400000
+      - REFRESH_TOKEN_EXPIRY=604800000
+      - SPIFFE_LLM_ID=spiffe://runtime-shield/llm-agent
+    volumes:
+      - ./librechat.yaml:/app/librechat.yaml:ro
+      - librechat-uploads:/app/uploads
+      - librechat-images:/app/client/public/images
       - spire-agent-socket:/run/spire/sockets:ro
       - ./spire/certs:/app/spire/certs:ro
     depends_on:
       - gateway
+      - mongodb
+      - keycloak
     restart: always
 
 
@@ -129,6 +148,9 @@ volumes:
   spire-agent-data:
   spire-agent-socket:
   keycloak-data:
+  mongo-data:
+  librechat-uploads:
+  librechat-images:
 
 networks:
   default:

@@ -121,15 +121,10 @@ services:
       - CREDS_KEY=f34be427ebb29de8d88c107a71546019685ed8b241d8f2ed00c3f31798823b19
       - CREDS_IV=e234cd426303d7788fa7a7a451a345f8
       - CONFIG_PATH=/app/librechat.yaml
-      - OPENID_CLIENT_ID=admin-cli
-      - OPENID_CLIENT_SECRET=vsIwGjbvAqpk1tdDeZGEUZAaFPR0ItG3
-      - OPENID_ISSUER=http://keycloak:8080/realms/master
-      - OPENID_SESSION_SECRET=openid_session_secret_789
-      - OPENID_BUTTON_LABEL=Keycloak Login
       - ALLOW_REGISTRATION=true
       - ALLOW_EMAIL_LOGIN=true
-      - ALLOW_SOCIAL_LOGIN=true
-      - ALLOW_SOCIAL_REGISTRATION=true
+      - ALLOW_SOCIAL_LOGIN=false
+      - ALLOW_SOCIAL_REGISTRATION=false
       - SESSION_EXPIRY=86400000
       - REFRESH_TOKEN_EXPIRY=604800000
       - SPIFFE_LLM_ID=spiffe://runtime-shield/llm-agent

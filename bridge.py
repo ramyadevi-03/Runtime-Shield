@@ -1405,9 +1405,19 @@ def redact_pii_with_presidio(text: str, is_raw: bool = False, skip_headers: bool
     # None = auto-detect ALL Presidio-supported entity types (no hardcoding)
     entities = None
     exclude_entities = []
-    raw_operators = {}
+    raw_operators = {
+        "EMAIL_ADDRESS": "[REDACTED-EMAIL]",
+        "US_SSN": "[REDACTED-SSN]",
+        "PHONE_NUMBER": "[REDACTED-PHONE]",
+        "CREDIT_CARD": "[REDACTED-CC]",
+    }
     default_placeholder = "[PII REDACTED]"
-    regex_fallbacks = [] # DISABLED: regex things disabled to test Microsoft NLP
+    regex_fallbacks = [
+        {"name": "Email", "pattern": r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', "placeholder": "[REDACTED-EMAIL]"},
+        {"name": "SSN", "pattern": r'\b\d{3}-\d{2}-\d{4}\b', "placeholder": "[REDACTED-SSN]"},
+        {"name": "Credit Card", "pattern": r'\b(?:\d{4}[-\s]?){3}\d{4}\b', "placeholder": "[REDACTED-CC]"},
+        {"name": "Phone", "pattern": r'\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b', "placeholder": "[REDACTED-PHONE]"},
+    ]
 
     if gateway_instance and gateway_instance.config and gateway_instance.config.pii:
         pii_cfg = gateway_instance.config.pii

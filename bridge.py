@@ -4520,38 +4520,6 @@ async def chat_completions_proxy(request: Request):
                     yield chunk
                 return
 
-                    is_tool_call_stream = False
-                    async for line in resp.aiter_lines():
-                        if line.startswith("data: "):
-                            data_content = line[6:].strip()
-                            if data_content == "[DONE]":
-                                if is_tool_call_stream:
-                                    yield "data: [DONE]\n\n"
-                                break
-
-                            try:
-                                chunk = json.loads(data_content)
-                                if not chunks_metadata:
-                                    chunks_metadata.append(chunk)
-                                
-                                choices = chunk.get("choices", [])
-                                delta = choices[0].get("delta", {}) if choices else {}
-                                if "tool_calls" in delta or (choices and "tool_calls" in choices[0]):
-                                    is_tool_call_stream = True
-                                    
-                                if is_tool_call_stream:
-                                    yield f"data: {data_content}\n\n"
-                                    continue
-                                    
-                                content = delta.get("content", "")
-                                if content:
-                                    accumulated_content.append(content)
-                            except Exception as e:
-                                log(f"⚠️ Stream chunk parsing error: {e}")
-
-            if is_tool_call_stream:
-                return
-
             full_text = "".join(accumulated_content)
             log(f"💬 Upstream LLM Response: {full_text}")
             

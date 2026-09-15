@@ -94,6 +94,7 @@ class PIIDetector(OutboundStage):
             nonlocal modified
             try:
                 results = analyzer.analyze(text=text, language="en", entities=entities)
+                results = [r for r in results if r.score >= 0.3]
                 if exclude_entities:
                     results = [r for r in results if r.entity_type not in exclude_entities]
 

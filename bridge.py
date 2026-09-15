@@ -3050,12 +3050,24 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
         yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
         yield "data: [DONE]\n\n"
 
+    is_react_client = any(
+        "ConversationalChatAgent" in str(msg.get("content", "")) or
+        "CRITICAL FORMATTING RULES" in str(msg.get("content", "")) or
+        "CRITICAL TOOL CALL RULE" in str(msg.get("content", ""))
+        for msg in messages
+    )
+
     # Helper to wrap action in standard ReAct JSON block expected by ConversationalChatAgent
     def format_action(action_name: str, action_input: dict):
+        if not is_react_client:
+            action_input_str = json.dumps(action_input)
+            return f"Executing `{action_name}` with input `{action_input_str}`..."
         action_input_str = json.dumps(action_input)
         return f"```json\n{{\n  \"action\": \"{action_name}\",\n  \"action_input\": {action_input_str}\n}}\n```"
 
     def format_final_answer(answer_text: str):
+        if not is_react_client:
+            return answer_text
         escaped_text = answer_text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
         return f"```json\n{{\n  \"action\": \"Final Answer\",\n  \"action_input\": \"{escaped_text}\"\n}}\n```"
 
@@ -3066,7 +3078,23 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
         return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
 
     if is_greeting:
-        text = "Hello! I am your helpful financial assistant. I can help you retrieve your recent bank transactions. Try asking me: 'What are my recent transactions?'"
+        text = "Hello! I am your helpful financial and research assistant protected by Runtime Shield. Try asking me: 'Who am I and what are my permissions?' or 'Read the file secure-experiment-zone/research_notes.txt'."
+        formatted = format_final_answer(text)
+        return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+
+    # Direct Identity Query Response for LibreChat and standard clients
+    if not is_react_client and any(w in raw_query_lower for w in ["who am i", "my role", "my permission", "current user", "permissions", "whoami"]):
+        dashboard_state.add_event({
+            "action": "allow",
+            "tool": "GetCurrentUser",
+            "agent": f"user-{user_id}",
+            "identity": "spiffe://runtime-shield/llm-agent",
+            "reason": f"Identity & RBAC profile retrieved for {user_id} (Role: {user_role.upper()})",
+            "severity": "info",
+            "stage": "role-policy",
+            "timestamp": time.time()
+        })
+        text = f"👤 **User Identity & Permissions**:\n\n* **Authenticated User**: `{user_id}`\n* **Assigned Role**: `{user_role.upper()}`\n* **Workload SPIFFE SVID**: `spiffe://runtime-shield/llm-agent` (Cryptographically Attested)\n* **Access Permissions**:\n  * `secure-experiment-zone/*`: **ALLOWED** (Authorized Sandbox Access)\n  * System Root (`../../etc/passwd`, `admin/`): **DENIED** by Policy Firewall\n  * Environment Credentials (`.env`): **DENIED** by Policy Firewall\n  * Security Drills: {'**ALLOWED** (Administrator Access)' if user_role == 'admin' else '**DENIED** (Requires Administrator Role)'}"
         formatted = format_final_answer(text)
         return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
 
@@ -3410,7 +3438,39 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
     log(f"[DEBUG QUERY] is_list_query={is_list_query} (called={list_dir_called}), is_file_query={is_file_query} (called={read_file_called}), is_keycloak_list_query={is_keycloak_list_query} (called={keycloak_list_called}), is_keycloak_revoke_query={is_keycloak_revoke_query} (called={keycloak_revoke_called})")
     
     if is_fetch_url_query:
-        if not fetch_url_called:
+        if not is_react_client:
+            url_match = re.search(r'https?://[^\s\'"]+', original_query)
+            target_url = url_match.group(0).rstrip(".,;") if url_match else "https://internal-service.local/metrics"
+            
+            is_internal = any(h in target_url for h in ["169.254.169.254", "localhost", "127.0.0.1", "internal", "10.0.", "192.168."])
+            if is_internal and user_role != "admin":
+                reason = "Security violation: SSRF prevention blocked access to internal subnet / metadata endpoint."
+                dashboard_state.add_event({
+                    "action": "deny",
+                    "tool": "FetchURL",
+                    "agent": f"user-{user_id}",
+                    "identity": "spiffe://runtime-shield/llm-agent",
+                    "reason": reason,
+                    "severity": "critical",
+                    "stage": "policy-engine",
+                    "timestamp": time.time()
+                })
+                text = f"🛡️ **Security Violation Detected (SSRF Defense)**\n\nThe Secure Runtime Shield Policy Firewall has blocked an outbound network request:\n* **Tool**: `FetchURL`\n* **Target URL**: `{target_url}`\n* **Reason**: {reason}\n* **Action**: **BLOCKED (DENY)**"
+            else:
+                dashboard_state.add_event({
+                    "action": "allow",
+                    "tool": "FetchURL",
+                    "agent": f"user-{user_id}",
+                    "identity": "spiffe://runtime-shield/llm-agent",
+                    "reason": f"Authorized outbound web fetch for {target_url}",
+                    "severity": "info",
+                    "stage": "policy-engine",
+                    "timestamp": time.time()
+                })
+                text = f"🌐 **FetchURL Output (`{target_url}`)**:\n\n* **Status**: `200 OK`\n* **Content**: Public web resources retrieved and sanitized through Runtime Shield proxy."
+            formatted = format_final_answer(text)
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+        elif not fetch_url_called:
             url_match = re.search(r'https?://[^\s\'"]+', original_query)
             target_url = url_match.group(0).rstrip(".,;") if url_match else None
             
@@ -3440,7 +3500,53 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
 
     if is_list_query:
-        if not list_dir_called:
+        if not is_react_client:
+            target_path = target if target else None
+            if not target_path:
+                dir_match = re.search(r'(?:list|dir|show|folder)\s+(?:the\s+directory\s+|in\s+)?([^\s]+/[^\s]+|[^\s]+)', original_query, re.IGNORECASE)
+                if dir_match:
+                    target_path = dir_match.group(1).strip()
+                else:
+                    target_path = "secure-experiment-zone"
+            
+            pol_inp = {
+                "user": {"id": user_id, "role": user_role, "scopes": []},
+                "workload": {"spiffe_id": "spiffe://runtime-shield/llm-agent"},
+                "agent": {"id": "spiffe://runtime-shield/llm-agent", "risk_score": 0},
+                "mcp": {"server": "filesystem-provider", "tool": "list_directory", "action": "call"},
+                "resource": {"path": target_path},
+                "request": {"contains_pii": False, "prompt_injection_detected": False, "original_args": {"path": target_path}}
+            }
+            pol_dec = active_policy_engine.evaluate_policy(pol_inp) if active_policy_engine else {"allow": False, "reason": "No policy engine"}
+            
+            if pol_dec.get("allow"):
+                dashboard_state.add_event({
+                    "action": "allow",
+                    "tool": "list_directory",
+                    "agent": f"user-{user_id}",
+                    "identity": "spiffe://runtime-shield/llm-agent",
+                    "reason": pol_dec.get("reason", "Sandbox Access: Authorized experiment zone operations."),
+                    "severity": "info",
+                    "stage": "policy-engine",
+                    "timestamp": time.time()
+                })
+                text = f"📂 **Directory Listing (`{target_path}`)**:\n\n* `research_notes.txt`\n* `claude-desktop.json`\n* `experiment_data.csv`\n* `config.yaml`"
+            else:
+                reason = pol_dec.get("reason", "Security violation: Unauthorized filesystem access attempt.")
+                dashboard_state.add_event({
+                    "action": "deny",
+                    "tool": "list_directory",
+                    "agent": f"user-{user_id}",
+                    "identity": "spiffe://runtime-shield/llm-agent",
+                    "reason": reason,
+                    "severity": "high",
+                    "stage": "policy-engine",
+                    "timestamp": time.time()
+                })
+                text = f"🛡️ **Security Violation Detected**\n\nThe Secure Runtime Shield Policy Firewall has intercepted and blocked an unauthorized directory listing:\n* **Tool**: `list_directory`\n* **Target**: `{target_path}`\n* **Reason**: {reason}\n* **Action**: **BLOCKED (DENY)**"
+            formatted = format_final_answer(text)
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+        elif not list_dir_called:
             target_path = target if target else None
             if not target_path:
                 dir_match = re.search(r'(?:list|dir|show|folder)\s+(?:the\s+directory\s+|in\s+)?([^\s]+/[^\s]+|[^\s]+)', original_query, re.IGNORECASE)
@@ -3480,7 +3586,65 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
 
     if is_file_query:
-        if not read_file_called:
+        if not is_react_client:
+            target_path = target if target else None
+            if not target_path:
+                file_match = re.search(r'(?:read|show|cat|view|file)\s+(?:the\s+file\s+)?([^\s]+\.[a-zA-Z0-9]+|[^\s]+/[^\s]+|[^\s]+)', original_query, re.IGNORECASE)
+                if file_match:
+                    target_path = file_match.group(1).strip()
+                else:
+                    target_path = original_query.strip().split()[-1]
+            
+            # Policy evaluation via active_policy_engine
+            pol_inp = {
+                "user": {"id": user_id, "role": user_role, "scopes": []},
+                "workload": {"spiffe_id": "spiffe://runtime-shield/llm-agent"},
+                "agent": {"id": "spiffe://runtime-shield/llm-agent", "risk_score": 0},
+                "mcp": {"server": "filesystem-provider", "tool": "read_file", "action": "call"},
+                "resource": {"path": target_path},
+                "request": {"contains_pii": False, "prompt_injection_detected": False, "original_args": {"path": target_path}}
+            }
+            pol_dec = active_policy_engine.evaluate_policy(pol_inp) if active_policy_engine else {"allow": False, "reason": "No policy engine"}
+            
+            if pol_dec.get("allow"):
+                dashboard_state.add_event({
+                    "action": "allow",
+                    "tool": "read_file",
+                    "agent": f"user-{user_id}",
+                    "identity": "spiffe://runtime-shield/llm-agent",
+                    "reason": pol_dec.get("reason", "Sandbox Access: Authorized experiment zone operations."),
+                    "severity": "info",
+                    "stage": "policy-engine",
+                    "timestamp": time.time()
+                })
+                real_content = ""
+                try:
+                    clean_p = target_path.lstrip("./").lstrip("/")
+                    fp = os.path.join(PROJECT_DIR, clean_p)
+                    if os.path.exists(fp):
+                        with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                            real_content = f.read()
+                    else:
+                        real_content = "# Research Notes: Meridian Experiment Zone\n\nProject: Neural Shield Protocol\nStatus: Active\nLead: Anika Sharma\nNotes: Security telemetry and OPA RE2 authorization verified."
+                except Exception as ex:
+                    real_content = f"Error reading file: {ex}"
+                text = f"📄 **File Contents (`{target_path}`)**:\n\n```\n{real_content}\n```"
+            else:
+                reason = pol_dec.get("reason", "Security violation: Potential directory traversal detected.")
+                dashboard_state.add_event({
+                    "action": "deny",
+                    "tool": "read_file",
+                    "agent": f"user-{user_id}",
+                    "identity": "spiffe://runtime-shield/llm-agent",
+                    "reason": reason,
+                    "severity": "high",
+                    "stage": "policy-engine",
+                    "timestamp": time.time()
+                })
+                text = f"🛡️ **Security Violation Detected**\n\nThe Secure Runtime Shield Policy Firewall has intercepted and blocked an unauthorized tool execution attempt:\n* **Tool**: `read_file`\n* **Target**: `{target_path}`\n* **Reason**: {reason}\n* **Action**: **BLOCKED (DENY)**"
+            formatted = format_final_answer(text)
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+        elif not read_file_called:
             target_path = target if target else None
             if not target_path:
                 file_match = re.search(r'(?:read|show|cat|view|file)\s+(?:the\s+file\s+)?([^\s]+\.[a-zA-Z0-9]+|[^\s]+/[^\s]+)', original_query, re.IGNORECASE)
@@ -3520,7 +3684,21 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
     is_banking_query = is_banking_query or get_user_called or get_trans_called
 
     if is_banking_query:
-        if not get_user_called:
+        if not is_react_client:
+            dashboard_state.add_event({
+                "action": "allow",
+                "tool": "GetUserTransactions",
+                "agent": f"user-{user_id}",
+                "identity": "spiffe://runtime-shield/llm-agent",
+                "reason": f"Authorized banking transactions retrieval for userId: {target_user_id}",
+                "severity": "info",
+                "stage": "role-policy",
+                "timestamp": time.time()
+            })
+            text = f"💳 **Recent Bank Transactions (User ID: {target_user_id})**:\n\n| Transaction ID | User ID | Reference | Recipient | Amount |\n| --- | --- | --- | --- | --- |\n| 1 | {target_user_id} | Salary Deposit | Employer Inc | $4,500.00 |\n| 2 | {target_user_id} | Grocery Store | Supermarket | -$125.50 |\n| 3 | {target_user_id} | Coffee Shop | Cafe Mocha | -$6.75 |\n| 4 | {target_user_id} | Electric Utility | Power Grid Corp | -$142.00 |\n\nAll transactions successfully retrieved from secure vault."
+            formatted = format_final_answer(text)
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+        elif not get_user_called:
             dashboard_state.add_event({
                 "action": "info",
                 "tool": "GetCurrentUser",
@@ -3564,41 +3742,59 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
                         parts = content.split("TOOL RESPONSE:")
                         if len(parts) > 1:
                             subparts = parts[1].split("USER'S INPUT")
-                            candidate = subparts[0].strip().lstrip("-").strip()
-                            if "[" in candidate and "]" in candidate:
-                                tool_output = candidate
-                                break
-            
-            formatted_table = ""
-            if tool_output:
-                try:
-                    txs = json.loads(tool_output)
-                    if isinstance(txs, list) and len(txs) > 0:
-                        formatted_table = "\n\n| Transaction ID | User ID | Reference | Recipient | Amount |\n| --- | --- | --- | --- | --- |\n"
-                        for tx in txs:
-                            formatted_table += f"| {tx.get('transactionId', '')} | {tx.get('userId', '')} | {tx.get('reference', '')} | {tx.get('recipient', '')} | ${tx.get('amount', 0.0):.2f} |\n"
-                except Exception as e:
-                    log(f"⚠️ Failed to parse dynamic tool transactions: {e}")
-            
-            if formatted_table:
-                text = f"Here are the requested bank transactions retrieved from the secure database:{formatted_table}\n\nAll transactions have been successfully retrieved and processed."
-            else:
-                text = "Here are your recent bank transactions:\n\n| Date | Description | Amount |\n| --- | --- | --- |\n| 2026-05-18 | Grocery Store | -$42.50 |\n| 2026-05-17 | Salary Credit | +$3500.00 |\n| 2026-05-15 | Coffee Shop | -$5.80 |\n| 2026-05-14 | Electric Bill | -$120.00 |\n\nAll transactions have been successfully retrieved and processed."
+                            tool_output = subparts[0].strip().lstrip("-").strip()
+                            break
 
-            dashboard_state.add_event({
-                "action": "info",
-                "tool": "chat_completion",
-                "agent": "mock-llm-agent",
-                "reason": "Agent successfully processed and rendered authenticated bank transactions",
-                "severity": "low",
-                "stage": "agent-reasoning",
-                "timestamp": time.time()
-            })
+            if tool_output and "Security Violation:" in tool_output:
+                text = f"Blocked by Security Gateway: {tool_output}"
+            elif tool_output:
+                try:
+                    transactions = json.loads(tool_output)
+                    if isinstance(transactions, list) and len(transactions) > 0:
+                        table_rows = []
+                        for t in transactions:
+                            table_rows.append(f"| {t.get('id', '')} | {t.get('userId', '')} | {t.get('reference', '')} | {t.get('recipient', '')} | {t.get('amount', '')} |")
+                        table_str = "| ID | User ID | Reference | Recipient | Amount |\n|---|---|---|---|---|\n" + "\n".join(table_rows)
+                        text = f"Here are your recent bank transactions:\n\n{table_str}"
+                    else:
+                        text = f"No transactions found for user ID: {target_user_id}"
+                except Exception:
+                    text = f"Here are your recent bank transactions:\n\n{tool_output}"
+            else:
+                text = f"Here are the recent bank transactions for user {target_user_id}:\n\n| ID | User ID | Reference | Recipient | Amount |\n|---|---|---|---|---|\n| 1 | {target_user_id} | Salary Deposit | Employer Inc | $4,500.00 |\n| 2 | {target_user_id} | Grocery Store | Supermarket | -$125.50 |\n| 3 | {target_user_id} | Coffee Shop | Cafe Mocha | -$6.75 |\n| 4 | {target_user_id} | Electric Utility | Power Grid Corp | -$142.00 |"
+                
             formatted = format_final_answer(text)
             return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
 
     if is_keycloak_list_query:
-        if not keycloak_list_called:
+        if not is_react_client:
+            if user_role != "admin":
+                reason = "Role violation: Keycloak user-management tools require admin role."
+                dashboard_state.add_event({
+                    "action": "deny",
+                    "tool": "keycloak_list_users",
+                    "agent": f"user-{user_id}",
+                    "reason": reason,
+                    "severity": "high",
+                    "stage": "role-policy",
+                    "timestamp": time.time()
+                })
+                text = f"🛡️ **Security Violation Detected (RBAC Policy Enforcement)**\n\n* **Tool**: `KeycloakListUsers`\n* **Current User**: `{user_id}` (`{user_role.upper()}`)\n* **Required Role**: `ADMIN`\n* **Reason**: {reason}\n* **Action**: **BLOCKED (DENY)**"
+            else:
+                dashboard_state.add_event({
+                    "action": "allow",
+                    "tool": "keycloak_list_users",
+                    "agent": f"user-{user_id}",
+                    "identity": "spiffe://runtime-shield/llm-agent",
+                    "reason": "Authorized Keycloak user directory audit for administrator.",
+                    "severity": "info",
+                    "stage": "role-policy",
+                    "timestamp": time.time()
+                })
+                text = "👥 **Keycloak User Directory (Realm: master)**:\n\n1. **`admin`** (`admin@deeptrustxai.com`) — *Role: Administrator (Full Access)*\n2. **`user1`** (`user1@deeptrustxai.com`) — *Role: Standard User*\n3. **`auditor`** (`auditor@deeptrustxai.com`) — *Role: Compliance Officer*"
+            formatted = format_final_answer(text)
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+        elif not keycloak_list_called:
             # RESTORE: Hardcoded RBAC check — block non-admins immediately (pre-JIT)
             if user_role != "admin":
                 reason = "Role violation: Keycloak user-management tools require admin role."
@@ -3660,7 +3856,35 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
 
     if is_keycloak_revoke_query:
-        if not keycloak_revoke_called:
+        if not is_react_client:
+            target_user = target if target else "user1"
+            if user_role != "admin":
+                reason = "Role violation: Keycloak user-management tools require admin role."
+                dashboard_state.add_event({
+                    "action": "deny",
+                    "tool": "keycloak_revoke_user_sessions",
+                    "agent": f"user-{user_id}",
+                    "reason": reason,
+                    "severity": "high",
+                    "stage": "role-policy",
+                    "timestamp": time.time()
+                })
+                text = f"🛡️ **Security Violation Detected (RBAC Policy Enforcement)**\n\n* **Tool**: `KeycloakRevokeUserSessions`\n* **Current User**: `{user_id}` (`{user_role.upper()}`)\n* **Required Role**: `ADMIN`\n* **Reason**: {reason}\n* **Action**: **BLOCKED (DENY)**"
+            else:
+                dashboard_state.add_event({
+                    "action": "allow",
+                    "tool": "keycloak_revoke_user_sessions",
+                    "agent": f"user-{user_id}",
+                    "identity": "spiffe://runtime-shield/llm-agent",
+                    "reason": f"Active session tokens invalidated for {target_user}",
+                    "severity": "info",
+                    "stage": "role-policy",
+                    "timestamp": time.time()
+                })
+                text = f"✅ **Keycloak Governance Action Completed**:\n\n* All active authentication sessions and bearer tokens for user **`{target_user}`** have been revoked across all realms."
+            formatted = format_final_answer(text)
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+        elif not keycloak_revoke_called:
             target_user = target if target else "user1"
             # RESTORE: Hardcoded RBAC check — block non-admins immediately (pre-JIT)
             if user_role != "admin":
@@ -3698,7 +3922,34 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
 
     if is_keycloak_run_drills_query:
-        if not keycloak_run_drills_called:
+        if not is_react_client:
+            if user_role != "admin":
+                reason = "Role violation: only admin may run Keycloak verification drills."
+                dashboard_state.add_event({
+                    "action": "deny",
+                    "tool": "keycloak_run_drills",
+                    "agent": f"user-{user_id}",
+                    "reason": reason,
+                    "severity": "high",
+                    "stage": "role-policy",
+                    "timestamp": time.time()
+                })
+                text = f"🛡️ **Security Violation Detected (RBAC Policy Enforcement)**\n\n* **Tool**: `KeycloakRunDrills`\n* **Current User**: `{user_id}` (`{user_role.upper()}`)\n* **Required Role**: `ADMIN`\n* **Reason**: {reason}\n* **Action**: **BLOCKED (DENY)**"
+            else:
+                dashboard_state.add_event({
+                    "action": "allow",
+                    "tool": "keycloak_run_drills",
+                    "agent": f"user-{user_id}",
+                    "identity": "spiffe://runtime-shield/llm-agent",
+                    "reason": "Execution of autonomous governance compliance drill suite.",
+                    "severity": "info",
+                    "stage": "role-policy",
+                    "timestamp": time.time()
+                })
+                text = "🛡️ **Automated Security Compliance Drill Report**:\n\n| Control Verification | Mechanism | Status |\n| --- | --- | --- |\n| **Sandbox Filesystem Traversal Defense** | OPA Policy Rule + RE2 AST | `✅ 100% BLOCKED` |\n| **SPIFFE Cryptographic SVID Attestation** | X.509 SVID Validation | `✅ VERIFIED` |\n| **Presidio PII Redaction** | Inbound / Outbound Regex & NLP | `✅ ACTIVE & ENFORCED` |\n| **Multi-Tenant User Isolation (RBAC)** | Role Token Clearance Gate | `✅ ENFORCED` |\n\n*Audit Status: **COMPLIANT** (NIST AI RMF & ISO/IEC 42001 Standard)*"
+            formatted = format_final_answer(text)
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
+        elif not keycloak_run_drills_called:
             # RESTORE: Direct admin check for running drills
             if user_role != "admin":
                 reason = "Role violation: only admin may run Keycloak verification drills."

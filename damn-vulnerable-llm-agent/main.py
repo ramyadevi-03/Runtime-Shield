@@ -191,7 +191,7 @@ if st.session_state.keycloak_token and st.session_state.username != "Guest":
         st.session_state.steps = {}
         st.rerun()
 else:
-    tab1, tab2 = st.sidebar.tabs(["Credentials", "Federated SSO (XAA)"])
+    tab1, tab2 = st.sidebar.tabs(["Keycloak Login", "Google Mail SSO"])
     
     with tab1:
         with st.form("login_form"):
@@ -255,34 +255,90 @@ else:
                     st.error(f"Error connecting to Keycloak: {e}")
                     
     with tab2:
-        with st.form("token_login_form"):
-            st.write("Paste SSO / JIT token:")
-            token_input = st.text_area("JWT Token", height=120)
-            token_submitted = st.form_submit_button("SSO Token Login")
-            
-            if token_submitted and token_input.strip():
-                try:
-                    access_token = token_input.strip()
-                    st.session_state.keycloak_token = access_token
-                    claims = get_claims_with_userinfo(access_token)
-                    roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
-                    groups = claims.get("groups", []) or []
-                    scopes = claims.get("scope", "")
-                    if isinstance(scopes, str):
-                        scopes = scopes.split(" ")
-                    if "Normal-Users" in groups:
-                        st.session_state.role = "user"
-                    elif "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
-                        st.session_state.role = "admin"
-                    elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
-                        st.session_state.role = "privileged"
-                    else:
-                        st.session_state.role = "user"
-                    st.session_state.username = claims.get("preferred_username") or claims.get("sub") or "FederatedUser"
-                    st.success("SSO Authentication Successful!")
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f"Failed to decode token: {ex}")
+        st.write("Sign in with Google Account:")
+        google_persona = st.selectbox(
+            "Select Account or Custom Email:",
+            [
+                "Anika Sharma (anika.sharma@meridianhealth.com)",
+                "Security Admin (admin@deeptrustxai.com)",
+                "Research Scientist (researcher@example.com)",
+                "Custom Google Email..."
+            ],
+            index=0
+        )
+        
+        custom_email = ""
+        if google_persona == "Custom Google Email...":
+            custom_email = st.text_input("Enter Google Mail / Email:", placeholder="anika@gmail.com or name@company.com")
+        
+        google_submit = st.button("🚀 Sign in with Google", use_container_width=True)
+        if google_submit:
+            if google_persona == "Custom Google Email...":
+                target_email = custom_email.strip()
+                if not target_email:
+                    st.error("Please enter a valid email address.")
+                    target_email = None
+            elif "anika.sharma" in google_persona:
+                target_email = "anika.sharma@meridianhealth.com"
+            elif "admin@deeptrustxai.com" in google_persona:
+                target_email = "admin@deeptrustxai.com"
+            else:
+                target_email = "researcher@example.com"
+                
+            if target_email:
+                import jwt
+                google_admins_raw = os.getenv("GOOGLE_ADMIN_EMAILS", "admin@deeptrustxai.com,admin@example.com")
+                google_admins = [e.strip().lower() for e in google_admins_raw.split(",")]
+                is_admin = target_email.lower() in google_admins or "admin" in target_email.lower()
+                
+                user_payload = {
+                    "sub": f"google-{uuid.uuid4().hex[:8]}",
+                    "name": target_email.split("@")[0].replace(".", " ").title(),
+                    "email": target_email,
+                    "email_verified": True,
+                    "iss": "https://accounts.google.com",
+                    "aud": "google-mock-client-id",
+                    "scope": "openid email profile",
+                    "roles": ["admin"] if is_admin else ["user"],
+                    "groups": ["Administrators"] if is_admin else ["Normal-Users"],
+                    "allowed_paths": ["./"] if is_admin else ["./secure-experiment-zone"]
+                }
+                
+                generated_token = jwt.encode(user_payload, "secret", algorithm="HS256")
+                st.session_state.keycloak_token = generated_token
+                st.session_state.role = "admin" if is_admin else "user"
+                st.session_state.username = user_payload["name"]
+                st.success(f"Signed in as {target_email} ({st.session_state.role.upper()})")
+                st.rerun()
+                
+        with st.expander("Advanced: Paste Custom Raw JWT"):
+            with st.form("token_login_form"):
+                token_input = st.text_area("JWT Token", height=100)
+                token_submitted = st.form_submit_button("Submit Raw Token")
+                
+                if token_submitted and token_input.strip():
+                    try:
+                        access_token = token_input.strip()
+                        st.session_state.keycloak_token = access_token
+                        claims = get_claims_with_userinfo(access_token)
+                        roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
+                        groups = claims.get("groups", []) or []
+                        scopes = claims.get("scope", "")
+                        if isinstance(scopes, str):
+                            scopes = scopes.split(" ")
+                        if "Normal-Users" in groups:
+                            st.session_state.role = "user"
+                        elif "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
+                            st.session_state.role = "admin"
+                        elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
+                            st.session_state.role = "privileged"
+                        else:
+                            st.session_state.role = "user"
+                        st.session_state.username = claims.get("preferred_username") or claims.get("email") or claims.get("name") or "FederatedUser"
+                        st.success("SSO Authentication Successful!")
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"Failed to decode token: {ex}")
 
 # --- SPIFFE Workload Status ---
 st.sidebar.markdown("---")

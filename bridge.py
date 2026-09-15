@@ -124,13 +124,8 @@ def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[d
             if resolved_user_id == "anonymous_user":
                 resolved_user_id = "admin"
 
-    # Contextual override if user invokes admin role / persona
-    if prompt_text:
-        p = prompt_text.lower()
-        if any(w in p for w in ["as admin", "as administrator", "[admin]", "role: admin", "i am admin", "mode: admin"]):
-            resolved_user_role = "admin"
-            resolved_user_id = "admin"
-
+    # Zero-Trust: Prompt text can NEVER escalate privileges.
+    # Privileges must strictly originate from verified cryptographic JWTs, SSO identity, or server env config.
     return resolved_user_id, resolved_user_role, resolved_user_sub
 
 # ── Governance Memory Layer ──────────────────────────────────────────────────

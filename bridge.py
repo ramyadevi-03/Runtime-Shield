@@ -4408,14 +4408,14 @@ async def chat_completions_proxy(request: Request):
     if nvidia_key and not is_fake_nvidia and ("llama-3.1" in requested_model.lower() or "meta-llama" in requested_model.lower() or "nvidia" in requested_model.lower()):
         is_nvidia = True
 
-    is_huggingface = requested_model.startswith("huggingface/") or "llama-3.1" in requested_model.lower() or "meta-llama" in requested_model.lower()
-    
-    if is_huggingface or (is_nvidia and not is_fake_nvidia):
-        pass # Force real upstream requests even if hf_token or nvidia_key is missing (it will fail cleanly upstream)
-    else:
-        if not openai_key or openai_key == "mock-key-for-local-demo" or is_fake_nvidia:
-            log("🤖 Zero-Key Mock LLM Mode activated")
-            return await handle_mock_llm_response(body, user_id, user_role, user_sub)
+    is_huggingface = False
+    if not is_nvidia:
+        if hf_token and hf_token != "None" and not hf_token.startswith("mock") and (requested_model.startswith("huggingface/") or "llama-3.1" in requested_model.lower() or "meta-llama" in requested_model.lower()):
+            is_huggingface = True
+
+    if not is_nvidia and not is_huggingface and (not openai_key or openai_key == "mock-key-for-local-demo" or is_fake_nvidia):
+        log("🤖 Zero-Key Smart Mock LLM Mode activated")
+        return await handle_mock_llm_response(body, user_id, user_role, user_sub)
 
     # 8. Standard Mode: Forward Request to Upstream LLM
     target_url = "https://api.openai.com/v1/chat/completions"
@@ -4473,15 +4473,52 @@ async def chat_completions_proxy(request: Request):
             log(f"🛤️ [Outbound Call - Streaming] Target URL: {target_url}")
             log(f"📋 [Outbound Call - Streaming] Headers: {headers}")
             
-            async with httpx.AsyncClient() as client:
-                async with client.stream("POST", target_url, headers=headers, json=body, timeout=60.0) as resp:
-                    if resp.status_code != 200:
-                        error_detail = await resp.aread()
-                        log(f"⚠️ Upstream streaming error: {error_detail}")
-                        err_msg = f"API Error: Upstream Hugging Face server returned status {resp.status_code}."
-                        yield f"data: {json.dumps({'id': 'err', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': requested_model, 'choices': [{'index': 0, 'delta': {'content': err_msg}, 'finish_reason': 'stop'}]})}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
+            upstream_failed = False
+            try:
+                async with httpx.AsyncClient() as client:
+                    async with client.stream("POST", target_url, headers=headers, json=body, timeout=30.0) as resp:
+                        if resp.status_code != 200:
+                            error_detail = await resp.aread()
+                            log(f"⚠️ Upstream streaming error (status {resp.status_code}): {error_detail}. Falling back to Smart Local Mock LLM...")
+                            upstream_failed = True
+                        else:
+                            is_tool_call_stream = False
+                            async for line in resp.aiter_lines():
+                                if line.startswith("data: "):
+                                    data_content = line[6:].strip()
+                                    if data_content == "[DONE]":
+                                        if is_tool_call_stream:
+                                            yield "data: [DONE]\n\n"
+                                        break
+
+                                    try:
+                                        chunk = json.loads(data_content)
+                                        if not chunks_metadata:
+                                            chunks_metadata.append(chunk)
+                                        
+                                        choices = chunk.get("choices", [])
+                                        delta = choices[0].get("delta", {}) if choices else {}
+                                        if "tool_calls" in delta or (choices and "tool_calls" in choices[0]):
+                                            is_tool_call_stream = True
+                                            
+                                        if is_tool_call_stream:
+                                            yield f"data: {data_content}\n\n"
+                                            continue
+                                            
+                                        content = delta.get("content", "")
+                                        if content:
+                                            accumulated_content.append(content)
+                                    except Exception as e:
+                                        log(f"⚠️ Stream chunk parsing error: {e}")
+            except Exception as ex:
+                log(f"⚠️ Upstream network exception ({ex}). Falling back to Smart Local Mock LLM...")
+                upstream_failed = True
+
+            if upstream_failed:
+                mock_resp = await handle_mock_llm_response(body, user_id, user_role, user_sub)
+                async for chunk in mock_resp.body_iterator:
+                    yield chunk
+                return
 
                     is_tool_call_stream = False
                     async for line in resp.aiter_lines():
@@ -4599,12 +4636,16 @@ async def chat_completions_proxy(request: Request):
         log(f"🛤️ [Outbound Call - Non-Streaming] Target URL: {target_url}")
         log(f"📋 [Outbound Call - Non-Streaming] Headers: {headers}")
         
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(target_url, headers=headers, json=body, timeout=60.0)
-            if resp.status_code != 200:
-                return JSONResponse(status_code=resp.status_code, content=resp.json())
-
-            resp_data = resp.json()
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(target_url, headers=headers, json=body, timeout=30.0)
+                if resp.status_code != 200:
+                    log(f"⚠️ Upstream HTTP error {resp.status_code}. Falling back to Smart Local Mock LLM...")
+                    return await handle_mock_llm_response(body, user_id, user_role, user_sub)
+                resp_data = resp.json()
+        except Exception as err:
+            log(f"⚠️ Upstream connection error ({err}). Falling back to Smart Local Mock LLM...")
+            return await handle_mock_llm_response(body, user_id, user_role, user_sub)
             
             # FIX: Ensure OpenAI-compatible fields for LiteLLM when using Hugging Face
             if "created" not in resp_data:

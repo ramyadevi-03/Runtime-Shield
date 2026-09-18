@@ -142,6 +142,8 @@ def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[d
         u = raw_user.strip()
         google_admins_raw = os.getenv("GOOGLE_ADMIN_EMAILS", "admin@deeptrustxai.com,admin@example.com")
         google_admins = [e.strip().lower() for e in google_admins_raw.split(",")]
+        google_privs_raw = os.getenv("GOOGLE_PRIVILEGED_EMAILS", "researcher@deeptrustxai.com,auditor@deeptrustxai.com")
+        google_privs = [e.strip().lower() for e in google_privs_raw.split(",")]
         
         # Query MongoDB
         db_user = get_user_from_mongodb(u)
@@ -153,6 +155,8 @@ def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[d
             
             if doc_role == "ADMIN" or doc_email in google_admins or "admin" in doc_name.lower():
                 return doc_name, "admin", user_sub_id
+            elif doc_role == "PRIVILEGED" or doc_email in google_privs or "priv" in doc_name.lower() or "research" in doc_name.lower():
+                return doc_name, "privileged", user_sub_id
             else:
                 return doc_name, "user", user_sub_id
 
@@ -160,7 +164,7 @@ def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[d
         u_lower = u.lower()
         if u_lower in google_admins or "admin" in u_lower:
             return "Admin", "admin", "admin-sub"
-        elif "research" in u_lower or "priv" in u_lower:
+        elif u_lower in google_privs or "research" in u_lower or "priv" in u_lower:
             return "Privileged-User", "privileged", "priv-sub"
         else:
             return "Standard-User", "user", "user-sub"

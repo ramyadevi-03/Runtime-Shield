@@ -84,18 +84,43 @@ def get_session_key(session_id: str, user_id: str, spiffe_id: str) -> str:
     return build_chain_context_id(session_id=session_id, user_id=user_id, spiffe_id=spiffe_id)
 
 
+_mongo_client = None
+
+def get_user_from_mongodb(raw_user: str) -> Optional[dict]:
+    global _mongo_client
+    if not raw_user or not isinstance(raw_user, str):
+        return None
+    raw_user = raw_user.strip()
+    if not raw_user:
+        return None
+    mongo_uri = os.getenv("MONGO_URI", "mongodb://mongodb:27017/LibreChat")
+    try:
+        import pymongo
+        from bson import ObjectId
+        if _mongo_client is None:
+            _mongo_client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=2000)
+        db = _mongo_client.get_default_database() or _mongo_client["LibreChat"]
+        users_col = db["users"]
+        
+        doc = None
+        if ObjectId.is_valid(raw_user):
+            doc = users_col.find_one({"_id": ObjectId(raw_user)})
+        if not doc:
+            doc = users_col.find_one({"email": raw_user.lower()})
+        if not doc:
+            doc = users_col.find_one({"username": raw_user})
+        if not doc:
+            doc = users_col.find_one({"name": raw_user})
+        return doc
+    except Exception as e:
+        log(f"⚠️ MongoDB user lookup failed: {e}")
+        return None
+
+
 def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[dict], user_id: str, user_sub: str, user_role: str, raw_user: str = "", prompt_text: str = "", header_role: str = "") -> Tuple[str, str, str]:
-    if header_role and header_role.lower() == "admin":
-        return "Admin", "admin", "admin-sub"
-    elif header_role and header_role.lower() in ("user", "standard"):
-        return "Standard-User", "user", "user-sub"
-
-    resolved_user_id = user_id
-    resolved_user_role = user_role
-    resolved_user_sub = user_sub
-
+    # 1. Authenticated JWT Bearer Token (Keycloak / OAuth / SPIFFE)
     if token and claims:
-        resolved_user_id = claims.get("preferred_username") or claims.get("sub") or resolved_user_id
+        resolved_user_id = claims.get("preferred_username") or claims.get("sub") or user_id
         resolved_user_sub = claims.get("sub") or ""
         roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
         groups = claims.get("groups", []) or []
@@ -110,28 +135,43 @@ def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[d
             resolved_user_role = "privileged"
         else:
             resolved_user_role = "user"
-    elif raw_user and raw_user.strip():
-        u = raw_user.strip().lower()
+        return resolved_user_id, resolved_user_role, resolved_user_sub
+
+    # 2. LibreChat MongoDB Account Lookup via raw_user (User ObjectId hex, email, or name)
+    if raw_user and raw_user.strip():
+        u = raw_user.strip()
         google_admins_raw = os.getenv("GOOGLE_ADMIN_EMAILS", "admin@deeptrustxai.com,admin@example.com")
         google_admins = [e.strip().lower() for e in google_admins_raw.split(",")]
         
-        if u in google_admins or "admin" in u:
-            resolved_user_role = "admin"
-            resolved_user_id = "Admin"
-        elif "research" in u or "priv" in u:
-            resolved_user_role = "privileged"
-            resolved_user_id = "Privileged-User"
-        else:
-            resolved_user_role = "user"
-            resolved_user_id = "Standard-User"
-    elif not token:
-        env_role = (env_role or "user").strip().lower().replace("'", "").replace('"', '')
-        if resolved_user_role != "admin" and env_role == "admin":
-            resolved_user_role = "admin"
-            if resolved_user_id == "anonymous_user":
-                resolved_user_id = "Admin"
+        # Query MongoDB
+        db_user = get_user_from_mongodb(u)
+        if db_user:
+            doc_role = (db_user.get("role") or "").upper()
+            doc_email = (db_user.get("email") or "").lower()
+            doc_name = db_user.get("name") or db_user.get("username") or "User"
+            user_sub_id = str(db_user.get("_id", u))
+            
+            if doc_role == "ADMIN" or doc_email in google_admins or "admin" in doc_name.lower():
+                return doc_name, "admin", user_sub_id
+            else:
+                return doc_name, "user", user_sub_id
 
-    return resolved_user_id, resolved_user_role, resolved_user_sub
+        # Fallback string heuristics if MongoDB is offline / unpopulated
+        u_lower = u.lower()
+        if u_lower in google_admins or "admin" in u_lower:
+            return "Admin", "admin", "admin-sub"
+        elif "research" in u_lower or "priv" in u_lower:
+            return "Privileged-User", "privileged", "priv-sub"
+        else:
+            return "Standard-User", "user", "user-sub"
+
+    # 3. Local Dev Environment role fallback
+    if not token:
+        env_role = (env_role or "user").strip().lower().replace("'", "").replace('"', '')
+        if env_role == "admin":
+            return "Admin", "admin", "admin-sub"
+
+    return user_id, user_role, user_sub
 
 # ── Governance Memory Layer ──────────────────────────────────────────────────
 try:
@@ -4312,16 +4352,7 @@ async def chat_completions_proxy(request: Request):
             prompt_extract = msg.get("content", "") or ""
             break
 
-    # Read role header / model override from LibreChat endpoints
-    header_role = request.headers.get("X-User-Role") or request.headers.get("x-user-role") or ""
-    req_model = body.get("model", "")
-    if not header_role:
-        if "admin" in req_model.lower():
-            header_role = "admin"
-        elif "agent" in req_model.lower() or "user" in req_model.lower():
-            header_role = "user"
-
-    # Resolve identity/role from the token when available; only use the env override
+    # Resolve identity/role from token / MongoDB user session; only use env override
     # as a fallback when the request is unauthenticated.
     raw_user_val = body.get("user") or request.headers.get("X-User-Email") or request.headers.get("x-user-email") or ""
     user_id, user_role, user_sub = resolve_user_context(
@@ -4333,7 +4364,6 @@ async def chat_completions_proxy(request: Request):
         user_role=user_role,
         raw_user=raw_user_val,
         prompt_text=prompt_extract,
-        header_role=header_role,
     )
     if token and claims and user_role != "admin":
         log(f"🧭 Resolved request identity from token: user={user_id}, role={user_role}")

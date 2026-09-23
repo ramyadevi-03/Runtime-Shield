@@ -89,6 +89,7 @@ services:
       - NVIDIA_API_KEY=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
       - NIM_BASE_URL=https://integrate.api.nvidia.com/v1
       - HF_TOKEN=${HUGGINGFACE_TOKEN}
+      - MONGO_URI=mongodb://mongodb:27017/LibreChat
     volumes:
       - spire-agent-socket:/run/spire/sockets:ro
       - ./spire/certs:/app/spire/certs:ro
@@ -96,6 +97,7 @@ services:
       - keycloak
       - spire-agent
       - opa
+      - mongodb
     restart: always
 
 

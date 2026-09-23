@@ -4,7 +4,7 @@ services:
     container_name: keycloak_mcp
     image: quay.io/keycloak/keycloak:26.5.3
     user: "0:0"
-    command: ["start-dev", "--features=token-exchange"]
+    command: ["start-dev", "--log-level=debug"]
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: kavss
@@ -41,6 +41,7 @@ services:
       - ./spire/certs:/run/spire/certs:ro
       - ./spire/agent/passwd:/etc/passwd:ro
       - ./spire/agent/group:/etc/group:ro
+      - spire-agent-data:/opt/spire/data
       - spire-agent-socket:/run/spire/sockets
     depends_on:
       - spire-server
@@ -69,10 +70,11 @@ services:
       - "5002:5002"
     environment:
       - KEYCLOAK_URL=http://keycloak:8080
+      - KEYCLOAK_ISSUER_URL=http://localhost:8083
       - OPA_URL=http://opa:8182/v1/data/runtime_shield/authz/decision
       - KEYCLOAK_REALM=master
-      - KEYCLOAK_CLIENT_ID=admin-cli
-      - KEYCLOAK_CLIENT_SECRET=vsIwGjbvAqpk1tdDeZGEUZAaFPR0ItG3
+      - KEYCLOAK_CLIENT_ID=runtime-shield-jit
+      - KEYCLOAK_CLIENT_SECRET=${RUNTIME_SHIELD_JIT_CLIENT_SECRET}
       - KEYCLOAK_ADMIN_USERNAME=admin
       - KEYCLOAK_ADMIN_PASSWORD=admin
       - LOCAL_DEV_MODE=false

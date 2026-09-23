@@ -2738,7 +2738,6 @@ class JITTokenManager:
             "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "scope": required_scope,
-            "audience": self.client_id
         }
         
         try:
@@ -2761,7 +2760,7 @@ class JITTokenManager:
                     log(f"🎟️ JIT Token Issued Successfully: {jit_token[:15]}... (TTL: {ttl}s)")
                     return jit_token
             else:
-                log(f"⚠️ Keycloak JIT Token Exchange returned HTTP {resp.status_code}. Generating downscoped JIT token from verified session...")
+                log(f"⚠️ Keycloak JIT Token Exchange returned HTTP {resp.status_code}: {resp.text}. Generating downscoped JIT token from verified session...")
         except Exception as net_err:
             log(f"⚠️ Keycloak JIT exchange request error: {net_err}. Generating downscoped JIT token from verified session...")
 
@@ -5595,7 +5594,7 @@ async def execute_tool_proxy(request: Request):
     # 8. JIT TOKEN EXCHANGE (RFC 8693)
     required_scope = scope_map.get(tool_name)
     provider_name = tool_map.get(tool_name, "unknown")
-    token_to_exchange = token or os.getenv("KEYCLOAK_TOKEN")
+    token_to_exchange = token or os.getenv("KEYCLOAK_TOKEN", "").strip("'\"")
     
     if not token_to_exchange:
         raise HTTPException(status_code=401, detail="No Keycloak authentication token provided")
@@ -7157,7 +7156,7 @@ setInterval(() => {
                         provider_env[k] = val
             elif provider == "filesystem-provider":
                 # filesystem-provider gets NO Keycloak secrets and NO NVIDIA API keys, but needs public Keycloak URL and Realm for JIT token verification!
-                for k in ["KEYCLOAK_URL", "KEYCLOAK_REALM"]:
+                for k in ["KEYCLOAK_URL", "KEYCLOAK_REALM", "KEYCLOAK_ISSUER_URL", "KEYCLOAK_CLIENT_ID"]:
                     val = os.getenv(k)
                     if val is not None:
                         provider_env[k] = val
@@ -7321,7 +7320,7 @@ setInterval(() => {
                                 required_scope = scope_map.get(tool_name)
                                 if not user_token:
                                     local_identity = f"Role: {DEFAULT_ROLE}"
-                                    local_token = os.getenv("KEYCLOAK_TOKEN")
+                                    local_token = os.getenv("KEYCLOAK_TOKEN", "").strip("'\"")
                                     if local_token:
                                         log("⚠️ WARNING: Fallback KEYCLOAK_TOKEN loaded from environment. Dynamic token acquisition should be preferred.")
                                         try:
@@ -7339,7 +7338,7 @@ setInterval(() => {
 
                                 # 3. JIT TOKEN EXCHANGE (DOWNSCOPING)
                                 provider_name = tool_map.get(tool_name, "unknown")
-                                token_to_exchange = user_token or os.getenv("KEYCLOAK_TOKEN")
+                                token_to_exchange = user_token or os.getenv("KEYCLOAK_TOKEN", "").strip("'\"")
                                 
                                 jit_token = None
                                 if token_to_exchange:

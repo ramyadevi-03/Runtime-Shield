@@ -11,15 +11,25 @@ Requires the following environment variables (no hardcoded defaults):
   - KEYCLOAK_ADMIN_PASSWORD
   - KEYCLOAK_CLIENT_ID
   - KEYCLOAK_CLIENT_SECRET (optional, used if the client is confidential)
+
+NOTE: On a fresh Keycloak instance, KEYCLOAK_CLIENT_ID may be set to
+"runtime-shield-jit" (a confidential, service-account-only client with no
+direct access grants). This script needs a client that supports direct
+access grants to obtain its own admin token. If you hit:
+  [ERROR] Admin token request failed (HTTP 400): unauthorized_client
+run this script once with the client temporarily overridden:
+  PowerShell: $env:KEYCLOAK_CLIENT_ID = "admin-cli"; python configure_keycloak.py
+This only affects the current shell session, not your .env file.
 """
 import requests
 import os
 import sys
 import urllib3
-from dotenv import load_dotenv
+from dotenv import load_dotenv , set_key
 
 load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+DOTENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 def _require_env(name: str) -> str:
     val = os.getenv(name)
@@ -373,6 +383,187 @@ def configure_groups_and_mappers(session: KeycloakSession):
     assign_user_to_group("user1", "Normal-Users")
 
 
+def configure_jit_exchange_client(session: KeycloakSession):
+    """
+    Creates the runtime-shield-jit client used by the gateway for JIT token
+    exchange (confidential, service-account, Standard Token Exchange enabled),
+    associates the tool:* scopes with it, and adds an audience mapper on
+    runtime-shield-cli so its tokens can be exchanged for runtime-shield-jit.
+    """
+    jit_client_id_name = "runtime-shield-jit"
+    source_client_id_name = "runtime-shield-cli"
+
+    # 1. Create runtime-shield-jit client if it doesn't exist
+    clients_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients?clientId={jit_client_id_name}"
+    try:
+        r = session.request("GET", clients_url, timeout=10)
+        existing = r.json() if r.status_code == 200 else []
+    except Exception as e:
+        print(f"[ERROR] Exception checking for '{jit_client_id_name}': {e}")
+        return
+
+    if existing:
+        jit_uuid = existing[0]["id"]
+        print(f"[INFO] Client '{jit_client_id_name}' already exists (UUID: {jit_uuid})")
+    else:
+        create_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients"
+        client_data = {
+            "clientId": jit_client_id_name,
+            "name": "Runtime Shield JIT Exchange",
+            "enabled": True,
+            "publicClient": False,
+            "serviceAccountsEnabled": True,
+            "standardFlowEnabled": False,
+            "directAccessGrantsEnabled": False,
+            "implicitFlowEnabled": False,
+            "protocol": "openid-connect",
+            "attributes": {
+                "standard.token.exchange.enabled": "true"
+            }
+        }
+        try:
+            r = session.request("POST", create_url, json=client_data, timeout=10)
+            if r.status_code == 201:
+                print(f"[OK] Created client '{jit_client_id_name}'")
+            else:
+                print(f"[ERROR] Failed to create '{jit_client_id_name}': {r.status_code} {r.text}")
+                return
+            r = session.request("GET", clients_url, timeout=10)
+            existing = r.json() if r.status_code == 200 else []
+            if not existing:
+                print(f"[ERROR] Could not retrieve '{jit_client_id_name}' after creation")
+                return
+            jit_uuid = existing[0]["id"]
+        except Exception as e:
+            print(f"[ERROR] Exception creating '{jit_client_id_name}': {e}")
+            return
+
+    # 2. Write its secret to .env so docker-compose.yml can reference it
+    #    as ${RUNTIME_SHIELD_JIT_CLIENT_SECRET} — never hardcode this value,
+    #    it's regenerated fresh whenever this client is (re)created.
+    try:
+        secret_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{jit_uuid}/client-secret"
+        r = session.request("GET", secret_url, timeout=10)
+        if r.status_code == 200:
+            secret = r.json().get("value")
+            set_key(DOTENV_PATH, "RUNTIME_SHIELD_JIT_CLIENT_SECRET", secret, quote_mode="never")
+            print(f"[OK] Wrote RUNTIME_SHIELD_JIT_CLIENT_SECRET to {DOTENV_PATH}")
+        else:
+            print(f"[ERROR] Failed to fetch secret for '{jit_client_id_name}': {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"[ERROR] Exception fetching/writing secret for '{jit_client_id_name}': {e}")
+
+    # 3. Associate tool:* scopes as optional on runtime-shield-jit
+    scopes_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/client-scopes"
+    try:
+        r = session.request("GET", scopes_url, timeout=10)
+        existing_scopes = {s["name"]: s["id"] for s in r.json() if "name" in s} if r.status_code == 200 else {}
+    except Exception as e:
+        print(f"[ERROR] Exception listing client scopes: {e}")
+        existing_scopes = {}
+
+    tool_scopes = [
+        "tool:read_file", "tool:write_file", "tool:list_directory",
+        "tool:keycloak_read", "tool:keycloak_admin", "tool:keycloak_report",
+        "tool:admin_internal"
+    ]
+    for scope_name in tool_scopes:
+        scope_uuid = existing_scopes.get(scope_name)
+        if not scope_uuid:
+            print(f"[WARNING] Scope '{scope_name}' not found — run configure_client_scopes() first")
+            continue
+        assoc_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{jit_uuid}/optional-client-scopes/{scope_uuid}"
+        try:
+            r = session.request("PUT", assoc_url, timeout=10)
+            if r.status_code in [204, 201, 200]:
+                print(f"[OK] Associated scope '{scope_name}' as optional for '{jit_client_id_name}'")
+            else:
+                print(f"[ERROR] Failed to associate scope '{scope_name}': {r.status_code} {r.text}")
+        except Exception as e:
+            print(f"[ERROR] Exception associating scope '{scope_name}': {e}")
+
+    # 4. Add audience mapper on runtime-shield-cli so its tokens can be
+    #    exchanged for runtime-shield-jit (Standard Token Exchange V2 requires
+    #    the requester client to appear in the subject token's aud claim)
+    src_clients_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients?clientId={source_client_id_name}"
+    try:
+        r = session.request("GET", src_clients_url, timeout=10)
+        src_clients = r.json() if r.status_code == 200 else []
+        if not src_clients:
+            print(f"[WARNING] Client '{source_client_id_name}' not found — skipping audience mapper")
+            return
+        src_uuid = src_clients[0]["id"]
+    except Exception as e:
+        print(f"[ERROR] Exception retrieving '{source_client_id_name}': {e}")
+        return
+
+    mappers_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{src_uuid}/protocol-mappers/models"
+    try:
+        r = session.request("GET", mappers_url, timeout=10)
+        if r.status_code == 200:
+            for mapper in r.json():
+                if mapper.get("name") == "jit-audience":
+                    print(f"[INFO] 'jit-audience' mapper already exists on '{source_client_id_name}', skipping")
+                    return
+
+        mapper_data = {
+            "name": "jit-audience",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-audience-mapper",
+            "config": {
+                "included.client.audience": jit_client_id_name,
+                "id.token.claim": "false",
+                "access.token.claim": "true"
+            }
+        }
+        r = session.request("POST", mappers_url, json=mapper_data, timeout=10)
+        if r.status_code == 201:
+            print(f"[OK] Added 'jit-audience' mapper to '{source_client_id_name}'")
+        else:
+            print(f"[ERROR] Failed to add audience mapper: {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"[ERROR] Exception adding audience mapper: {e}")
+
+
+def configure_frontend_url(session: KeycloakSession):
+    """
+    Sets the realm's Frontend URL to match this script's own KEYCLOAK_URL.
+    This is required so tokens issued to external callers (e.g. login.py on
+    the host) carry an issuer that internally-issued JIT-exchanged tokens
+    also match — otherwise downstream token verification fails with an
+    issuer mismatch, since Keycloak dev mode derives the issuer from the
+    Host header of whichever hostname reached it (host vs internal Docker
+    network) unless Frontend URL pins it to one fixed value.
+    """
+    realm_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}"
+    try:
+        r = session.request("GET", realm_url, timeout=10)
+        if r.status_code != 200:
+            print(f"[ERROR] Failed to fetch realm representation: {r.status_code} {r.text}")
+            return
+        realm_rep = r.json()
+    except Exception as e:
+        print(f"[ERROR] Exception fetching realm representation: {e}")
+        return
+
+    current = realm_rep.get("attributes", {}).get("frontendUrl", "")
+    if current == KEYCLOAK_URL:
+        print(f"[INFO] Frontend URL already set to '{KEYCLOAK_URL}'")
+        return
+
+    if "attributes" not in realm_rep or realm_rep["attributes"] is None:
+        realm_rep["attributes"] = {}
+    realm_rep["attributes"]["frontendUrl"] = KEYCLOAK_URL
+
+    try:
+        r = session.request("PUT", realm_url, json=realm_rep, timeout=10)
+        if r.status_code in [200, 204]:
+            print(f"[OK] Set realm Frontend URL to '{KEYCLOAK_URL}'")
+        else:
+            print(f"[ERROR] Failed to set Frontend URL: {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"[ERROR] Exception setting Frontend URL: {e}")
+
 def configure_trusted_idps(session: KeycloakSession):
     """Ensure trusted external Identity Providers are configured in Keycloak."""
     idp_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/identity-provider/instances"
@@ -431,6 +622,10 @@ def main():
 
     # Configure the client scopes
     configure_client_scopes(session)
+
+    # Configure the JIT exchange client (runtime-shield-jit) and audience mapper
+    configure_jit_exchange_client(session)
+    configure_frontend_url(session)
 
     # Set passwords for the configured realm users from environment
     user_pass = os.getenv("KEYCLOAK_USER_PASSWORD")

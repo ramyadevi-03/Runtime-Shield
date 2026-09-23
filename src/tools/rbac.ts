@@ -124,7 +124,7 @@ export async function verifyJitToken(
     if (!keycloakUrl || !realm) {
         throw new Error("Fatal Error: KEYCLOAK_URL or KEYCLOAK_REALM not configured in environment variables");
     }
-    const expectedIssuer = `${keycloakUrl}/realms/${realm}`;
+    const expectedIssuer = `${process.env.KEYCLOAK_ISSUER_URL || keycloakUrl}/realms/${realm}`;
 
     // Cryptographic validation using jsonwebtoken (without strict audience check inside verify, as public client tokens might not have aud claim)
     const decoded: any = jwt.verify(token, cert, {

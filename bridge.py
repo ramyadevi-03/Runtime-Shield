@@ -7034,16 +7034,22 @@ setInterval(() => {
 </body>
 </html>"""
 
-            # Override the default route with our patched dashboard
+            from mcp_firewall.dashboard.app import DASHBOARD_HTML
+
+            # Serve the comprehensive SHIELD-FORCE-ONE Governance Console
             @dashboard_app.get("/", response_class=HTMLResponse)
-            async def patched_index():
+            async def serve_root_dashboard():
+                return DASHBOARD_HTML
+
+            @dashboard_app.get("/simple", response_class=HTMLResponse)
+            async def serve_simple_dashboard():
                 return PATCHED_DASHBOARD_HTML
 
             @dashboard_app.get("/labs", response_class=HTMLResponse)
             async def serve_labs_portal():
                 return LABS_PORTAL_HTML
 
-            log("✅ Dashboard patched with polling fallback for live updates")
+            log("✅ Dashboard active with full Governance Console and Labs Portal")
 
             # NOW start the servers once all routes are registered!
             start_dashboard(port=dashboard_port)
@@ -7927,12 +7933,14 @@ setInterval(() => {
         output_threads.append(t_out)
         stderr_threads.append(t_err)
 
-    log("⌛ Multi-MCP Bridge active and relaying...")
+    log("⌛ Multi-MCP Bridge & Dashboard active and running...")
 
-    # Wait for all processes
-    for name, proc in mcp_processes.items():
-        proc.wait()
-        log(f"🏁 Provider {name} exited with code {proc.returncode}")
+    # Keep the bridge process, dashboard (9090), and proxy (5001) alive continuously
+    try:
+        while True:
+            time.sleep(1)
+    except (KeyboardInterrupt, SystemExit):
+        log("🛑 Stopping bridge process...")
 
 
 if __name__ == "__main__":

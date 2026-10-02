@@ -39,14 +39,12 @@ def get_opa_status() -> dict:
     }
 
 
-def sync_policies() -> bool:
+def sync_policies(max_retries: int = 15, retry_interval: float = 2.0) -> bool:
     """
     Loads pre-normalized rules from rules/runtime_shield_data.json and the Rego
     policy from rules/runtime_shield.rego, then pushes both to the OPA server.
 
-    Policy rules are no longer read from mcp-firewall.yaml.
-    mcp-firewall.yaml is retained for operational config only (MCP servers,
-    NeMo, PII/secrets settings, etc.).
+    Includes retry logic to wait for OPA server readiness during container startup.
     """
     global _last_sync_status, _last_data_hash, _last_sync_time, _opa_reachable
     project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -56,11 +54,23 @@ def sync_policies() -> bool:
     opa_url = os.getenv("OPA_URL", "http://localhost:8182/v1/data/runtime_shield/authz/decision")
     base_url = opa_url.split("/v1/")[0]
 
-    try:
-        # Check if OPA is reachable before proceeding
-        requests.get(f"{base_url}/health", timeout=2.0)
-        _opa_reachable = True
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Check if OPA is reachable before proceeding
+            resp = requests.get(f"{base_url}/health", timeout=2.0)
+            if resp.status_code == 200:
+                _opa_reachable = True
+                break
+        except requests.exceptions.RequestException:
+            logger.info(f"⏳ Waiting for OPA server at {base_url} (attempt {attempt}/{max_retries})...")
+            time.sleep(retry_interval)
+    else:
+        _opa_reachable = False
+        _last_sync_status = "failed"
+        logger.error(f"❌ Failed to reach OPA server at {base_url} after {max_retries} attempts.")
+        return False
 
+    try:
         # Load pre-normalized rules from the OPA-native JSON data file
         with open(data_path, "r", encoding="utf-8") as f:
             data_payload = json.load(f)

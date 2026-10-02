@@ -14,6 +14,9 @@ tests/
 scratch/
 temp_repo/
 .pytest_cache/
+# Governance memory session files and temp files
+governance_memory/short_term/sessions/
+query
 
 # Large binaries
 opa.exe

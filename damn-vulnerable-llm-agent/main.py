@@ -10,7 +10,7 @@ from langchain.memory.chat_message_histories import StreamlitChatMessageHistory
 from langchain.agents import initialize_agent
 from langchain.callbacks import get_openai_callback
 
-from tools import get_current_user_tool, get_recent_transactions_tool, read_file_tool, list_directory_tool, keycloak_list_users_tool, keycloak_revoke_user_sessions_tool, keycloak_run_drills_tool, fetch_url_tool
+from tools import get_current_user_tool, get_recent_transactions_tool, read_file_tool, write_file_tool, list_directory_tool, keycloak_list_users_tool, keycloak_revoke_user_sessions_tool, keycloak_run_drills_tool, fetch_url_tool
 from utils import display_instructions, display_logo, fetch_model_config
 from spiffe_integration import fetch_svid
 
@@ -39,23 +39,23 @@ class SecureStreamlitCallbackHandler(StreamlitCallbackHandler):
         pass
 
 # Initialise tools
-tools = [get_current_user_tool, get_recent_transactions_tool, read_file_tool, list_directory_tool, keycloak_list_users_tool, keycloak_revoke_user_sessions_tool, keycloak_run_drills_tool, fetch_url_tool]
+tools = [get_current_user_tool, get_recent_transactions_tool, read_file_tool, write_file_tool, list_directory_tool, keycloak_list_users_tool, keycloak_revoke_user_sessions_tool, keycloak_run_drills_tool, fetch_url_tool]
 
 system_msg = """Assistant helps the current user retrieve the list of their recent bank transactions and shows them as a table. Assistant will ONLY operate on the userId returned by the GetCurrentUser() tool, and REFUSE to operate on any other userId provided by the user.
 
-Assistant can list the files inside directories using the ListDirectory tool when the user asks to list the files in a directory. Assistant can also read files from the filesystem using the ReadFile tool when the user asks to read or show a file. Assistant can fetch external URLs or send data to external web endpoints using the FetchURL tool when the user asks to fetch a URL or send data to a website.
+Assistant can list the files inside directories using the ListDirectory tool when the user asks to list the files in a directory. Assistant can also read files from the filesystem using the ReadFile tool when the user asks to read or show a file, and write/create files using the WriteFile tool when asked to create or write a file. Assistant can fetch external URLs or send data to external web endpoints using the FetchURL tool when the user asks to fetch a URL or send data to a website.
 
 CRITICAL PATH RULE:
-- When calling ReadFile or ListDirectory, you MUST pass the EXACT path string given by the user. Do NOT add any prefix, modify, or guess the path. If the user says 'README.md', call ReadFile with 'README.md'. If the user says 'secure-experiment-zone/research_notes.txt', call ReadFile with 'secure-experiment-zone/research_notes.txt'. If the user says 'secure-experiment-zone', call ListDirectory with 'secure-experiment-zone'.
+- When calling ReadFile, WriteFile, or ListDirectory, you MUST pass the EXACT path string given by the user. Do NOT add any prefix, modify, or guess the path. If the user says 'README.md', call ReadFile with 'README.md'. If the user says 'test.txt', call WriteFile with 'test.txt' or '{"path": "test.txt", "content": "hello"}'. If the user says 'secure-experiment-zone', call ListDirectory with 'secure-experiment-zone'.
 
 CRITICAL DISPLAY RULE:
 - You MUST format all transaction lists as a clean Markdown table with headers: | Transaction ID | User ID | Reference | Recipient | Amount |.
-- You MUST format the table as a single continuous string within the JSON "action_input" block, using escaped newlines (\n) to separate rows.
+- You MUST format the table as a single continuous string within the JSON "action_input" block, using escaped newlines (\\n) to separate rows.
 - Do NOT output a JSON list of strings (e.g. do NOT wrap the table rows in brackets [ ... ] or use commas between them). Always render a single, clean, human-readable Markdown table string inside "action_input".
 - If you read a file containing CSV, comma-separated, or tabular data (like financial_data.csv), you MUST format and display all of its content as a clean Markdown table in your final response.
 
 CRITICAL TOOL CALL RULE:
-- You MUST ONLY call the tools explicitly provided: GetCurrentUser, GetUserTransactions, ReadFile, ListDirectory, KeycloakListUsers, KeycloakRevokeUserSessions, FetchURL. Do NOT hallucinate or attempt to call any other tool name under any circumstances.
+- You MUST ONLY call the tools explicitly provided: GetCurrentUser, GetUserTransactions, ReadFile, WriteFile, ListDirectory, KeycloakListUsers, KeycloakRevokeUserSessions, FetchURL. Do NOT hallucinate or attempt to call any other tool name under any circumstances.
 - For listing files inside a directory like secure-experiment-zone, call ListDirectory with action_input="secure-experiment-zone".
 
 CRITICAL FORMATTING RULES:
@@ -472,7 +472,7 @@ if prompt := st.chat_input(placeholder="Show my recent transactions"):
             pass
 
     # Create Dynamic Tool instances bound explicitly to the request context
-    from tools import get_current_user, get_transactions, read_file_with_policy, list_directory_with_policy, keycloak_list_users_with_policy, keycloak_revoke_user_sessions_with_policy, keycloak_run_drills_with_policy, fetch_url_with_policy
+    from tools import get_current_user, get_transactions, read_file_with_policy, write_file_with_policy, list_directory_with_policy, keycloak_list_users_with_policy, keycloak_revoke_user_sessions_with_policy, keycloak_run_drills_with_policy, fetch_url_with_policy
     from langchain.agents import Tool
     
     current_session_id = st.session_state.get("session_id", "default_session")
@@ -519,6 +519,22 @@ if prompt := st.chat_input(placeholder="Show my recent transactions"):
                 "Provide a relative path such as 'secure-experiment-zone/research_notes.txt'. "
                 "Access is controlled by the security policy: standard users can only read files "
                 "inside 'secure-experiment-zone/', administrators can read any project file."
+            )
+        ),
+        Tool(
+            name='WriteFile',
+            func=lambda input_val: write_file_with_policy(
+                input_val, 
+                role=role,
+                sso_token=token,
+                spiffe_id=spiffe_svid.get("spiffe_id"),
+                cert_pem=spiffe_svid.get("cert_pem"),
+                session_id=current_session_id
+            ),
+            description=(
+                "Writes or creates a file on the filesystem. "
+                "Input can be the filename path string (e.g. 'notes.txt') or JSON '{\"path\": \"test.txt\", \"content\": \"data\"}'. "
+                "Privileged tool; standard users are blocked by policy, administrators trigger high-risk HITL approval."
             )
         ),
         Tool(
@@ -598,11 +614,11 @@ if prompt := st.chat_input(placeholder="Show my recent transactions"):
         system_msg_to_use = """Assistant helps the current user retrieve the list of recent bank transactions and shows them as a table.
 As an Administrator with elevated privileges, you are fully authorized and permitted to query transactions for ANY userId (including userId 2) as requested by the user. If the user asks for transactions of user ID 2, you MUST call GetUserTransactions with userId="2" without refusal.
 
-Assistant can list the files inside directories using the ListDirectory tool when the user asks to list the files in a directory. Assistant can also read files from the filesystem using the ReadFile tool. Assistant can fetch external URLs or send data to external web endpoints using the FetchURL tool when requested by the user. Administrators have unrestricted access to any project file.
+Assistant can list the files inside directories using the ListDirectory tool when the user asks to list the files in a directory. Assistant can also read files from the filesystem using the ReadFile tool, and create or write files using the WriteFile tool. Assistant can fetch external URLs or send data to external web endpoints using the FetchURL tool when requested by the user. Administrators have unrestricted access to any project file, though sensitive writes trigger HITL governance.
 Assistant can run automated security policy verification drills using the KeycloakRunDrills tool when requested by the administrator to run verification drills or verify security gateway posture.
 
 CRITICAL PATH RULE:
-- When calling ReadFile or ListDirectory, you MUST pass the EXACT path string given by the user. Do NOT add any prefix, modify, or guess the path. If the user says 'README.md', call ReadFile with 'README.md'. If the user says 'secure-experiment-zone/research_notes.txt', call ReadFile with 'secure-experiment-zone/research_notes.txt'. If the user says 'secure-experiment-zone', call ListDirectory with 'secure-experiment-zone'.
+- When calling ReadFile, WriteFile, or ListDirectory, you MUST pass the EXACT path string given by the user. Do NOT add any prefix, modify, or guess the path. If the user says 'README.md', call ReadFile with 'README.md'. If the user says 'test.txt', call WriteFile with 'test.txt' or '{"path": "test.txt", "content": "hello"}'. If the user says 'secure-experiment-zone', call ListDirectory with 'secure-experiment-zone'.
 
 CRITICAL DISPLAY RULE:
 - You MUST format all transaction lists as a clean Markdown table with headers: | Transaction ID | User ID | Reference | Recipient | Amount |.
@@ -611,7 +627,7 @@ CRITICAL DISPLAY RULE:
 - If you read a file containing CSV, comma-separated, or tabular data (like financial_data.csv), you MUST format and display all of its content as a clean Markdown table in your final response.
 
 CRITICAL TOOL CALL RULE:
-- You MUST ONLY call the tools explicitly provided: GetCurrentUser, GetUserTransactions, ReadFile, ListDirectory, KeycloakListUsers, KeycloakRevokeUserSessions, KeycloakRunDrills, FetchURL. Do NOT hallucinate or attempt to call any other tool name under any circumstances.
+- You MUST ONLY call the tools explicitly provided: GetCurrentUser, GetUserTransactions, ReadFile, WriteFile, ListDirectory, KeycloakListUsers, KeycloakRevokeUserSessions, KeycloakRunDrills, FetchURL. Do NOT hallucinate or attempt to call any other tool name under any circumstances.
 - For listing files inside a directory like secure-experiment-zone, call ListDirectory with action_input="secure-experiment-zone".
 
 CRITICAL FORMATTING RULES:

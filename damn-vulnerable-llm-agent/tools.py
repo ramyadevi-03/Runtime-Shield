@@ -72,6 +72,41 @@ def read_file_with_policy(file_path: str, role: str = "user", sso_token: str = N
     except Exception as e:
         return f"Security Violation: {e}"
 
+def write_file_with_policy(input_val: str, content: str = "", role: str = "user", sso_token: str = None, spiffe_id: str = None, cert_pem: str = None, session_id: str = None) -> str:
+    """
+    Writes content to a file by delegating execution to the sandboxed 'write_file' tool
+    running inside the isolated 'filesystem-provider' subprocess via Runtime Shield.
+    """
+    try:
+        path = str(input_val).strip()
+        file_content = content
+        
+        # Handle if LLM passes a JSON string like {"path": "...", "content": "..."}
+        if path.startswith("{") and path.endswith("}"):
+            try:
+                parsed = json.loads(path)
+                path = parsed.get("path") or parsed.get("file_path") or path
+                file_content = parsed.get("content") or parsed.get("data") or file_content
+            except Exception:
+                pass
+        elif "|" in path and not file_content:
+            parts = path.split("|", 1)
+            path = parts[0].strip()
+            file_content = parts[1].strip()
+
+        args = {"path": path, "content": file_content, "role": role}
+        resp = shield.call_tool(
+            tool_name="write_file",
+            args=args,
+            sso_token=sso_token,
+            spiffe_id=spiffe_id,
+            cert_pem=cert_pem,
+            session_id=session_id
+        )
+        return resp.get("result", f"File '{path}' successfully created/written.")
+    except Exception as e:
+        return f"Security Violation: {e}"
+
 def list_directory_with_policy(dir_path: str, role: str = "user", sso_token: str = None, spiffe_id: str = None, cert_pem: str = None, session_id: str = None) -> str:
     """
     Lists files inside directories by delegating execution to the sandboxed 'list_directory' tool
@@ -194,6 +229,11 @@ get_recent_transactions_tool = Tool(
 )
 read_file_tool = Tool(
     name='ReadFile',
+    func=lambda x="": "Placeholder",
+    description="Placeholder"
+)
+write_file_tool = Tool(
+    name='WriteFile',
     func=lambda x="": "Placeholder",
     description="Placeholder"
 )

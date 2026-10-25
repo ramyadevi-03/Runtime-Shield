@@ -532,6 +532,18 @@ DASHBOARD_HTML = """
             <div class="m-card"><div class="m-label">UPTIME</div><div class="m-value" id="val-uptime">0s</div></div>
         </div>
 
+        <!-- HITL PENDING APPROVALS BANNER / CONTROLS -->
+        <div id="hitl-approvals-panel" style="display: none; margin: 0 40px 15px; background: rgba(251, 146, 60, 0.12); border: 1px solid rgba(251, 146, 60, 0.4); border-radius: 8px; padding: 14px 20px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                <div style="font-weight: 700; font-size: 0.9rem; color: #fb923c; display: flex; align-items: center; gap: 8px;">
+                    <span style="display:inline-block; width:9px; height:9px; border-radius:50%; background:#fb923c; box-shadow: 0 0 8px #fb923c;"></span>
+                    ⏸️ Human-In-The-Loop (HITL) Pending Approval Queue
+                </div>
+                <div style="font-size: 0.75rem; color: var(--text-dim);">Fails closed in 30 seconds if unapproved</div>
+            </div>
+            <div id="hitl-cards-container" style="display: flex; flex-direction: column; gap: 8px;"></div>
+        </div>
+
         <!-- VIEW: LIVE AUDIT -->
         <div id="view-audit" class="view-section active">
             <div class="feed-container">
@@ -1389,9 +1401,64 @@ DASHBOARD_HTML = """
                 document.getElementById('val-uptime').innerText = `${Math.floor(diff/60)}m ${diff%60}s`;
             }, 1000);
         }
+        // ── Human-In-The-Loop (HITL) Approval Handler ──
+        async function checkPendingApprovals() {
+            try {
+                const res = await fetch('/api/approvals/pending');
+                if (!res.ok) return;
+                const approvals = await res.json();
+                const panel = document.getElementById('hitl-approvals-panel');
+                const container = document.getElementById('hitl-cards-container');
+                if (!panel || !container) return;
+
+                if (!approvals || approvals.length === 0) {
+                    panel.style.display = 'none';
+                    container.innerHTML = '';
+                    return;
+                }
+
+                panel.style.display = 'block';
+                container.innerHTML = approvals.map(appr => `
+                    <div style="background: rgba(0,0,0,0.3); border: 1px solid rgba(251, 146, 60, 0.35); border-radius: 6px; padding: 10px 14px; display: flex; justify-content: space-between; align-items: center;">
+                        <div>
+                            <span style="font-family:'JetBrains Mono'; font-weight:700; color:#fff; font-size:0.9rem;">${appr.tool_name}</span>
+                            <span style="margin-left: 10px; font-size:0.75rem; color:var(--text-dim);">Req ID: <code style="color:#60a5fa;">${appr.req_id}</code> · User: <b>${appr.user_id || 'admin'}</b> (${appr.user_role}) · Risk Delta: <b>+${appr.risk_score}</b></span>
+                            <div style="font-size:0.75rem; color:#d4d4d4; margin-top:3px; font-family:'JetBrains Mono';">Args: ${JSON.stringify(appr.tool_args || {})}</div>
+                        </div>
+                        <div style="display: flex; gap: 8px;">
+                            <button onclick="resolveApproval('${appr.req_id}', 'deny')" style="background: rgba(248,113,113,0.18); border: 1px solid var(--red); color: var(--red); padding: 6px 14px; border-radius: 6px; font-weight: 700; font-size: 0.75rem; cursor: pointer;">✕ Deny</button>
+                            <button onclick="resolveApproval('${appr.req_id}', 'approve')" style="background: var(--green); border: none; color: #000; padding: 6px 16px; border-radius: 6px; font-weight: 700; font-size: 0.75rem; cursor: pointer;">✓ Approve</button>
+                        </div>
+                    </div>
+                `).join('');
+            } catch(e) {
+                // Endpoint not reachable yet
+            }
+        }
+
+        async function resolveApproval(reqId, action) {
+            try {
+                const res = await fetch('/api/approvals/' + reqId + '/action', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ action: action })
+                });
+                if (res.ok) {
+                    checkPendingApprovals();
+                } else {
+                    const err = await res.json().catch(() => ({}));
+                    alert('Approval action failed: ' + (err.detail || err.error || res.statusText));
+                }
+            } catch(err) {
+                alert('Approval request failed: ' + err);
+            }
+        }
+
         connect();
         loadPolicyStatus();
         setInterval(loadPolicyStatus, 5000);
+        setInterval(checkPendingApprovals, 1500);
+        checkPendingApprovals();
     </script>
 </body>
 </html>

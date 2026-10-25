@@ -5995,6 +5995,13 @@ def main():
   <div class="card"><div class="label">Uptime</div><div class="value" id="stat-uptime">0s</div></div>
 </div>
 
+<div id="hitl-panel" style="display:none; padding: 0 24px 16px;">
+  <div style="background: rgba(251, 146, 60, 0.12); border: 1px solid rgba(251, 146, 60, 0.4); border-radius: 8px; padding: 12px 16px;">
+    <div style="font-weight:600; font-size:13px; color:#fb923c; margin-bottom:8px;">⏸️ Human-In-The-Loop (HITL) Pending Approvals</div>
+    <div id="hitl-items"></div>
+  </div>
+</div>
+
 <div class="feed">
   <h2>Live Event Feed</h2>
   <div class="event-list" id="events"></div>
@@ -6051,6 +6058,46 @@ function pollDashboard() {
     .catch(() => {});
 }
 
+async function checkPendingApprovals() {
+  try {
+    const r = await fetch('/api/approvals/pending');
+    if (!r.ok) return;
+    const approvals = await r.json();
+    const panel = document.getElementById('hitl-panel');
+    const items = document.getElementById('hitl-items');
+    if (!panel || !items) return;
+    if (!approvals || approvals.length === 0) {
+      panel.style.display = 'none';
+      items.innerHTML = '';
+      return;
+    }
+    panel.style.display = 'block';
+    items.innerHTML = approvals.map(appr => `
+      <div style="display:flex; justify-content:space-between; align-items:center; background:#161b22; padding:8px 12px; border-radius:6px; margin-top:6px; font-size:12px;">
+        <div>
+          <b style="color:#58a6ff;">${appr.tool_name}</b> <span style="color:#8b949e;">(User: ${appr.user_id}, Risk: +${appr.risk_score})</span>
+          <div style="color:#8b949e; font-size:11px;">Args: ${JSON.stringify(appr.tool_args||{})}</div>
+        </div>
+        <div style="display:flex; gap:6px;">
+          <button onclick="resolveApproval('${appr.req_id}', 'deny')" style="background:#f85149; color:#fff; border:none; padding:4px 10px; border-radius:4px; cursor:pointer; font-weight:600;">Deny</button>
+          <button onclick="resolveApproval('${appr.req_id}', 'approve')" style="background:#3fb950; color:#0d1117; border:none; padding:4px 12px; border-radius:4px; cursor:pointer; font-weight:700;">Approve</button>
+        </div>
+      </div>
+    `).join('');
+  } catch(e) {}
+}
+
+async function resolveApproval(reqId, action) {
+  try {
+    await fetch('/api/approvals/' + reqId + '/action', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action})
+    });
+    checkPendingApprovals();
+  } catch(e) {}
+}
+
 function connectWS() {
   try {
     const ws = new WebSocket('ws://' + location.host + '/ws');
@@ -6072,6 +6119,8 @@ fetch('/api/events?limit=50').then(r => r.json()).then(events => {
 });
 
 setInterval(pollDashboard, 2000);
+setInterval(checkPendingApprovals, 1500);
+checkPendingApprovals();
 connectWS();
 
 setInterval(() => {

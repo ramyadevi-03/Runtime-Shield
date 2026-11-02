@@ -197,8 +197,10 @@ cd Agentic-AI-Security
 # 2. Configure environment
 cp .env.example .env
 # Fill each required blank with a unique secret or the client secret from Keycloak.
-# Generate JWT_SECRET, JWT_REFRESH_SECRET, OPENID_SESSION_SECRET, and
-# RUNTIME_SHIELD_GATEWAY_API_KEY with a password manager or secure local generator.
+# Generate JWT_SECRET, JWT_REFRESH_SECRET, and OPENID_SESSION_SECRET with a
+# password manager or secure local generator. The workshop launcher creates and
+# persists RUNTIME_SHIELD_GATEWAY_API_KEY in the ignored .env file when it is blank,
+# then renders it into the ignored LibreChat runtime config.
 # Set CREDS_KEY to 64 hex characters and CREDS_IV to 32 hex characters.
 # Set the Keycloak client secrets after configuring their clients.
 # start_librechat_demo.ps1 generates RUNTIME_SHIELD_FS_PROVIDER_TOKEN if it is blank.
@@ -212,8 +214,10 @@ python generate_keycloak_tls.py
 # 4. Create network (if deploying on Dokploy or standalone)
 docker network create dokploy-network || true
 
-# 5. Launch all services
-docker compose up --build -d
+# 5. Launch the Windows workshop demo (generates the local gateway key/config)
+.\start_librechat_demo.ps1
+# For a non-workshop deployment, set every required value in .env before running:
+# docker compose up --build -d
 ```
 
 #### Running Services:

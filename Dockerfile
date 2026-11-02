@@ -35,7 +35,7 @@ COPY --from=spire-cli /opt/spire/bin/spire-agent /usr/local/bin/spire-agent
 COPY package*.json tsconfig.json ./
 
 # Copy other project code files
-COPY bridge.py telemetry.py database_mcp.py scanner_mcp.py system_monitor_mcp.py audit_agent.py windows_sandbox.py chain_helpers.py run_security_drills.py sandbox_enforcer.py jail_factory.py workshop_sandbox.py ./
+COPY bridge.py telemetry.py database_mcp.py scanner_mcp.py system_monitor_mcp.py audit_agent.py windows_sandbox.py chain_helpers.py run_security_drills.py sandbox_enforcer.py jail_factory.py workshop_sandbox.py gateway_auth.py ./
 COPY rules/ ./rules/
 COPY mcp-firewall.yaml ./mcp-firewall.yaml
 COPY mcp_firewall/ ./mcp_firewall/

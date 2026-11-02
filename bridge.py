@@ -35,6 +35,11 @@ from fastapi import Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
 import asyncio
+from gateway_auth import (
+    extract_bearer_token,
+    gateway_api_key_matches,
+    is_gateway_api_key_configured,
+)
 
 from src.policy_loader import init_policies, search as ard_search, auto_refresh_catalog
 from src.policy_registry import PolicyRegistry
@@ -4937,6 +4942,42 @@ async def chat_completions_proxy(request: Request):
     # Reload environment to pick up persona shifts dynamically
     load_env_safe()
 
+    gateway_api_key = os.getenv("RUNTIME_SHIELD_GATEWAY_API_KEY", "")
+    if not is_gateway_api_key_configured(gateway_api_key):
+        log("Gateway API authentication is not configured; rejecting completions request.")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": "Gateway API authentication is not configured.",
+                    "type": "authentication_error",
+                    "code": "gateway_auth_not_configured",
+                }
+            },
+        )
+
+    presented_api_key = extract_bearer_token(request.headers.get("Authorization"))
+    if not gateway_api_key_matches(gateway_api_key, presented_api_key):
+        dashboard_state.add_event({
+            "action": "block",
+            "tool": "chat_completion",
+            "agent": "llm-agent",
+            "reason": "Missing or invalid gateway API credential",
+            "severity": "high",
+            "stage": "api-auth",
+            "timestamp": time.time(),
+        })
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": {
+                    "message": "A valid gateway API credential is required.",
+                    "type": "authentication_error",
+                    "code": "invalid_gateway_api_key",
+                }
+            },
+        )
+
     env_role = os.getenv("RUNTIME_ROLE", "user").strip().lower().replace("'", "").replace('"', '')
 
     # --- SPIFFE WORKLOAD IDENTITY ENFORCEMENT (Strict SVID Cryptographic Verification) ---
@@ -5025,9 +5066,8 @@ async def chat_completions_proxy(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     # 2. Extract JWT and verify identity/role
-    auth_header = request.headers.get("Authorization")
     shield_header = request.headers.get("X-Shield-Token")
-    token = shield_header or auth_header
+    token = shield_header
     if token and token.startswith("Bearer "):
         token = token[7:]
 

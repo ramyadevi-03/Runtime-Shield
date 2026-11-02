@@ -87,7 +87,6 @@ if (-not $configTemplate.Contains($certPlaceholder)) {
 
 $encodedCert = [uri]::EscapeDataString($svidPem.Trim())
 $runtimeConfig = $configTemplate.Replace($certPlaceholder, $encodedCert)
-[System.IO.File]::WriteAllText($runtimeConfigPath, $runtimeConfig, [System.Text.UTF8Encoding]::new($false))
 
 $stagingContainers = @(
     "runtime-shield-workshop-gateway-next",
@@ -204,10 +203,94 @@ if (-not $storedProviderToken) {
 }
 $env:RUNTIME_SHIELD_FS_PROVIDER_TOKEN = $providerToken
 
+$gatewayKeyEntries = @(
+    $envFileLines | Where-Object {
+        $_ -match "^\s*RUNTIME_SHIELD_GATEWAY_API_KEY="
+    }
+)
+if ($gatewayKeyEntries.Count -gt 1) {
+    Write-Error "The .env file contains duplicate RUNTIME_SHIELD_GATEWAY_API_KEY entries. Keep exactly one and rerun."
+    exit 1
+}
+$storedGatewayKey = if ($gatewayKeyEntries.Count -eq 1) {
+    ($gatewayKeyEntries[0] -split "=", 2)[1].Trim().Trim('"').Trim("'")
+} else {
+    ""
+}
+$gatewayApiKey = $env:RUNTIME_SHIELD_GATEWAY_API_KEY
+if ($storedGatewayKey -and $gatewayApiKey -and $storedGatewayKey -cne $gatewayApiKey) {
+    Write-Error "RUNTIME_SHIELD_GATEWAY_API_KEY differs between the process environment and .env. Keep one value and rerun."
+    exit 1
+}
+if (-not $gatewayApiKey) {
+    $gatewayApiKey = $storedGatewayKey
+}
+if (-not $gatewayApiKey) {
+    $randomBytes = New-Object byte[] 32
+    $randomGenerator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $randomGenerator.GetBytes($randomBytes)
+        $gatewayApiKey = [Convert]::ToBase64String($randomBytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
+    } finally {
+        $randomGenerator.Dispose()
+    }
+}
+if ($gatewayApiKey -notmatch "^[A-Za-z0-9_-]{32,}$") {
+    Write-Error "RUNTIME_SHIELD_GATEWAY_API_KEY must be at least 32 URL-safe characters."
+    exit 1
+}
+if (-not $storedGatewayKey) {
+    $separator = if (
+        $envFileContent.Length -gt 0 -and
+        -not $envFileContent.EndsWith("`n") -and
+        -not $envFileContent.EndsWith("`r")
+    ) {
+        [Environment]::NewLine
+    } else {
+        ""
+    }
+    [System.IO.File]::AppendAllText(
+        $envFilePath,
+        $separator + "RUNTIME_SHIELD_GATEWAY_API_KEY=$gatewayApiKey" + [Environment]::NewLine,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    Write-Host "Saved the private gateway API key in the Git-ignored .env file." -ForegroundColor Cyan
+}
+$env:RUNTIME_SHIELD_GATEWAY_API_KEY = $gatewayApiKey
+$gatewayKeyPlaceholder = '${RUNTIME_SHIELD_GATEWAY_API_KEY}'
+if (-not $runtimeConfig.Contains($gatewayKeyPlaceholder)) {
+    Write-Error "LibreChat config is missing the gateway API key placeholder."
+    exit 1
+}
+$runtimeConfig = $runtimeConfig.Replace($gatewayKeyPlaceholder, $gatewayApiKey)
+if ($runtimeConfig.Contains($gatewayKeyPlaceholder)) {
+    Write-Error "LibreChat runtime config still contains an unresolved gateway API key placeholder."
+    exit 1
+}
+
 $chatbotUrl = "http://localhost:3080"
 $dashboardUrl = "http://localhost:9090"
 
 if ($stagingReady) {
+    $gatewayInspection = & $docker.Source inspect "runtime-shield-workshop-gateway-next" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Could not inspect the staging gateway API-key configuration."
+        exit 1
+    }
+    $gatewayContainer = ($gatewayInspection | ConvertFrom-Json)[0]
+    $gatewayKeyEnv = @(
+        $gatewayContainer.Config.Env | Where-Object {
+            $_ -like "RUNTIME_SHIELD_GATEWAY_API_KEY=*"
+        }
+    )
+    if (
+        $gatewayKeyEnv.Count -ne 1 -or
+        $gatewayKeyEnv[0].Substring("RUNTIME_SHIELD_GATEWAY_API_KEY=".Length) -cne $gatewayApiKey
+    ) {
+        Write-Error "The running staging gateway does not have the same API key as .env. No containers were restarted; redeploy the gateway with the configured key before rerunning."
+        exit 1
+    }
+
     $runtimeConfig = $runtimeConfig.Replace("http://gateway:5001", "http://gateway-workshop-next:5001")
     [System.IO.File]::WriteAllText($runtimeConfigPath, $runtimeConfig, [System.Text.UTF8Encoding]::new($false))
 
@@ -245,6 +328,7 @@ if ($stagingReady) {
     $dashboardUrl = "http://localhost:9091"
     Write-Host "Using the existing isolated workshop gateway and provider; existing gateway containers and Docker data were left untouched." -ForegroundColor Cyan
 } else {
+    [System.IO.File]::WriteAllText($runtimeConfigPath, $runtimeConfig, [System.Text.UTF8Encoding]::new($false))
     Write-Host "Building and starting Runtime Shield, LibreChat, and the dashboard..." -ForegroundColor Cyan
     if ((Invoke-Docker -DockerArguments @("compose", "-f", "docker-compose.yml", "-f", "docker-compose.librechat-demo.yml", "up", "--build", "-d")) -ne 0) {
         Write-Error "Docker Compose could not start the stack. Review the error above, fix it, and rerun this script."

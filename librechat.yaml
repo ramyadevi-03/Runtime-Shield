@@ -3,11 +3,38 @@ version: 1.0.8
 # Cache settings
 cache: true
 
+registration:
+  socialLogins:
+    - openid
+
+# Explicit origins used by the MCP gateway and its Keycloak OAuth flow.
+mcpSettings:
+  allowedDomains:
+    - "http://gateway:5001"
+    - "https://host.docker.internal:8443"
+    - "http://keycloak:8080"
+
+# Per-user Keycloak OAuth is required for Runtime Shield tool calls.
+mcpServers:
+  runtime-shield-hitl:
+    type: streamable-http
+    title: "Runtime Shield HITL"
+    url: "http://gateway:5001/mcp/runtime-shield"
+    requiresOAuth: true
+    oauth:
+      authorization_url: "https://host.docker.internal:8443/realms/master/protocol/openid-connect/auth"
+      token_url: "https://host.docker.internal:8443/realms/master/protocol/openid-connect/token"
+      client_id: "${RUNTIME_SHIELD_MCP_CLIENT_ID}"
+      client_secret: "${RUNTIME_SHIELD_MCP_CLIENT_SECRET}"
+      redirect_uri: "http://localhost:3080/api/mcp/runtime-shield-hitl/oauth/callback"
+      scope: "openid"
+    serverInstructions: "Use write_file only for user-requested changes under secure-experiment-zone/. The administrator must approve each write in the Runtime Shield dashboard."
+
 # Custom Endpoints configuring Runtime Shield Gateway
 endpoints:
   custom:
     - name: "Runtime Shield Gateway"
-      apiKey: "runtime-shield-session-token"
+      apiKey: "${RUNTIME_SHIELD_GATEWAY_API_KEY}"
       baseURL: "http://gateway:5001/v1"
       models:
         default:
@@ -22,6 +49,7 @@ endpoints:
       modelDisplayLabel: "Runtime Shield Gateway"
       headers:
         X-SPIFFE-ID: "spiffe://runtime-shield/llm-agent"
+        X-SPIFFE-CERT: "${SPIFFE_LLM_CERT}"
 
 # Model Specifications
 modelSpecs:

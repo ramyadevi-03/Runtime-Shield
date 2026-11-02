@@ -112,6 +112,7 @@ state = DashboardState()
 async def get_policy_status():
     import os
     import sys
+    from mcp_firewall.privacy.presidio_engine import get_pii_engine_status
 
     opa_info = {
         "opa_reachable": False,
@@ -137,6 +138,7 @@ async def get_policy_status():
 
     return {
         "status": "ok",
+        **get_pii_engine_status(),
         "active_backend": active_backend,
         "shadow_backend": shadow_backend,
         "opa_reachable": opa_info.get("opa_reachable", False),
@@ -521,7 +523,10 @@ DASHBOARD_HTML = """
 
         <div class="header">
             <div class="brand-title">SHIELD-FORCE-ONE <span style="font-weight: 300; opacity: 0.5;" id="view-title">Governance</span></div>
-            <div class="live-status"><div class="dot-pulse"></div> ENFORCEMENT ACTIVE</div>
+            <div style="display:flex; flex-direction:column; align-items:flex-end; gap:6px;">
+                <div class="live-status"><div class="dot-pulse"></div> ENFORCEMENT ACTIVE</div>
+                <div id="pii-engine-status" style="font-size:0.7rem; color:var(--text-dim);">PII engine: loading</div>
+            </div>
         </div>
 
         <div class="metrics">
@@ -533,15 +538,25 @@ DASHBOARD_HTML = """
         </div>
 
         <!-- HITL PENDING APPROVALS BANNER / CONTROLS -->
-        <div id="hitl-approvals-panel" style="display: none; margin: 0 40px 15px; background: rgba(251, 146, 60, 0.12); border: 1px solid rgba(251, 146, 60, 0.4); border-radius: 8px; padding: 14px 20px;">
+        <div id="hitl-approvals-panel" style="display: block; margin: 0 40px 15px; background: rgba(251, 146, 60, 0.12); border: 1px solid rgba(251, 146, 60, 0.4); border-radius: 8px; padding: 14px 20px;">
+            <div id="hitl-admin-login" style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px;">
+                <strong style="color:#fb923c;">Admin approval access</strong>
+                <input id="hitl-admin-username" autocomplete="username" placeholder="Keycloak admin username" style="padding:6px 8px; border-radius:5px;">
+                <input id="hitl-admin-password" type="password" autocomplete="current-password" placeholder="Keycloak password" style="padding:6px 8px; border-radius:5px;">
+                <button id="hitl-admin-login-button" type="button" style="padding:6px 12px; cursor:pointer;">Sign in</button>
+                <button id="hitl-admin-logout-button" type="button" style="padding:6px 12px; cursor:pointer; display:none;">Sign out</button>
+                <span id="hitl-admin-login-status" role="status" style="font-size:0.8rem;"></span>
+            </div>
+            <div id="hitl-pending-content" style="display:none;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                 <div style="font-weight: 700; font-size: 0.9rem; color: #fb923c; display: flex; align-items: center; gap: 8px;">
                     <span style="display:inline-block; width:9px; height:9px; border-radius:50%; background:#fb923c; box-shadow: 0 0 8px #fb923c;"></span>
                     ⏸️ Human-In-The-Loop (HITL) Pending Approval Queue
                 </div>
-                <div style="font-size: 0.75rem; color: var(--text-dim);">Fails closed in 30 seconds if unapproved</div>
+                <div style="font-size: 0.75rem; color: var(--text-dim);">Fails closed when the approval timeout expires</div>
             </div>
             <div id="hitl-cards-container" style="display: flex; flex-direction: column; gap: 8px;"></div>
+            </div>
         </div>
 
         <!-- VIEW: LIVE AUDIT -->
@@ -1249,7 +1264,12 @@ DASHBOARD_HTML = """
                         const syncStatusEl = document.getElementById('policy-sync-status');
                         const hashEl = document.getElementById('policy-hash-val');
                         const syncTimeEl = document.getElementById('policy-sync-time');
+                        const piiStatusEl = document.getElementById('pii-engine-status');
 
+                        if (piiStatusEl) {
+                            piiStatusEl.innerText = `PII engine: ${data.pii_status || data.pii_engine || 'status unavailable'}`;
+                            piiStatusEl.style.color = data.pii_engine === 'presidio' ? 'var(--green)' : 'var(--orange)';
+                        }
                         if (activeEl) activeEl.innerText = (data.active_backend || 'yaml').toUpperCase();
                         if (shadowEl) shadowEl.innerText = (data.shadow_backend || 'none').toUpperCase();
 
@@ -1402,9 +1422,70 @@ DASHBOARD_HTML = """
             }, 1000);
         }
         // ── Human-In-The-Loop (HITL) Approval Handler ──
-        async function checkPendingApprovals() {
+        function approvalAuthHeaders(extraHeaders = {}) {
+            const token = sessionStorage.getItem('runtimeShieldAdminToken');
+            return token ? {...extraHeaders, 'Authorization': `Bearer ${token}`} : extraHeaders;
+        }
+
+        function updateApprovalLoginUI(username = '') {
+            const isSignedIn = Boolean(sessionStorage.getItem('runtimeShieldAdminToken'));
+            document.getElementById('hitl-admin-login').style.display = 'flex';
+            document.getElementById('hitl-admin-username').style.display = isSignedIn ? 'none' : '';
+            document.getElementById('hitl-admin-password').style.display = isSignedIn ? 'none' : '';
+            document.getElementById('hitl-admin-login-button').style.display = isSignedIn ? 'none' : '';
+            document.getElementById('hitl-admin-logout-button').style.display = isSignedIn ? 'inline-block' : 'none';
+            if (isSignedIn) {
+                document.getElementById('hitl-admin-login-status').textContent = `Signed in as ${username || sessionStorage.getItem('runtimeShieldAdminName') || 'admin'}.`;
+            }
+        }
+
+        async function loginHITLAdmin() {
+            const status = document.getElementById('hitl-admin-login-status');
+            const button = document.getElementById('hitl-admin-login-button');
+            button.disabled = true;
+            status.textContent = 'Signing in...';
             try {
-                const res = await fetch('/api/approvals/pending');
+                const res = await fetch('/api/approvals/session', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        username: document.getElementById('hitl-admin-username').value,
+                        password: document.getElementById('hitl-admin-password').value
+                    })
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Admin sign-in failed.');
+                sessionStorage.setItem('runtimeShieldAdminToken', data.access_token);
+                sessionStorage.setItem('runtimeShieldAdminName', data.username);
+                document.getElementById('hitl-admin-password').value = '';
+                updateApprovalLoginUI(data.username);
+                await checkPendingApprovals();
+            } catch (error) {
+                status.textContent = error.message;
+            } finally {
+                button.disabled = false;
+            }
+        }
+
+        function logoutHITLAdmin() {
+            sessionStorage.removeItem('runtimeShieldAdminToken');
+            sessionStorage.removeItem('runtimeShieldAdminName');
+            document.getElementById('hitl-admin-login-status').textContent = 'Signed out.';
+            document.getElementById('hitl-pending-content').style.display = 'none';
+            updateApprovalLoginUI();
+        }
+
+        async function checkPendingApprovals() {
+            if (!sessionStorage.getItem('runtimeShieldAdminToken')) return;
+            try {
+                const res = await fetch('/api/approvals/pending', {
+                    headers: approvalAuthHeaders()
+                });
+                if (res.status === 401 || res.status === 403) {
+                    logoutHITLAdmin();
+                    document.getElementById('hitl-admin-login-status').textContent = 'Admin session expired or not authorized. Sign in again.';
+                    return;
+                }
                 if (!res.ok) return;
                 const approvals = await res.json();
                 const panel = document.getElementById('hitl-approvals-panel');
@@ -1412,27 +1493,37 @@ DASHBOARD_HTML = """
                 if (!panel || !container) return;
 
                 if (!approvals || approvals.length === 0) {
-                    panel.style.display = 'none';
+                    document.getElementById('hitl-pending-content').style.display = 'none';
                     container.innerHTML = '';
                     return;
                 }
 
-                panel.style.display = 'block';
-                container.innerHTML = approvals.map(appr => `
-                    <div style="background: rgba(0,0,0,0.3); border: 1px solid rgba(251, 146, 60, 0.35); border-radius: 6px; padding: 10px 14px; display: flex; justify-content: space-between; align-items: center;">
-                        <div>
-                            <span style="font-family:'JetBrains Mono'; font-weight:700; color:#fff; font-size:0.9rem;">${appr.tool_name}</span>
-                            <span style="margin-left: 10px; font-size:0.75rem; color:var(--text-dim);">Req ID: <code style="color:#60a5fa;">${appr.req_id}</code> · User: <b>${appr.user_id || 'admin'}</b> (${appr.user_role}) · Risk Delta: <b>+${appr.risk_score}</b></span>
-                            <div style="font-size:0.75rem; color:#d4d4d4; margin-top:3px; font-family:'JetBrains Mono';">Args: ${JSON.stringify(appr.tool_args || {})}</div>
-                        </div>
-                        <div style="display: flex; gap: 8px;">
-                            <button onclick="resolveApproval('${appr.req_id}', 'deny')" style="background: rgba(248,113,113,0.18); border: 1px solid var(--red); color: var(--red); padding: 6px 14px; border-radius: 6px; font-weight: 700; font-size: 0.75rem; cursor: pointer;">✕ Deny</button>
-                            <button onclick="resolveApproval('${appr.req_id}', 'approve')" style="background: var(--green); border: none; color: #000; padding: 6px 16px; border-radius: 6px; font-weight: 700; font-size: 0.75rem; cursor: pointer;">✓ Approve</button>
-                        </div>
-                    </div>
-                `).join('');
+                document.getElementById('hitl-pending-content').style.display = 'block';
+                container.replaceChildren();
+                approvals.forEach(appr => {
+                    const card = document.createElement('div');
+                    card.style.cssText = 'background:rgba(0,0,0,0.3);border:1px solid rgba(251,146,60,0.35);border-radius:6px;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;';
+                    const details = document.createElement('div');
+                    const title = document.createElement('strong');
+                    title.textContent = appr.tool_name;
+                    const meta = document.createElement('div');
+                    meta.textContent = `Request ${appr.req_id} · User ${appr.user_id} (${appr.user_role}) · Risk +${appr.risk_score}`;
+                    const args = document.createElement('div');
+                    args.textContent = `Args: ${JSON.stringify(appr.tool_args || {})}`;
+                    details.append(title, meta, args);
+                    const actions = document.createElement('div');
+                    const deny = document.createElement('button');
+                    deny.textContent = 'Deny';
+                    deny.addEventListener('click', () => resolveApproval(appr.req_id, 'deny'));
+                    const approve = document.createElement('button');
+                    approve.textContent = 'Approve';
+                    approve.addEventListener('click', () => resolveApproval(appr.req_id, 'approve'));
+                    actions.append(deny, approve);
+                    card.append(details, actions);
+                    container.append(card);
+                });
             } catch(e) {
-                // Endpoint not reachable yet
+                document.getElementById('hitl-admin-login-status').textContent = 'Could not load approval queue.';
             }
         }
 
@@ -1440,20 +1531,23 @@ DASHBOARD_HTML = """
             try {
                 const res = await fetch('/api/approvals/' + reqId + '/action', {
                     method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
+                    headers: approvalAuthHeaders({'Content-Type': 'application/json'}),
                     body: JSON.stringify({ action: action })
                 });
                 if (res.ok) {
                     checkPendingApprovals();
                 } else {
                     const err = await res.json().catch(() => ({}));
-                    alert('Approval action failed: ' + (err.detail || err.error || res.statusText));
+                    document.getElementById('hitl-admin-login-status').textContent = 'Approval action failed: ' + (err.detail || err.error || res.statusText);
                 }
             } catch(err) {
-                alert('Approval request failed: ' + err);
+                document.getElementById('hitl-admin-login-status').textContent = 'Approval request failed: ' + err;
             }
         }
 
+        document.getElementById('hitl-admin-login-button').addEventListener('click', loginHITLAdmin);
+        document.getElementById('hitl-admin-logout-button').addEventListener('click', logoutHITLAdmin);
+        updateApprovalLoginUI();
         connect();
         loadPolicyStatus();
         setInterval(loadPolicyStatus, 5000);

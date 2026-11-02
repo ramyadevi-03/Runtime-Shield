@@ -5,6 +5,8 @@ COPY package*.json tsconfig.json ./
 COPY src/ ./src/
 RUN npm ci && npm run build
 
+FROM ghcr.io/spiffe/spire-agent:1.8.0 AS spire-cli
+
 # --- Stage 2: Unified Gateway Runner ---
 FROM python:3.11-slim
 WORKDIR /app
@@ -22,17 +24,18 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Download spaCy models for Microsoft Presidio PII Redaction
-RUN python -m spacy download en_core_web_sm && \
-    python -m spacy download en_core_web_lg
+# Install the pinned spaCy model used by Microsoft Presidio PII redaction.
+RUN pip install --no-cache-dir \
+    https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 
 # Copy Node.js built files and node_modules from builder stage
 COPY --from=node-builder /app/dist ./dist
 COPY --from=node-builder /app/node_modules ./node_modules
+COPY --from=spire-cli /opt/spire/bin/spire-agent /usr/local/bin/spire-agent
 COPY package*.json tsconfig.json ./
 
 # Copy other project code files
-COPY bridge.py telemetry.py database_mcp.py scanner_mcp.py system_monitor_mcp.py audit_agent.py windows_sandbox.py start.sh chain_helpers.py run_security_drills.py ./
+COPY bridge.py telemetry.py database_mcp.py scanner_mcp.py system_monitor_mcp.py audit_agent.py windows_sandbox.py chain_helpers.py run_security_drills.py sandbox_enforcer.py jail_factory.py workshop_sandbox.py ./
 COPY rules/ ./rules/
 COPY mcp-firewall.yaml ./mcp-firewall.yaml
 COPY mcp_firewall/ ./mcp_firewall/
@@ -52,4 +55,4 @@ EXPOSE 5001
 EXPOSE 9090
 EXPOSE 5002
 
-ENTRYPOINT ["/bin/bash", "start.sh"]
+ENTRYPOINT ["python", "-u", "bridge.py"]

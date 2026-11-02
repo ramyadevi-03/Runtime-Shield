@@ -40,12 +40,13 @@ class TransactionDb:
         if cursor.fetchone()[0] > 0:
             return
 
-        # Sample users with unique keycloak_sub mapping values (using real Keycloak UUIDs)
+        # Link demo Keycloak usernames to isolated transaction records.
         users = [
-            (1, "MartyMcFly", "Password1", "24d9f5c0-5734-42f2-9697-283cc67bba54"),
-            (2, "DocBrown", "flux-capacitor-123", "1440c71c-7198-4431-955a-052a381526fb"),
-            (3, "BiffTannen", "Password3", "keycloak-sub-user3-uuid"),
-            (4, "GeorgeMcFly", "Password4", "1e9c8d21-fb65-418a-aaee-40e7f0ce735f")
+            (1, "user", "Password1", None),
+            (2, "DocBrown", "flux-capacitor-123", None),
+            (3, "user1", "Password3", None),
+            (4, "admin", "Password4", None),
+            (5, "privileged", "Password5", None)
         ]
         cursor.executemany("INSERT INTO Users (userId, username, password, keycloak_sub) VALUES (?, ?, ?, ?)", users)
 
@@ -57,7 +58,8 @@ class TransactionDb:
             (4, 2, "FluxCapacitor", "InnovativeTech", 3000.0),
             (5, 3, "SportsAlmanac", "RareBooks", 200.0),
             (6, 4, "WritingSupplies (SSN verified: 999-12-3456)", "OfficeStore", 40.0),
-            (7, 4, "SciFiNovels", "BookShop", 60.0)
+            (7, 4, "SciFiNovels", "BookShop", 60.0),
+            (8, 5, "ResearchMaterials", "Library", 85.0)
         ]
         cursor.executemany("INSERT INTO Transactions (transactionId, userId, reference, recipient, amount) VALUES (?, ?, ?, ?, ?)", transactions)
 
@@ -112,4 +114,3 @@ class TransactionDb:
 
     def close(self):
         self.conn.close()
-

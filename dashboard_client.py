@@ -53,8 +53,8 @@ class DashboardClient:
         
         # MOCK SECRETS
         mock_vault = {
-            "NVIDIA_API_KEY": os.getenv("NVIDIA_API_KEY", "mock-nv-key"),
-            "OPENAI_API_KEY": "mock-openai-key-for-" + self.tenant_id
+            "NVIDIA_API_KEY": os.getenv("NVIDIA_API_KEY", ""),
+            "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""),
         }
         
         # Return only keys relevant to the requested tool to enforce principle of least privilege

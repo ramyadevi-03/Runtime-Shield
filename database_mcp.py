@@ -6,6 +6,14 @@ import os
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(PROJECT_DIR, "damn-vulnerable-llm-agent", "transactions.db")
 
+def initialize_database():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    sys.path.insert(0, os.path.join(PROJECT_DIR, "damn-vulnerable-llm-agent"))
+    from transaction_db import TransactionDb
+
+    db = TransactionDb(DB_PATH)
+    db.close()
+
 def log(msg):
     import re
     msg_str = str(msg)
@@ -36,6 +44,7 @@ def handle_request(req):
                             "type": "object",
                             "properties": {
                                 "keycloak_sub": {"type": "string"},
+                                "username": {"type": "string"},
                                 "debug_mode": {"type": "boolean"}
                             }
                         }
@@ -67,13 +76,17 @@ def handle_request(req):
         try:
             if tool_name == "GetCurrentUser":
                 keycloak_sub = args.get("keycloak_sub")
+                username = args.get("username")
                 debug_mode = args.get("debug_mode", True)
                 
                 rows = []
                 if keycloak_sub:
                     cursor.execute("SELECT userId, username FROM Users WHERE keycloak_sub = ?", (str(keycloak_sub),))
                     rows = cursor.fetchall()
-                elif debug_mode:
+                if not rows and username:
+                    cursor.execute("SELECT userId, username FROM Users WHERE lower(username) = lower(?)", (str(username),))
+                    rows = cursor.fetchall()
+                if not rows and debug_mode:
                     cursor.execute("SELECT userId, username FROM Users WHERE userId = 1")
                     rows = cursor.fetchall()
                 
@@ -143,6 +156,11 @@ def handle_request(req):
 
 def main():
     log("Database MCP server starting...")
+    try:
+        initialize_database()
+    except Exception as e:
+        log(f"Failed to initialize transactions database at {DB_PATH}: {e}")
+        raise
     while True:
         line = sys.stdin.readline()
         if not line:

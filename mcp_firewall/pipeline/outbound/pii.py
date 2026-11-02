@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import json
+import re
 from typing import Any
 
 from ..base import OutboundStage
@@ -15,23 +16,9 @@ from ...models import (
     Severity,
     ToolCallResponse,
 )
+from ...privacy.presidio_engine import get_presidio_instances
 
 logger = logging.getLogger("pii_detector")
-
-_analyzer = None
-_anonymizer = None
-
-def get_presidio_instances():
-    global _analyzer, _anonymizer
-    if _analyzer is None or _anonymizer is None:
-        try:
-            from presidio_analyzer import AnalyzerEngine
-            from presidio_anonymizer import AnonymizerEngine
-            _analyzer = AnalyzerEngine()
-            _anonymizer = AnonymizerEngine()
-        except ImportError:
-            logger.warning("Presidio library not available in PIIDetector. Make sure it's installed.")
-    return _analyzer, _anonymizer
 
 
 def redact_json_structure(data: Any, redact_fn) -> Any:
@@ -70,14 +57,10 @@ class PIIDetector(OutboundStage):
         if not config.pii.enabled:
             return response, None
 
-        analyzer, anonymizer = get_presidio_instances()
-        if not analyzer or not anonymizer:
-            logger.error("Presidio instances could not be loaded. Skipping PII redaction.")
-            return response, None
-
         findings: list[str] = []
         modified = False
 
+        analyzer, anonymizer = get_presidio_instances()
         # Extract Presidio configuration
         cfg_entities = getattr(config.pii, "presidio_entities", [])
         entities = None
@@ -88,7 +71,12 @@ class PIIDetector(OutboundStage):
         raw_operators = getattr(config.pii, "presidio_operators", {}) or {}
         default_placeholder = config.pii.placeholder
 
-        from presidio_anonymizer.entities import OperatorConfig
+        def replace_matches(text: str, pattern: str, placeholder: str) -> tuple[str, int]:
+            try:
+                return re.subn(pattern, placeholder, text)
+            except re.error as exc:
+                logger.error("Invalid configured PII regex fallback %r: %s", pattern, exc)
+                return text, 0
 
         def redact_raw_text(text: str) -> str:
             nonlocal modified
@@ -116,18 +104,40 @@ class PIIDetector(OutboundStage):
                         if anonymized.text != text:
                             modified = True
                             return anonymized.text
-            except Exception as e:
-                logger.error(f"Error in Presidio scan: {e}")
+            except Exception as exc:
+                logger.error("Error in Presidio scan (%s)", type(exc).__name__)
             return text
 
-        for i, content_item in enumerate(response.content):
-            text = content_item.get("text", "")
-            if not text:
-                continue
+        if analyzer and anonymizer:
+            from presidio_anonymizer.entities import OperatorConfig
 
-            new_text = redact_text_or_json(text, redact_raw_text)
-            if new_text != text:
-                response.content[i] = {**content_item, "text": new_text}
+            for i, content_item in enumerate(response.content):
+                text = content_item.get("text", "")
+                if not text:
+                    continue
+
+                new_text = redact_text_or_json(text, redact_raw_text)
+                if new_text != text:
+                    response.content[i] = {**content_item, "text": new_text}
+
+        if config.pii.action == Action.REDACT:
+            for i, content_item in enumerate(response.content):
+                text = content_item.get("text", "")
+                if not text:
+                    continue
+
+                for fallback in getattr(config.pii, "outbound_patterns", []):
+                    pattern = fallback.get("pattern", "")
+                    if not pattern:
+                        continue
+                    placeholder = fallback.get("placeholder", default_placeholder)
+                    text, match_count = replace_matches(text, pattern, placeholder)
+                    if match_count:
+                        findings.append(fallback.get("name", "configured regex fallback"))
+                        modified = True
+
+                if text != content_item.get("text", ""):
+                    response.content[i] = {**content_item, "text": text}
 
         if not findings:
             return response, None
@@ -136,8 +146,8 @@ class PIIDetector(OutboundStage):
         decision = PipelineDecision(
             stage=self.stage,
             action=config.pii.action,
-            reason=f"PII detected via Presidio NLP: {', '.join(unique)}",
+            reason=f"PII detected via Presidio and/or configured regex fallbacks: {', '.join(unique)}",
             severity=config.pii.severity,
-            details={"pii_types": unique},
+            details={"pii_types": unique, "modified": modified},
         )
         return response, decision

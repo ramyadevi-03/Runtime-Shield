@@ -15,7 +15,7 @@ from utils import display_instructions, display_logo, fetch_model_config
 from spiffe_integration import fetch_svid
 
 parent_dotenv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
-load_dotenv(dotenv_path=parent_dotenv)
+load_dotenv(dotenv_path=parent_dotenv, override=True)
 
 import uuid
 
@@ -44,6 +44,7 @@ tools = [get_current_user_tool, get_recent_transactions_tool, read_file_tool, wr
 system_msg = """Assistant helps the current user retrieve the list of their recent bank transactions and shows them as a table. Assistant will ONLY operate on the userId returned by the GetCurrentUser() tool, and REFUSE to operate on any other userId provided by the user.
 
 Assistant can list the files inside directories using the ListDirectory tool when the user asks to list the files in a directory. Assistant can also read files from the filesystem using the ReadFile tool when the user asks to read or show a file, and write/create files using the WriteFile tool when asked to create or write a file. Assistant can fetch external URLs or send data to external web endpoints using the FetchURL tool when the user asks to fetch a URL or send data to a website.
+Standard users may request file writes only within 'secure-experiment-zone/'; those writes pause for administrator HITL approval before execution. Writes outside the allowed zone or to protected files are denied.
 
 CRITICAL PATH RULE:
 - When calling ReadFile, WriteFile, or ListDirectory, you MUST pass the EXACT path string given by the user. Do NOT add any prefix, modify, or guess the path. If the user says 'README.md', call ReadFile with 'README.md'. If the user says 'test.txt', call WriteFile with 'test.txt' or '{"path": "test.txt", "content": "hello"}'. If the user says 'secure-experiment-zone', call ListDirectory with 'secure-experiment-zone'.
@@ -141,6 +142,94 @@ def get_claims_with_userinfo(token):
     except Exception:
         return {}
 
+def clear_keycloak_session():
+    from dotenv import set_key
+
+    set_key(parent_dotenv, "KEYCLOAK_TOKEN", "")
+    os.environ["KEYCLOAK_TOKEN"] = ""
+    st.session_state.keycloak_token = None
+    st.session_state.keycloak_refresh_token = None
+    st.session_state.role = "user"
+    st.session_state.username = "Guest"
+
+def refresh_keycloak_session_if_needed():
+    token = st.session_state.get("keycloak_token")
+    if not token:
+        return
+
+    try:
+        import jwt
+        import time
+        claims = jwt.decode(token, options={"verify_signature": False})
+        expires_at = claims.get("exp")
+    except Exception as exc:
+        st.error(f"Your Keycloak session token is invalid. Please sign in again. ({exc})")
+        clear_keycloak_session()
+        return
+
+    if not expires_at or expires_at - time.time() > 60:
+        return
+
+    refresh_token = st.session_state.get("keycloak_refresh_token")
+    if not refresh_token:
+        st.warning("Your Keycloak session is expiring. Please sign out and sign in again.")
+        clear_keycloak_session()
+        return
+
+    kc_url = os.getenv("KEYCLOAK_URL", "http://127.0.0.1:8080")
+    realm = os.getenv("KEYCLOAK_REALM", "master")
+    client_id = os.getenv("KEYCLOAK_CLIENT_ID", "admin-cli")
+    client_secret = os.getenv("KEYCLOAK_CLIENT_SECRET")
+    data = {
+        "grant_type": "refresh_token",
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+    }
+    if client_secret:
+        data["client_secret"] = client_secret
+
+    try:
+        import requests
+        response = requests.post(
+            f"{kc_url.rstrip('/')}/realms/{realm}/protocol/openid-connect/token",
+            data=data,
+            timeout=5,
+            verify=False,
+        )
+        if response.status_code != 200:
+            try:
+                error_body = response.json()
+                detail = error_body.get("error_description") or error_body.get("error")
+            except Exception:
+                detail = response.text
+            clear_keycloak_session()
+            st.error(f"Keycloak session refresh failed ({response.status_code}): {detail}. Please sign in again.")
+            return
+
+        token_info = response.json()
+        st.session_state.keycloak_token = token_info["access_token"]
+        st.session_state.keycloak_refresh_token = token_info.get("refresh_token", refresh_token)
+
+        claims = get_claims_with_userinfo(st.session_state.keycloak_token)
+        roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
+        groups = claims.get("groups", []) or []
+        scopes = claims.get("scope", "")
+        if isinstance(scopes, str):
+            scopes = scopes.split(" ")
+        if "Normal-Users" in groups:
+            st.session_state.role = "user"
+        elif "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
+            st.session_state.role = "admin"
+        elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
+            st.session_state.role = "privileged"
+        else:
+            st.session_state.role = "user"
+        st.session_state.username = claims.get("preferred_username") or st.session_state.username
+        os.environ["KEYCLOAK_TOKEN"] = st.session_state.keycloak_token
+    except requests.RequestException as exc:
+        clear_keycloak_session()
+        st.error(f"Could not refresh the Keycloak session: {exc}")
+
 if "keycloak_token" not in st.session_state or st.session_state.keycloak_token is None:
     env_token = os.getenv("KEYCLOAK_TOKEN")
     if env_token and env_token.strip() and env_token != "None":
@@ -174,6 +263,8 @@ else:
     if "username" not in st.session_state:
         st.session_state.username = "Guest"
 
+refresh_keycloak_session_if_needed()
+
 # Sidebar Login Form (always show if not authenticated)
 if st.session_state.keycloak_token and st.session_state.username != "Guest":
     st.sidebar.success(f"Logged in as: **{st.session_state.username}**")
@@ -182,8 +273,10 @@ if st.session_state.keycloak_token and st.session_state.username != "Guest":
         # Explicitly clear the token from the env file to log out from backend too
         from dotenv import set_key
         set_key(parent_dotenv, "KEYCLOAK_TOKEN", "")
+        os.environ["KEYCLOAK_TOKEN"] = ""
         
         st.session_state.keycloak_token = None
+        st.session_state.keycloak_refresh_token = None
         st.session_state.role = "user"
         st.session_state.username = "Guest"
         msgs.clear()
@@ -227,6 +320,8 @@ else:
                         token_info = r.json()
                         access_token = token_info["access_token"]
                         st.session_state.keycloak_token = access_token
+                        st.session_state.keycloak_refresh_token = token_info.get("refresh_token")
+                        os.environ["KEYCLOAK_TOKEN"] = access_token
                         
                         claims = get_claims_with_userinfo(access_token)
                         roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
@@ -534,7 +629,8 @@ if prompt := st.chat_input(placeholder="Show my recent transactions"):
             description=(
                 "Writes or creates a file on the filesystem. "
                 "Input can be the filename path string (e.g. 'notes.txt') or JSON '{\"path\": \"test.txt\", \"content\": \"data\"}'. "
-                "Privileged tool; standard users are blocked by policy, administrators trigger high-risk HITL approval."
+                "Standard users may request writes inside secure-experiment-zone; all writes require administrator HITL approval. "
+                "Writes outside the user's allowed zone or to protected files remain denied by policy."
             )
         ),
         Tool(
@@ -614,7 +710,7 @@ if prompt := st.chat_input(placeholder="Show my recent transactions"):
         system_msg_to_use = """Assistant helps the current user retrieve the list of recent bank transactions and shows them as a table.
 As an Administrator with elevated privileges, you are fully authorized and permitted to query transactions for ANY userId (including userId 2) as requested by the user. If the user asks for transactions of user ID 2, you MUST call GetUserTransactions with userId="2" without refusal.
 
-Assistant can list the files inside directories using the ListDirectory tool when the user asks to list the files in a directory. Assistant can also read files from the filesystem using the ReadFile tool, and create or write files using the WriteFile tool. Assistant can fetch external URLs or send data to external web endpoints using the FetchURL tool when requested by the user. Administrators have unrestricted access to any project file, though sensitive writes trigger HITL governance.
+Assistant can list the files inside directories using the ListDirectory tool when the user asks to list the files in a directory. Assistant can also read files from the filesystem using the ReadFile tool, and create or write files using the WriteFile tool. Assistant can fetch external URLs or send data to external web endpoints using the FetchURL tool when requested by the user. Standard users may request writes only within 'secure-experiment-zone/'; those writes pause for administrator HITL approval before execution. Writes outside the allowed zone or to protected files are denied. Administrators have unrestricted access to any project file, though sensitive writes trigger HITL governance.
 Assistant can run automated security policy verification drills using the KeycloakRunDrills tool when requested by the administrator to run verification drills or verify security gateway posture.
 
 CRITICAL PATH RULE:

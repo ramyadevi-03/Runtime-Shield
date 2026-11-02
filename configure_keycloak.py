@@ -24,6 +24,7 @@ This only affects the current shell session, not your .env file.
 import requests
 import os
 import sys
+import secrets
 import urllib3
 from dotenv import load_dotenv , set_key
 
@@ -387,11 +388,19 @@ def configure_jit_exchange_client(session: KeycloakSession):
     """
     Creates the runtime-shield-jit client used by the gateway for JIT token
     exchange (confidential, service-account, Standard Token Exchange enabled),
-    associates the tool:* scopes with it, and adds an audience mapper on
-    runtime-shield-cli so its tokens can be exchanged for runtime-shield-jit.
+    grants it the minimum Keycloak roles needed to query users, associates the
+    tool:* scopes with it, and adds audience mappers to the Runtime Shield
+    requester clients so their tokens can be exchanged for runtime-shield-jit.
     """
     jit_client_id_name = "runtime-shield-jit"
-    source_client_id_name = "runtime-shield-cli"
+    source_client_ids = list(dict.fromkeys([
+        "runtime-shield-cli",
+        os.getenv("RUNTIME_SHIELD_MCP_CLIENT_ID", "runtime-shield-hitl"),
+    ]))
+    token_lifespans = {
+        **{client_id: "1800" for client_id in source_client_ids},
+        jit_client_id_name: "300",
+    }
 
     # 1. Create runtime-shield-jit client if it doesn't exist
     clients_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients?clientId={jit_client_id_name}"
@@ -453,6 +462,78 @@ def configure_jit_exchange_client(session: KeycloakSession):
     except Exception as e:
         print(f"[ERROR] Exception fetching/writing secret for '{jit_client_id_name}': {e}")
 
+    # 2a. Grant only the user-query roles needed by the Keycloak provider.
+    try:
+        realm_management = session.request(
+            "GET",
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients",
+            params={"clientId": "realm-management"},
+            timeout=10,
+        )
+        if realm_management.status_code != 200:
+            print(f"[ERROR] Could not find the realm-management client: HTTP {realm_management.status_code}")
+            return
+        realm_management_clients = realm_management.json()
+        if not realm_management_clients and REALM == "master":
+            realm_management = session.request(
+                "GET",
+                f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients",
+                params={"clientId": "master-realm"},
+                timeout=10,
+            )
+            realm_management_clients = realm_management.json() if realm_management.status_code == 200 else []
+        if not realm_management_clients:
+            print(f"[ERROR] Could not find the administrative roles client in realm '{REALM}'")
+            return
+        realm_management_id = realm_management_clients[0]["id"]
+
+        service_account = session.request(
+            "GET",
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{jit_uuid}/service-account-user",
+            timeout=10,
+        )
+        if service_account.status_code != 200:
+            print(f"[ERROR] Could not find the '{jit_client_id_name}' service-account user: HTTP {service_account.status_code}")
+            return
+        service_account_id = service_account.json()["id"]
+
+        assigned = session.request(
+            "GET",
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}/users/{service_account_id}/role-mappings/clients/{realm_management_id}",
+            timeout=10,
+        )
+        if assigned.status_code != 200:
+            print(f"[ERROR] Could not read service-account role mappings: HTTP {assigned.status_code}")
+            return
+        assigned_names = {role.get("name") for role in assigned.json()}
+
+        roles_to_add = []
+        for role_name in ("query-users", "view-users"):
+            role_response = session.request(
+                "GET",
+                f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{realm_management_id}/roles/{role_name}",
+                timeout=10,
+            )
+            if role_response.status_code != 200:
+                print(f"[ERROR] Could not find realm-management role '{role_name}': HTTP {role_response.status_code}")
+                return
+            if role_name not in assigned_names:
+                roles_to_add.append(role_response.json())
+
+        if roles_to_add:
+            mapping = session.request(
+                "POST",
+                f"{KEYCLOAK_URL}/admin/realms/{REALM}/users/{service_account_id}/role-mappings/clients/{realm_management_id}",
+                json=roles_to_add,
+                timeout=10,
+            )
+            if mapping.status_code not in (200, 204):
+                print(f"[ERROR] Failed to grant user-query roles: HTTP {mapping.status_code} {mapping.text}")
+                return
+        print("[OK] JIT service account has the minimum query-users and view-users roles")
+    except Exception as e:
+        print(f"[ERROR] Exception configuring JIT service-account roles: {e}")
+
     # 3. Associate tool:* scopes as optional on runtime-shield-jit
     scopes_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/client-scopes"
     try:
@@ -482,52 +563,109 @@ def configure_jit_exchange_client(session: KeycloakSession):
         except Exception as e:
             print(f"[ERROR] Exception associating scope '{scope_name}': {e}")
 
-    # 4. Add audience mapper on runtime-shield-cli so its tokens can be
-    #    exchanged for runtime-shield-jit (Standard Token Exchange V2 requires
-    #    the requester client to appear in the subject token's aud claim)
-    src_clients_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients?clientId={source_client_id_name}"
-    try:
-        r = session.request("GET", src_clients_url, timeout=10)
-        src_clients = r.json() if r.status_code == 200 else []
-        if not src_clients:
-            print(f"[WARNING] Client '{source_client_id_name}' not found — skipping audience mapper")
-            return
-        src_uuid = src_clients[0]["id"]
-    except Exception as e:
-        print(f"[ERROR] Exception retrieving '{source_client_id_name}': {e}")
-        return
+    # 4. Add an audience mapper to each requester client. Standard Token
+    #    Exchange requires the requester to appear in the subject token aud.
+    for source_client_id_name in source_client_ids:
+        src_clients_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients?clientId={source_client_id_name}"
+        try:
+            r = session.request("GET", src_clients_url, timeout=10)
+            src_clients = r.json() if r.status_code == 200 else []
+            if not src_clients:
+                print(f"[WARNING] Client '{source_client_id_name}' not found — skipping audience mapper")
+                continue
+            src_uuid = src_clients[0]["id"]
+        except Exception as e:
+            print(f"[ERROR] Exception retrieving '{source_client_id_name}': {e}")
+            continue
 
-    mappers_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{src_uuid}/protocol-mappers/models"
-    try:
-        r = session.request("GET", mappers_url, timeout=10)
-        if r.status_code == 200:
-            for mapper in r.json():
-                if mapper.get("name") == "jit-audience":
-                    print(f"[INFO] 'jit-audience' mapper already exists on '{source_client_id_name}', skipping")
-                    return
+        mappers_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{src_uuid}/protocol-mappers/models"
+        try:
+            r = session.request("GET", mappers_url, timeout=10)
+            existing_mappers = r.json() if r.status_code == 200 else []
+            existing_mapper = next(
+                (mapper for mapper in existing_mappers if mapper.get("name") == "jit-audience"),
+                None,
+            )
+            if (
+                existing_mapper
+                and existing_mapper.get("config", {}).get("included.client.audience")
+                == jit_client_id_name
+            ):
+                print(f"[INFO] 'jit-audience' mapper already exists on '{source_client_id_name}', skipping")
+                continue
 
-        mapper_data = {
-            "name": "jit-audience",
-            "protocol": "openid-connect",
-            "protocolMapper": "oidc-audience-mapper",
-            "config": {
-                "included.client.audience": jit_client_id_name,
-                "id.token.claim": "false",
-                "access.token.claim": "true"
+            mapper_data = {
+                "name": "jit-audience",
+                "protocol": "openid-connect",
+                "protocolMapper": "oidc-audience-mapper",
+                "config": {
+                    "included.client.audience": jit_client_id_name,
+                    "id.token.claim": "false",
+                    "access.token.claim": "true"
+                }
             }
-        }
-        r = session.request("POST", mappers_url, json=mapper_data, timeout=10)
-        if r.status_code == 201:
-            print(f"[OK] Added 'jit-audience' mapper to '{source_client_id_name}'")
-        else:
-            print(f"[ERROR] Failed to add audience mapper: {r.status_code} {r.text}")
-    except Exception as e:
-        print(f"[ERROR] Exception adding audience mapper: {e}")
+            if existing_mapper:
+                mapper_url = f"{mappers_url}/{existing_mapper['id']}"
+                r = session.request("PUT", mapper_url, json=mapper_data, timeout=10)
+            else:
+                r = session.request("POST", mappers_url, json=mapper_data, timeout=10)
+            if r.status_code in (200, 201, 204):
+                print(f"[OK] Added 'jit-audience' mapper to '{source_client_id_name}'")
+            else:
+                print(f"[ERROR] Failed to add audience mapper to '{source_client_id_name}': {r.status_code} {r.text}")
+        except Exception as e:
+            print(f"[ERROR] Exception adding audience mapper to '{source_client_id_name}': {e}")
+
+    # Give the interactive requester token a practical demo lifetime while
+    # keeping the downscoped JIT token short-lived for the approval window.
+    for token_client_id, token_lifespan in token_lifespans.items():
+        clients_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients"
+        try:
+            r = session.request(
+                "GET",
+                clients_url,
+                params={"clientId": token_client_id},
+                timeout=10,
+            )
+            clients = r.json() if r.status_code == 200 else []
+            if not clients:
+                print(f"[WARNING] Client '{token_client_id}' not found — skipping token lifespan")
+                continue
+
+            client = clients[0]
+            attributes = client.setdefault("attributes", {})
+            if attributes.get("access.token.lifespan") == token_lifespan:
+                print(
+                    f"[INFO] '{token_client_id}' access-token lifespan is already "
+                    f"{token_lifespan} seconds"
+                )
+                continue
+
+            attributes["access.token.lifespan"] = token_lifespan
+            update = session.request(
+                "PUT",
+                f"{clients_url}/{client['id']}",
+                json=client,
+                timeout=10,
+            )
+            if update.status_code in (200, 204):
+                print(
+                    f"[OK] Set '{token_client_id}' access-token lifespan to "
+                    f"{token_lifespan} seconds"
+                )
+            else:
+                print(
+                    f"[ERROR] Failed to set '{token_client_id}' access-token lifespan: "
+                    f"{update.status_code} {update.text}"
+                )
+        except Exception as e:
+            print(f"[ERROR] Exception configuring '{token_client_id}' token lifespan: {e}")
 
 
 def configure_frontend_url(session: KeycloakSession):
     """
-    Sets the realm's Frontend URL to match this script's own KEYCLOAK_URL.
+    Sets the realm's Frontend URL to the public Keycloak URL shared by
+    LibreChat and Runtime Shield.
     This is required so tokens issued to external callers (e.g. login.py on
     the host) carry an issuer that internally-issued JIT-exchanged tokens
     also match — otherwise downstream token verification fails with an
@@ -535,34 +673,33 @@ def configure_frontend_url(session: KeycloakSession):
     Host header of whichever hostname reached it (host vs internal Docker
     network) unless Frontend URL pins it to one fixed value.
     """
+    frontend_url = os.getenv("KEYCLOAK_PUBLIC_URL", KEYCLOAK_URL).rstrip("/")
     realm_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}"
     try:
         r = session.request("GET", realm_url, timeout=10)
         if r.status_code != 200:
-            print(f"[ERROR] Failed to fetch realm representation: {r.status_code} {r.text}")
-            return
+            raise RuntimeError(f"Could not fetch realm representation: HTTP {r.status_code}")
         realm_rep = r.json()
     except Exception as e:
-        print(f"[ERROR] Exception fetching realm representation: {e}")
-        return
+        raise RuntimeError(f"Could not fetch realm representation: {e}") from e
 
     current = realm_rep.get("attributes", {}).get("frontendUrl", "")
-    if current == KEYCLOAK_URL:
-        print(f"[INFO] Frontend URL already set to '{KEYCLOAK_URL}'")
+    if current == frontend_url:
+        print(f"[INFO] Frontend URL already set to '{frontend_url}'")
         return
 
     if "attributes" not in realm_rep or realm_rep["attributes"] is None:
         realm_rep["attributes"] = {}
-    realm_rep["attributes"]["frontendUrl"] = KEYCLOAK_URL
+    realm_rep["attributes"]["frontendUrl"] = frontend_url
 
     try:
         r = session.request("PUT", realm_url, json=realm_rep, timeout=10)
         if r.status_code in [200, 204]:
-            print(f"[OK] Set realm Frontend URL to '{KEYCLOAK_URL}'")
+            print(f"[OK] Set realm Frontend URL to '{frontend_url}'")
         else:
-            print(f"[ERROR] Failed to set Frontend URL: {r.status_code} {r.text}")
+            raise RuntimeError(f"Failed to set realm Frontend URL: HTTP {r.status_code}")
     except Exception as e:
-        print(f"[ERROR] Exception setting Frontend URL: {e}")
+        raise RuntimeError(f"Could not set realm Frontend URL: {e}") from e
 
 def configure_trusted_idps(session: KeycloakSession):
     """Ensure trusted external Identity Providers are configured in Keycloak."""
@@ -608,6 +745,217 @@ def configure_trusted_idps(session: KeycloakSession):
         print(f"[WARNING] Exception registering Identity Provider: {e}")
 
 
+def _get_client(session: KeycloakSession, client_id: str) -> dict | None:
+    response = session.request(
+        "GET",
+        f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients",
+        params={"clientId": client_id},
+        timeout=10,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not inspect Keycloak client '{client_id}': HTTP {response.status_code}")
+    clients = response.json()
+    return clients[0] if clients else None
+
+
+def _ensure_group_mapper(session: KeycloakSession, client: dict) -> None:
+    client_id = client["clientId"]
+    mappers_url = (
+        f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/"
+        f"{client['id']}/protocol-mappers/models"
+    )
+    response = session.request("GET", mappers_url, timeout=10)
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not inspect mappers for '{client_id}': HTTP {response.status_code}")
+
+    expected = {
+        "name": "runtime-shield-groups",
+        "protocol": "openid-connect",
+        "protocolMapper": "oidc-group-membership-mapper",
+        "config": {
+            "full.path": "false",
+            "claim.name": "groups",
+            "access.token.claim": "true",
+            "id.token.claim": "true",
+            "userinfo.token.claim": "true",
+        },
+    }
+    existing = next(
+        (mapper for mapper in response.json() if mapper.get("name") == expected["name"]),
+        None,
+    )
+    if existing:
+        if (
+            existing.get("protocolMapper") != expected["protocolMapper"]
+            or any(
+                existing.get("config", {}).get(key) != value
+                for key, value in expected["config"].items()
+            )
+        ):
+            raise RuntimeError(
+                f"'{client_id}' already has an incompatible '{expected['name']}' mapper; "
+                "no existing mapper was changed."
+            )
+        print(f"[INFO] Group claims already enabled for '{client_id}'")
+        return
+
+    response = session.request("POST", mappers_url, json=expected, timeout=10)
+    if response.status_code != 201:
+        raise RuntimeError(
+            f"Could not add group claims mapper to '{client_id}': "
+            f"HTTP {response.status_code} {response.text}"
+        )
+    print(f"[OK] Added group claims mapper to '{client_id}'")
+
+
+def _ensure_realm_roles_scope(session: KeycloakSession, client: dict) -> None:
+    client_id = client["clientId"]
+    scopes_url = (
+        f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/"
+        f"{client['id']}/default-client-scopes"
+    )
+    response = session.request("GET", scopes_url, timeout=10)
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not inspect default scopes for '{client_id}': HTTP {response.status_code}")
+    if any(scope.get("name") == "roles" for scope in response.json()):
+        return
+
+    scopes_response = session.request(
+        "GET",
+        f"{KEYCLOAK_URL}/admin/realms/{REALM}/client-scopes",
+        params={"search": "roles"},
+        timeout=10,
+    )
+    if scopes_response.status_code != 200:
+        raise RuntimeError(
+            f"Could not find the Keycloak 'roles' client scope: HTTP {scopes_response.status_code}"
+        )
+    roles_scope = next(
+        (scope for scope in scopes_response.json() if scope.get("name") == "roles"),
+        None,
+    )
+    if not roles_scope:
+        raise RuntimeError("The Keycloak 'roles' client scope does not exist.")
+
+    response = session.request(
+        "PUT",
+        f"{scopes_url}/{roles_scope['id']}",
+        timeout=10,
+    )
+    if response.status_code not in (200, 204):
+        raise RuntimeError(f"Could not add realm-role claims to '{client_id}': HTTP {response.status_code}")
+    print(f"[OK] Enabled realm-role claims for '{client_id}'")
+
+
+def configure_librechat_oidc_client(session: KeycloakSession) -> None:
+    """Create a dedicated OIDC browser-login client without changing Runtime Shield clients."""
+    client_id = os.getenv("OPENID_CLIENT_ID", "runtime-shield-librechat")
+    redirect_uri = "http://localhost:3080/oauth/openid/callback"
+    client = _get_client(session, client_id)
+
+    if client is None:
+        create_response = session.request(
+            "POST",
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients",
+            json={
+                "clientId": client_id,
+                "name": "Runtime Shield LibreChat Login",
+                "enabled": True,
+                "protocol": "openid-connect",
+                "publicClient": False,
+                "standardFlowEnabled": True,
+                "implicitFlowEnabled": False,
+                "directAccessGrantsEnabled": False,
+                "serviceAccountsEnabled": False,
+                "redirectUris": [redirect_uri],
+                "webOrigins": ["http://localhost:3080"],
+                "attributes": {
+                    "post.logout.redirect.uris": "http://localhost:3080/login",
+                },
+            },
+            timeout=10,
+        )
+        if create_response.status_code != 201:
+            raise RuntimeError(
+                f"Could not create the dedicated LibreChat OIDC client: "
+                f"HTTP {create_response.status_code} {create_response.text}"
+            )
+        client = _get_client(session, client_id)
+        if client is None:
+            raise RuntimeError("The LibreChat OIDC client was created but could not be retrieved.")
+        print(f"[OK] Created dedicated Keycloak OIDC client '{client_id}'")
+    elif (
+        client.get("protocol") != "openid-connect"
+        or client.get("publicClient") is not False
+        or client.get("standardFlowEnabled") is not True
+        or redirect_uri not in client.get("redirectUris", [])
+    ):
+        raise RuntimeError(
+            f"Keycloak client '{client_id}' exists but does not match the LibreChat OIDC setup. "
+            "It was left unchanged."
+        )
+    else:
+        print(f"[INFO] Existing dedicated LibreChat OIDC client '{client_id}' is configured")
+
+    attributes = client.get("attributes") or {}
+    logout_redirect_uri = "http://localhost:3080/login"
+    if attributes.get("post.logout.redirect.uris") != logout_redirect_uri:
+        attributes["post.logout.redirect.uris"] = logout_redirect_uri
+        client["attributes"] = attributes
+        update_response = session.request(
+            "PUT",
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{client['id']}",
+            json=client,
+            timeout=10,
+        )
+        if update_response.status_code not in (200, 204):
+            raise RuntimeError(
+                f"Could not configure the LibreChat post-logout redirect URI: "
+                f"HTTP {update_response.status_code}"
+            )
+        print(f"[OK] Configured LibreChat post-logout redirect URI '{logout_redirect_uri}'")
+
+    _ensure_realm_roles_scope(session, client)
+    _ensure_group_mapper(session, client)
+
+    mcp_client_id = os.getenv("RUNTIME_SHIELD_MCP_CLIENT_ID", "runtime-shield-hitl")
+    mcp_client = _get_client(session, mcp_client_id)
+    if mcp_client is None:
+        raise RuntimeError(
+            f"Runtime Shield MCP OAuth client '{mcp_client_id}' was not found; "
+            "no Runtime Shield/JIT client was created or overwritten."
+        )
+    _ensure_realm_roles_scope(session, mcp_client)
+    _ensure_group_mapper(session, mcp_client)
+
+    secret_response = session.request(
+        "GET",
+        f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{client['id']}/client-secret",
+        timeout=10,
+    )
+    if secret_response.status_code != 200 or not secret_response.json().get("value"):
+        raise RuntimeError(
+            f"Could not retrieve the LibreChat client secret: HTTP {secret_response.status_code}"
+        )
+
+    public_url = os.getenv(
+        "KEYCLOAK_PUBLIC_URL",
+        "https://host.docker.internal:8443",
+    ).rstrip("/")
+    env_values = {
+        "KEYCLOAK_PUBLIC_URL": public_url,
+        "KEYCLOAK_ISSUER_URL": public_url,
+        "OPENID_ISSUER": f"{public_url}/realms/{REALM}",
+        "OPENID_CLIENT_ID": client_id,
+        "OPENID_CLIENT_SECRET": secret_response.json()["value"],
+    }
+    if not os.getenv("OPENID_SESSION_SECRET"):
+        env_values["OPENID_SESSION_SECRET"] = secrets.token_urlsafe(48)
+    for key, value in env_values.items():
+        set_key(DOTENV_PATH, key, value, quote_mode="never")
+    print(f"[OK] Updated OIDC environment values in {DOTENV_PATH}; secret values were not printed")
+
+
 def main():
     print("--- Keycloak Setup Utility ---")
     print(f"  URL:   {KEYCLOAK_URL}")
@@ -647,6 +995,49 @@ def main():
     print("\n[OK] Keycloak setup complete.")
 
 
-if __name__ == "__main__":
-    main()
+def configure_jit_exchange_only():
+    """Configure only the JIT exchange client without changing user passwords."""
+    global CLIENT_ID, CLIENT_SECRET
 
+    if CLIENT_ID == "runtime-shield-jit":
+        CLIENT_ID = os.getenv("KEYCLOAK_SETUP_CLIENT_ID", "admin-cli")
+        CLIENT_SECRET = None
+
+    session = KeycloakSession()
+    if not session.token:
+        print("[ERROR] Could not acquire a Keycloak admin token. No JIT changes were made.")
+        sys.exit(1)
+
+    configure_jit_exchange_client(session)
+    print("\n[OK] Keycloak JIT exchange setup complete.")
+
+
+def configure_librechat_oidc_only():
+    """Configure only LibreChat login; do not rewrite demo-user passwords."""
+    global CLIENT_ID, CLIENT_SECRET
+
+    if CLIENT_ID == "runtime-shield-jit":
+        CLIENT_ID = os.getenv("KEYCLOAK_SETUP_CLIENT_ID", "admin-cli")
+        CLIENT_SECRET = None
+    os.environ.setdefault(
+        "KEYCLOAK_PUBLIC_URL",
+        "https://host.docker.internal:8443",
+    )
+
+    session = KeycloakSession()
+    if not session.token:
+        print("[ERROR] Could not acquire a Keycloak admin token. No OIDC changes were made.")
+        sys.exit(1)
+
+    configure_librechat_oidc_client(session)
+    configure_frontend_url(session)
+    print("\n[OK] LibreChat OIDC setup complete.")
+
+
+if __name__ == "__main__":
+    if "--jit-only" in sys.argv[1:]:
+        configure_jit_exchange_only()
+    elif "--librechat-oidc-only" in sys.argv[1:]:
+        configure_librechat_oidc_only()
+    else:
+        main()

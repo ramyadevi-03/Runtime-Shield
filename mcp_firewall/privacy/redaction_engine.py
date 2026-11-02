@@ -96,10 +96,10 @@ class RedactionEngine:
                     return redacted_text, [{"pattern_name": "ai_semantic_dlp", "match_count": 1}]
                 return text, []
             else:
-                logger.warning(f"NIM API returned {response.status_code}: {response.text[:200]}")
+                logger.warning("NIM API returned HTTP %s; semantic redaction was skipped.", response.status_code)
                 return text, []
-        except Exception as e:
-            logger.error(f"NIM Redaction Error: {e}")
+        except Exception as exc:
+            logger.error("NIM redaction request failed (%s)", type(exc).__name__)
             return text, []
 
     def redact(self, text: str) -> Tuple[str, List[Dict[str, Any]]]:

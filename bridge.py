@@ -54,10 +54,9 @@ from sandbox_enforcer import (
 )
 from workshop_sandbox import (
     WORKSHOP_DEMO_CONTENT,
-    WORKSHOP_DEMO_PATH,
     create_request_auth,
     expected_content_sha256,
-    is_workshop_demo_write,
+    is_workshop_provider_write,
     provider_identity_failures,
     verify_response_auth,
 )
@@ -147,23 +146,23 @@ async def _verify_workshop_filesystem_provider():
     return identity
 
 
-async def _execute_workshop_file_write(identity, req_id):
+async def _execute_workshop_file_write(identity, req_id, path, content):
     result = await _filesystem_provider_request(
         "POST",
         "/v1/write_file",
         {
             "tool": "write_file",
-            "path": WORKSHOP_DEMO_PATH,
-            "content": WORKSHOP_DEMO_CONTENT,
+            "path": path,
+            "content": content,
             "request_id": str(req_id),
         },
     )
     if (
         result.get("tool") != "write_file"
-        or result.get("path") != WORKSHOP_DEMO_PATH
+        or result.get("path") != path
         or result.get("success") is not True
-        or result.get("sha256") != expected_content_sha256(WORKSHOP_DEMO_CONTENT)
-        or result.get("size_bytes") != len(WORKSHOP_DEMO_CONTENT.encode("utf-8"))
+        or result.get("sha256") != expected_content_sha256(content)
+        or result.get("size_bytes") != len(content.encode("utf-8"))
         or result.get("provider_container_id") != identity.get("container_id")
     ):
         raise FilesystemProviderExecutionError(
@@ -6407,7 +6406,7 @@ async def execute_tool_proxy(request: Request):
                 tool_args["path"] = norm_p
                 if "params" in body and "arguments" in body["params"]:
                     body["params"]["arguments"]["path"] = norm_p
-    workshop_docker_write = is_workshop_demo_write(tool_name, tool_args)
+    workshop_docker_write = is_workshop_provider_write(tool_name, tool_args)
     req_id = body.get("id")
 
     if not req_id:
@@ -6997,7 +6996,10 @@ async def execute_tool_proxy(request: Request):
     if workshop_docker_write:
         try:
             _workshop_result = await _execute_workshop_file_write(
-                _workshop_provider_identity, req_id
+                _workshop_provider_identity,
+                req_id,
+                tool_args["path"],
+                tool_args["content"],
             )
         except FilesystemProviderUnavailable as _provider_error:
             _failure_message = str(_provider_error)
@@ -7068,7 +7070,7 @@ async def execute_tool_proxy(request: Request):
             "provider_container_id": _workshop_result["provider_container_id"],
             "execution_outcome": "success",
             "execution_success": True,
-            "resource_path": WORKSHOP_DEMO_PATH,
+            "resource_path": _workshop_result["path"],
             "content_sha256": _workshop_result["sha256"],
             "size_bytes": _workshop_result["size_bytes"],
             "reason": "Filesystem provider confirmed the new file and exact content after write_file.",
@@ -7084,7 +7086,7 @@ async def execute_tool_proxy(request: Request):
                 "content": [{
                     "type": "text",
                     "text": (
-                        f"File written successfully to {WORKSHOP_DEMO_PATH} "
+                        f"File written successfully to {_workshop_result['path']} "
                         "inside the verified Docker runc provider."
                     ),
                 }],

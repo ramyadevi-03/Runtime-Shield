@@ -6,7 +6,7 @@ from workshop_sandbox import (
     create_request_auth,
     create_response_auth,
     expected_content_sha256,
-    is_workshop_demo_write,
+    is_workshop_provider_write,
     provider_identity_failures,
     validate_provider_file_path,
     verify_response_auth,
@@ -28,20 +28,24 @@ def _valid_identity():
     }
 
 
-def test_workshop_exception_matches_only_exact_write():
-    assert is_workshop_demo_write("write_file", {
+def test_workshop_provider_routes_safe_filesystem_writes():
+    assert is_workshop_provider_write("write_file", {
         "path": WORKSHOP_DEMO_PATH,
         "content": WORKSHOP_DEMO_CONTENT,
     })
-    assert not is_workshop_demo_write("write_file", {
-        "path": WORKSHOP_DEMO_PATH,
-        "content": WORKSHOP_DEMO_CONTENT + "!",
+    assert is_workshop_provider_write("write_file", {
+        "path": "secure-experiment-zone/workshop-rehearsal.txt",
+        "content": "Harmless workshop content with different wording.",
     })
-    assert not is_workshop_demo_write("write_file", {
-        "path": "secure-experiment-zone/other.txt",
+    assert not is_workshop_provider_write("write_file", {
+        "path": "secure-experiment-zone/other.json",
         "content": WORKSHOP_DEMO_CONTENT,
     })
-    assert not is_workshop_demo_write("keycloak_revoke_user_sessions", {
+    assert not is_workshop_provider_write("write_file", {
+        "path": "secure-experiment-zone/workshop-rehearsal.txt",
+        "content": "x" * 4097,
+    })
+    assert not is_workshop_provider_write("keycloak_revoke_user_sessions", {
         "path": WORKSHOP_DEMO_PATH,
         "content": WORKSHOP_DEMO_CONTENT,
     })
@@ -67,7 +71,7 @@ def test_provider_identity_requires_all_container_restrictions():
 
 
 def test_provider_path_policy_is_limited_to_direct_txt_files():
-    assert validate_provider_file_path(WORKSHOP_DEMO_PATH) == "hitl-demo-approved.txt"
+    assert validate_provider_file_path(WORKSHOP_DEMO_PATH) == "hitl-demo-approved-20261103.txt"
     for path in (
         "../secure-experiment-zone/file.txt",
         "secure-experiment-zone/../file.txt",

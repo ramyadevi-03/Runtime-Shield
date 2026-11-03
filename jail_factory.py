@@ -219,6 +219,7 @@ class JailFactory:
         # When running inside a container, internal MCP servers run directly
         if os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER", "false").lower() == "true":
             return BaseJailer(provider_name, cwd, env, allowed_paths)
+
         # Docker Desktop's Linux containers cannot bind-mount Windows paths reliably
         # for stdio MCP providers; use the restricted Windows process jail instead.
         if sys.platform == "win32":
@@ -237,3 +238,4 @@ class JailFactory:
                 return LandlockJailer(provider_name, cwd, env, allowed_paths)
 
         return BaseJailer(provider_name, cwd, env, allowed_paths)
+

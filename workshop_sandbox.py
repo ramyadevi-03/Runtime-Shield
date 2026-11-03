@@ -7,20 +7,26 @@ import time
 import uuid
 
 
-WORKSHOP_DEMO_PATH = "secure-experiment-zone/hitl-demo-approved.txt"
+WORKSHOP_DEMO_PATH = "secure-experiment-zone/hitl-demo-approved-20261103.txt"
 WORKSHOP_DEMO_CONTENT = "Runtime Shield HITL and Docker sandbox execution successful"
 WORKSHOP_PROVIDER_ID = "runtime-shield-filesystem-provider"
 _CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
 _WORKSHOP_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.txt$")
 
 
-def is_workshop_demo_write(tool_name, tool_args):
-    return (
-        tool_name == "write_file"
-        and isinstance(tool_args, dict)
-        and tool_args.get("path") == WORKSHOP_DEMO_PATH
-        and tool_args.get("content") == WORKSHOP_DEMO_CONTENT
-    )
+def is_workshop_provider_write(tool_name, tool_args):
+    if tool_name != "write_file" or not isinstance(tool_args, dict):
+        return False
+    if validate_provider_file_path(tool_args.get("path")) is None:
+        return False
+
+    content = tool_args.get("content")
+    if not isinstance(content, str):
+        return False
+    try:
+        return len(content.encode("utf-8")) <= 4096
+    except UnicodeEncodeError:
+        return False
 
 
 def validate_provider_file_path(path):

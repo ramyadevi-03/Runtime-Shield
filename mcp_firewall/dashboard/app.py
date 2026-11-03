@@ -93,7 +93,6 @@ class DashboardState:
             if hasattr(manager, 'loop') and manager.loop and manager.loop.is_running():
                 asyncio.run_coroutine_threadsafe(manager.broadcast_event(event), manager.loop)
             else:
-                import asyncio
                 loop = None
                 try:
                     loop = asyncio.get_event_loop()

@@ -153,6 +153,8 @@ sequenceDiagram
 
 ##  Getting Started
 
+> New contributors: start with the [intern clone and workshop guide](document/README.md) for private-repository access, local setup, Keycloak, and the HITL demo.
+
 ### Prerequisites
 - **Python 3.10+**
 - **Node.js 18+**

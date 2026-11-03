@@ -7,6 +7,7 @@ real_stdout_buffer = sys.stdout.buffer
 sys.stdout = sys.stderr
 
 import os
+from pathlib import Path
 # Force Python to load local mcp_firewall package first instead of site-packages
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_DIR)
@@ -19,6 +20,8 @@ import json
 import time
 import re
 import shutil
+import hashlib
+import uuid
 from mcp_firewall.sdk import Gateway
 from mcp_firewall.dashboard.server import start_dashboard
 from mcp_firewall.dashboard.app import state as dashboard_state, app as dashboard_app
@@ -32,18 +35,141 @@ from fastapi import Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
 import asyncio
+from gateway_auth import (
+    extract_bearer_token,
+    gateway_api_key_matches,
+    is_gateway_api_key_configured,
+)
 
 from src.policy_loader import init_policies, search as ard_search, auto_refresh_catalog
 from src.policy_registry import PolicyRegistry
 from src.policy_engine import OpaPolicyEngine
 from src.opa_sync import sync_policies
 
-try:
-    from presidio_analyzer import AnalyzerEngine
-    from presidio_anonymizer import AnonymizerEngine
-except ImportError:
-    AnalyzerEngine = None
-    AnonymizerEngine = None
+# Sandbox fail-closed enforcement
+from sandbox_enforcer import (
+    SandboxEnforcer,
+    SandboxUnavailableError,
+    requires_sandbox_isolation,
+)
+from workshop_sandbox import (
+    WORKSHOP_DEMO_CONTENT,
+    WORKSHOP_DEMO_PATH,
+    create_request_auth,
+    expected_content_sha256,
+    is_workshop_demo_write,
+    provider_identity_failures,
+    verify_response_auth,
+)
+
+
+WORKSHOP_FILESYSTEM_PROVIDER_URL = "http://filesystem-provider:8765"
+
+
+class FilesystemProviderUnavailable(RuntimeError):
+    pass
+
+
+class FilesystemProviderExecutionError(RuntimeError):
+    pass
+
+
+async def _filesystem_provider_request(method, path, payload=None):
+    provider_url = os.getenv("RUNTIME_SHIELD_FS_PROVIDER_URL", WORKSHOP_FILESYSTEM_PROVIDER_URL)
+    provider_secret = os.getenv("RUNTIME_SHIELD_FS_PROVIDER_TOKEN", "")
+    if provider_url != WORKSHOP_FILESYSTEM_PROVIDER_URL:
+        raise FilesystemProviderUnavailable("Filesystem provider URL does not match the private workshop endpoint.")
+    if len(provider_secret) < 32:
+        raise FilesystemProviderUnavailable("Filesystem provider authentication is not configured.")
+
+    body = b"" if payload is None else json.dumps(
+        payload, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    provider_request_id, timestamp, signature = create_request_auth(
+        provider_secret, method, path, body
+    )
+    headers = {
+        "X-Runtime-Request-Id": provider_request_id,
+        "X-Runtime-Request-Timestamp": timestamp,
+        "X-Runtime-Request-Signature": signature,
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+            response = await client.request(
+                method, provider_url + path, content=body, headers=headers
+            )
+    except httpx.HTTPError as exc:
+        raise FilesystemProviderUnavailable(
+            "Dedicated filesystem provider is unavailable."
+        ) from exc
+
+    response_body = response.content
+    if (
+        response.headers.get("X-Runtime-Response-Id") != provider_request_id
+        or not verify_response_auth(
+            provider_secret,
+            path,
+            provider_request_id,
+            response.status_code,
+            response.headers,
+            response_body,
+        )
+    ):
+        raise FilesystemProviderUnavailable(
+            "Dedicated filesystem provider response could not be authenticated."
+        )
+
+    try:
+        result = response.json()
+    except ValueError as exc:
+        raise FilesystemProviderUnavailable(
+            "Dedicated filesystem provider returned invalid JSON."
+        ) from exc
+    if not isinstance(result, dict):
+        raise FilesystemProviderUnavailable(
+            "Dedicated filesystem provider returned an invalid response."
+        )
+
+    if response.status_code != 200:
+        raise FilesystemProviderExecutionError(
+            str(result.get("error", "Dedicated filesystem provider rejected the operation."))
+        )
+    return result
+
+
+async def _verify_workshop_filesystem_provider():
+    identity = await _filesystem_provider_request("GET", "/v1/identity")
+    failures = provider_identity_failures(identity)
+    if failures:
+        raise FilesystemProviderUnavailable("; ".join(failures))
+    return identity
+
+
+async def _execute_workshop_file_write(identity, req_id):
+    result = await _filesystem_provider_request(
+        "POST",
+        "/v1/write_file",
+        {
+            "tool": "write_file",
+            "path": WORKSHOP_DEMO_PATH,
+            "content": WORKSHOP_DEMO_CONTENT,
+            "request_id": str(req_id),
+        },
+    )
+    if (
+        result.get("tool") != "write_file"
+        or result.get("path") != WORKSHOP_DEMO_PATH
+        or result.get("success") is not True
+        or result.get("sha256") != expected_content_sha256(WORKSHOP_DEMO_CONTENT)
+        or result.get("size_bytes") != len(WORKSHOP_DEMO_CONTENT.encode("utf-8"))
+        or result.get("provider_container_id") != identity.get("container_id")
+    ):
+        raise FilesystemProviderExecutionError(
+            "Provider did not confirm the requested file contents and execution identity."
+        )
+    return result
 
 # Global references for LLM proxy endpoints to access the core engines
 gateway_instance = None
@@ -53,9 +179,18 @@ semantic_parser_instance = None
 active_policy_engine = None
 shadow_policy_engine = None
 
+HONEYPOT_TOOLS = {
+    "get_system_config",
+    "fetch_internal_db",
+}
+
 import telemetry
 from mcp_firewall.config import load_config
 from mcp_firewall.models import ToolCallRequest, Action, GatewayConfig
+from mcp_firewall.privacy.presidio_engine import (
+    get_pii_engine_status,
+    get_presidio_instances,
+)
 
 try:
     global_gateway_config = load_config(os.path.join(PROJECT_DIR, "mcp-firewall.yaml"))
@@ -117,25 +252,29 @@ def get_user_from_mongodb(raw_user: str) -> Optional[dict]:
         return None
 
 
+def role_from_verified_claims(claims: dict) -> str:
+    roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
+    groups = claims.get("groups", []) or []
+    if isinstance(roles, str):
+        roles = [roles]
+    if isinstance(groups, str):
+        groups = [groups]
+    if "admin" in roles or "Administrators" in groups:
+        return "admin"
+    if "privileged" in roles or "Privileged-Users" in groups:
+        return "privileged"
+    return "user"
+
+
 def resolve_user_context(token: Optional[str], env_role: str, claims: Optional[dict], user_id: str, user_sub: str, user_role: str, raw_user: str = "", prompt_text: str = "", header_role: str = "") -> Tuple[str, str, str]:
     # 1. Authenticated JWT Bearer Token (Keycloak / OAuth / SPIFFE)
     if token and claims:
         resolved_user_id = claims.get("preferred_username") or claims.get("sub") or user_id
         resolved_user_sub = claims.get("sub") or ""
-        roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
-        groups = claims.get("groups", []) or []
-        scopes = claims.get("scope", "")
-        if isinstance(scopes, str):
-            scopes = scopes.split(" ")
-        if "Normal-Users" in groups:
-            resolved_user_role = "user"
-        elif "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
-            resolved_user_role = "admin"
-        elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
-            resolved_user_role = "privileged"
-        else:
-            resolved_user_role = "user"
-        return resolved_user_id, resolved_user_role, resolved_user_sub
+        return resolved_user_id, role_from_verified_claims(claims), resolved_user_sub
+
+    if token or os.getenv("LOCAL_DEV_MODE", "false").lower() != "true":
+        return "anonymous_user", "user", ""
 
     # 2. LibreChat MongoDB Account Lookup via raw_user (User ObjectId hex, email, or name)
     if raw_user and raw_user.strip():
@@ -199,7 +338,16 @@ tool_map = {}
 scope_map = {}
 pending_tool_futures = {}  # req_id -> asyncio.Future
 pending_approvals = {}     # req_id -> dict with asyncio.Event
+approval_login_attempts = {}
+approval_admin_sessions = {}
+approval_login_lock = threading.Lock()
 stdout_lock = threading.Lock()
+try:
+    HITL_TIMEOUT_SECONDS = float(os.getenv("HITL_TIMEOUT_SECONDS", "180"))
+except ValueError as exc:
+    raise RuntimeError("HITL_TIMEOUT_SECONDS must be a number between 0 and 3600.") from exc
+if not 0 < HITL_TIMEOUT_SECONDS <= 3600:
+    raise RuntimeError("HITL_TIMEOUT_SECONDS must be greater than 0 and no more than 3600.")
 
 def reload_tool_mappings():
     global tool_map, scope_map
@@ -283,35 +431,35 @@ class RemoteSseMcpClient:
             elif event_type == "message":
                 msg = json.loads(data)
                 msg_id = msg.get("id")
-                
+
+                line_str = data
+                if "result" in msg and isinstance(msg["result"], dict) and "tools" in msg["result"]:
+                    global tools_list_aggregator
+                    tools_list = msg["result"]["tools"] or []
+                    if tools_list_aggregator is not None:
+                        is_complete, merged_tools = tools_list_aggregator.add_response(
+                            msg_id,
+                            self.provider_name,
+                            tools_list,
+                        )
+                        if not is_complete:
+                            return
+                        tools_list = merged_tools
+                    msg["result"]["tools"] = ToolsListAggregator.include_honeypot_tools(tools_list)
+                    line_str = json.dumps(msg)
+
                 # Relay message to pending tool call futures
                 if msg_id is not None and msg_id in pending_tool_futures:
                     loop = pending_tool_futures[msg_id]._loop
-                    loop.call_soon_threadsafe(pending_tool_futures[msg_id].set_result, data)
+                    loop.call_soon_threadsafe(pending_tool_futures[msg_id].set_result, line_str)
                 else:
                     # Write response directly to stdout for stdio clients
                     try:
                         with stdout_lock:
-                            protocol_stdout.write(data + "\n")
+                            protocol_stdout.write(line_str + "\n")
                             protocol_stdout.flush()
                     except Exception as e:
                         log(f"⚠️ Failed to write remote SSE response to stdout: {e}")
-                
-                # Relay tool lists to the aggregator if it is a list response
-                if "result" in msg and isinstance(msg["result"], dict) and "tools" in msg["result"]:
-                    global tools_list_aggregator
-                    if tools_list_aggregator is not None:
-                        tools_list = msg["result"]["tools"] or []
-                        is_complete, merged_tools = tools_list_aggregator.add_response(msg_id, self.provider_name, tools_list)
-                        if is_complete:
-                            msg["result"]["tools"] = merged_tools
-                            line_str = json.dumps(msg) + "\n"
-                            try:
-                                with stdout_lock:
-                                    protocol_stdout.write(line_str)
-                                    protocol_stdout.flush()
-                            except Exception as e:
-                                log(f"⚠️ Failed to write aggregated tools to stdout: {e}")
         except Exception as e:
             log(f"⚠️ RemoteSseMcpClient [{self.provider_name}]: Error handling event ({event_type}): {e}")
 
@@ -354,7 +502,7 @@ class RemoteSseMcpClient:
             async with httpx.AsyncClient() as post_client:
                 resp = await post_client.post(self.post_url, json=payload, headers=headers, timeout=timeout)
             if resp.status_code not in (200, 202):
-                raise RuntimeError(f"POST {self.post_url} returned {resp.status_code}: {resp.text}")
+                raise RuntimeError(f"POST {self.post_url} returned HTTP {resp.status_code}")
             
             response_str = await asyncio.wait_for(fut, timeout=timeout)
             return json.loads(response_str)
@@ -436,17 +584,41 @@ class FraudDetectionEngine:
         self.last_activity = {} # For cooldown/decay: {identifier: timestamp}
         self.lock = threading.Lock() # Ensure thread-safe access
         self.RISK_THRESHOLD = 200
-        self.QUARANTINE_THRESHOLD = 500 # Threshold for permanent circuit breaking
+        self.QUARANTINE_THRESHOLD = 500 # Threshold for bridge-level quarantine
         self.HONEYPOT_PENALTY = 100     # Penalty for hitting a honeypot trap
         self.learning_mode = learning_mode
         self.DECAY_RATE = 10 # Points to remove per interval
-        self.DECAY_INTERVAL = 30 # Seconds per decay step (1 minute)
+        self.DECAY_INTERVAL = 30 # Seconds per decay step
 
         # Start background decay thread for real-time cooldown
         threading.Thread(target=self._decay_loop, daemon=True).start()
 
+    def record_honeypot_hit(self, agent: str, user_id: str = None, risk_delta: int = None) -> tuple[int, bool]:
+        """Increase risk for a honeypot attempt and report whether quarantine threshold was reached."""
+        now = time.time()
+        with self.lock:
+            if agent not in self.agent_risk_scores:
+                self.agent_risk_scores[agent] = 0
+            risk_increase = 0 if self.learning_mode else max(
+                0,
+                risk_delta if risk_delta is not None else self.HONEYPOT_PENALTY,
+            )
+            self.agent_risk_scores[agent] += risk_increase
+            self.last_activity[agent] = now
+
+            if user_id:
+                if user_id not in self.user_risk_scores:
+                    self.user_risk_scores[user_id] = 0
+                self.user_risk_scores[user_id] += risk_increase
+                self.last_activity[user_id] = now
+
+            score = self.agent_risk_scores[agent]
+            if user_id:
+                score = max(score, self.user_risk_scores[user_id])
+            return score, score >= self.QUARANTINE_THRESHOLD
+
     def _decay_loop(self):
-        """Proactively decay risk scores every minute even if no tools are called."""
+        """Proactively decay risk scores every 30 seconds even if no tools are called."""
         while True:
             time.sleep(10) # Check every 10s for responsiveness
             now = time.time()
@@ -559,12 +731,77 @@ class FraudDetectionEngine:
             
             # Determine if dynamic threshold is crossed
             if current_score >= self.QUARANTINE_THRESHOLD:
-                return True, "deny", f"Fraud Engine QUARANTINE: Risk Score ({current_score}) reached critical limit. Agent identity {agent} is now permanently blacklisted.", "critical"
+                return True, "deny", f"Fraud Engine QUARANTINE: Risk Score ({current_score}) reached critical limit for agent identity {agent}.", "critical"
 
             if current_score >= self.RISK_THRESHOLD:
                 return True, "deny", f"Fraud Engine Block: Risk Score ({current_score}) exceeded threshold ({self.RISK_THRESHOLD}).", "critical"
                 
             return False, action_val, decision.reason, decision.severity.value if hasattr(decision.severity, 'value') else str(decision.severity)
+
+
+def match_honeypot_prompt(query: str) -> str | None:
+    """Recognize explicit requests to invoke either honeypot without matching discussion about them."""
+    normalized = re.sub(r"[^a-z0-9]", "", query.lower())
+    if normalized == "getsystemconfig" or re.search(
+        r"\b(call|invoke|execute|run|use|try)\b.{0,60}\bget_system_config\b",
+        query,
+        re.I,
+    ):
+        return "get_system_config"
+    if normalized == "fetchinternaldb" or re.search(
+        r"\b(call|invoke|execute|run|use|try)\b.{0,60}\bfetch_internal_db\b",
+        query,
+        re.I,
+    ):
+        return "fetch_internal_db"
+
+    if re.search(r"\b(call|invoke|fetch|read|show|get|retrieve|access|query|dump|open)\b.{0,60}\b(system\s+config(?:uration)?|system_config)\b", query, re.I):
+        return "get_system_config"
+    if re.search(r"\b(call|invoke|fetch|read|show|get|retrieve|access|query|dump|open)\b.{0,60}\b(internal\s+(?:db|database)|internal_db)\b", query, re.I):
+        return "fetch_internal_db"
+    return None
+
+
+def record_honeypot_attempt(
+    tool_name: str,
+    agent_id: str,
+    user_id: str = None,
+    risk_delta: int = None,
+    rule_id: str = "block-honeypots",
+) -> tuple[int | None, bool, str]:
+    engine = fraud_engine_instance
+    effective_delta = risk_delta if risk_delta is not None else (engine.HONEYPOT_PENALTY if engine else 100)
+    if engine and engine.learning_mode:
+        effective_delta = 0
+    if engine is None:
+        log("❌ Honeypot hit could not update risk: fraud engine is not initialized.")
+        score = None
+        quarantined = False
+    else:
+        score, quarantined = engine.record_honeypot_hit(agent_id, user_id, effective_delta)
+
+    reason = "Honeypot bait tool intercepted; no internal data was returned."
+    if score is not None:
+        reason += f" Risk score: {score}/{engine.QUARANTINE_THRESHOLD}."
+    if quarantined:
+        reason += " Agent is quarantined by the bridge circuit breaker."
+
+    log(f"🚨 HONEYPOT: {tool_name} blocked for {agent_id}; {reason}")
+    dashboard_state.add_event({
+        "action": "deny",
+        "tool": tool_name,
+        "agent": agent_id,
+        "user_id": user_id,
+        "reason": reason,
+        "severity": "critical",
+        "stage": "honeypot-trap",
+        "rule_id": rule_id,
+        "risk_delta": effective_delta,
+        "risk_score": score,
+        "quarantined": quarantined,
+        "timestamp": time.time(),
+    })
+    return score, quarantined, reason
 
 class NIMCloudGuard:
     def __init__(self, api_key: str, base_url: str, config: dict):
@@ -584,9 +821,7 @@ class NIMCloudGuard:
         # Returns "safe" or "unsafe\nS1,S2..." with category codes
         endpoint = f"{self.base_url}/chat/completions"
         try:
-            log(f"[DEBUG LLAMA GUARD] Sending to {endpoint}")
-            log(f"[DEBUG LLAMA GUARD] Payload Text: {repr(text)}")
-            log(f"[DEBUG LLAMA GUARD] API Key: {self.api_key[:10]}...")
+            log(f"[DEBUG LLAMA GUARD] Sending request (payload_chars={len(text)})")
             data = {
                 "model": "meta/llama-guard-4-12b",
                 "messages": [{"role": "user", "content": text}],
@@ -596,7 +831,6 @@ class NIMCloudGuard:
             req_headers.update(get_spiffe_headers())
             response = requests.post(endpoint, headers=req_headers, json=data, timeout=5)
             log(f"[DEBUG LLAMA GUARD] Status Code: {response.status_code}")
-            log(f"[DEBUG LLAMA GUARD] Response: {response.text}")
             if response.status_code == 200:
                 verdict = response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip().lower()
                 if verdict.startswith("unsafe"):
@@ -906,7 +1140,7 @@ class SemanticIntentParser:
                     self.consecutive_failures = 0  # Reset on successful call
                     return resp.json().get("data", [{}])[0].get("embedding", [])
                 else:
-                    raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+                    raise RuntimeError(f"Embedding provider returned HTTP {resp.status_code}")
         except Exception as e:
             self.consecutive_failures += 1
             log(f"⚠️ Embedding API call failed ({self.consecutive_failures}/{self.MAX_FAILURES_BEFORE_BREAK}): {e}")
@@ -1034,6 +1268,30 @@ class ToolsListAggregator:
         self.timer_threads = {}
         self.completed = set()
 
+    @staticmethod
+    def include_honeypot_tools(tools_list):
+        existing_tool_names = {
+            tool.get("name")
+            for tool in tools_list
+            if isinstance(tool, dict)
+        }
+        for honeypot_tool in sorted(HONEYPOT_TOOLS):
+            if honeypot_tool not in existing_tool_names:
+                tools_list.append({
+                    "name": honeypot_tool,
+                    "description": (
+                        "Runtime Shield internal system data access tool."
+                        if honeypot_tool == "get_system_config"
+                        else "Runtime Shield internal database access tool."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                })
+        return tools_list
+
     def add_response(self, req_id, provider_name, tools_list):
         with self.lock:
             if req_id in self.completed:
@@ -1075,7 +1333,7 @@ class ToolsListAggregator:
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
-                    "tools": aggregated
+                    "tools": self.include_honeypot_tools(aggregated)
                 }
             }
             try:
@@ -1092,10 +1350,7 @@ tools_list_aggregator = None
 # MICROSOFT PRESIDIO NLP PII REDACTION (OPTION A) & AI SEMANTIC REDACTION (OPTION B)
 # ==========================================
 
-_presidio_analyzer = None
-_presidio_anonymizer = None
 _ai_redactor = None
-_presidio_lock = threading.Lock()
 _ai_redactor_lock = threading.Lock()
 
 def get_ai_redactor_instance():
@@ -1107,16 +1362,6 @@ def get_ai_redactor_instance():
             pii_cfg = gateway_instance.config.pii if (gateway_instance and gateway_instance.config) else None
             _ai_redactor = RedactionEngine(pii_config=pii_cfg)
     return _ai_redactor
-
-def get_presidio_instances():
-    global _presidio_analyzer, _presidio_anonymizer
-    with _presidio_lock:
-        if _presidio_analyzer is None or _presidio_anonymizer is None:
-            if AnalyzerEngine is None or AnonymizerEngine is None:
-                raise ImportError("Presidio library is not installed/available.")
-            _presidio_analyzer = AnalyzerEngine()
-            _presidio_anonymizer = AnonymizerEngine()
-    return _presidio_analyzer, _presidio_anonymizer
 
 def is_markdown_table(text: str) -> bool:
     """
@@ -1468,6 +1713,7 @@ def redact_pii_with_presidio(text: str, is_raw: bool = False, skip_headers: bool
         {"name": "SSN", "pattern": r'\b\d{3}-\d{2}-\d{4}\b', "placeholder": "[REDACTED-SSN]"},
         {"name": "Credit Card", "pattern": r'\b(?:\d{4}[-\s]?){3}\d{4}\b', "placeholder": "[REDACTED-CC]"},
         {"name": "Phone", "pattern": r'\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b', "placeholder": "[REDACTED-PHONE]"},
+        {"name": "Titled Person Name", "pattern": r'\b(?:Dr|Mr|Mrs|Ms|Miss|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b', "placeholder": "[REDACTED-NAME]"},
     ]
 
     if gateway_instance and gateway_instance.config and gateway_instance.config.pii:
@@ -1489,6 +1735,13 @@ def redact_pii_with_presidio(text: str, is_raw: bool = False, skip_headers: bool
         
         # Apply exclude list and confidence threshold (ignore low-confidence false positives)
         results = [r for r in results if r.score >= 0.3]
+        workshop_content_start = text.find(WORKSHOP_DEMO_CONTENT)
+        if workshop_content_start >= 0:
+            workshop_content_end = workshop_content_start + len(WORKSHOP_DEMO_CONTENT)
+            results = [
+                r for r in results
+                if not (workshop_content_start <= r.start and r.end <= workshop_content_end)
+            ]
         results = [r for r in results if not any(kw in text[r.start:r.end].lower() for kw in ["keycloak", "spiffe", "opa", "runtime-shield", "runtime_shield"])]
         if exclude_entities:
             results = [r for r in results if r.entity_type not in exclude_entities]
@@ -1510,7 +1763,7 @@ def redact_pii_with_presidio(text: str, is_raw: bool = False, skip_headers: bool
             detected = list({r.entity_type for r in results})
             log(f"✂️ PII redacted via Microsoft Presidio NLP — types: {detected}")
     except Exception as e:
-        log(f"⚠️ Presidio PII redaction error: {e}. Returning original.")
+        log(f"⚠️ Presidio PII redaction error ({type(e).__name__}). Applying configured regex fallbacks.")
 
     # --- DYNAMIC REGEX FALLBACKS ---
     for fallback in regex_fallbacks:
@@ -1528,6 +1781,48 @@ def redact_pii_with_presidio(text: str, is_raw: bool = False, skip_headers: bool
             pass
 
     return text
+
+
+def redact_outbound_pii(text: str, user_role: str, user_id: str, tool: str) -> str:
+    if user_role == "admin":
+        return text
+
+    redacted_lines = []
+    for line in text.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        line_ending = line[len(content):]
+        redacted_lines.append(
+            redact_pii_with_presidio(content, is_raw=True, skip_headers=False)
+            + line_ending
+        )
+    redacted = "".join(redacted_lines)
+    if redacted != text:
+        dashboard_state.add_event({
+            "action": "redact",
+            "tool": tool,
+            "agent": f"user-{user_id}",
+            "identity": "spiffe://runtime-shield/llm-agent",
+            "reason": "Outbound PII redacted before returning tool output.",
+            "severity": "medium",
+            "stage": "pii-redaction-outbound",
+            "timestamp": time.time(),
+        })
+    return redacted
+
+
+def resolve_workspace_file_path(target_path: str) -> Path:
+    normalized_path = target_path.replace("\\", "/").strip()
+    if not normalized_path or normalized_path.startswith("/") or re.match(r"^[A-Za-z]:", normalized_path):
+        raise ValueError("File path must be relative to the project workspace.")
+
+    if ".." in normalized_path.split("/"):
+        raise ValueError("Parent-directory traversal is not allowed.")
+
+    workspace_root = Path(PROJECT_DIR).resolve()
+    file_path = (workspace_root / normalized_path).resolve()
+    if os.path.commonpath((str(workspace_root), str(file_path))) != str(workspace_root):
+        raise ValueError("File path must remain within the project workspace.")
+    return file_path
 
 
 def has_pii_presidio(text: str) -> bool:
@@ -1554,12 +1849,10 @@ def has_pii_presidio(text: str) -> bool:
 
 # Warm up Microsoft Presidio NLP engine synchronously on startup
 def _warmup_presidio_sync():
-    try:
-        log("⏳ Warming up Microsoft Presidio NLP engine...")
-        get_presidio_instances()
-        log("✅ Microsoft Presidio NLP engine fully warmed up!")
-    except Exception as e:
-        log(f"⚠️ Presidio warmup warning: {e}")
+    log("⏳ Initializing Microsoft Presidio NLP engine...")
+    get_presidio_instances()
+    status = get_pii_engine_status()
+    log(f"🛡️ {status['pii_status']}")
 
 
 
@@ -1822,11 +2115,14 @@ class WindowsJailer(BaseJailer):
         if sys.platform == 'win32':
             sandbox_script = os.path.join(PROJECT_DIR, "windows_sandbox.py")
             if os.path.exists(sandbox_script):
-                new_cmd = ["python", sandbox_script, "--provider", self.provider_name, "--"] + cmd
+                new_cmd = [sys.executable, sandbox_script, "--provider", self.provider_name, "--"] + cmd
                 cmd[:] = new_cmd
                 log(f"🪟 Sandboxing [{self.provider_name}]: Windows Restricted Process Group initialized (win32job + restricted token)")
             else:
-                log(f"⚠️ [WARNING] Windows process jailer script not found at {sandbox_script}. Running '{self.provider_name}' without sandboxing.")
+                # FAIL-CLOSED: Refuse to run without sandboxing
+                msg = f"[SANDBOX FAIL-CLOSED] Windows sandbox script not found at {sandbox_script}. Refusing to run '{self.provider_name}' unsandboxed on host."
+                log(f"🚫 {msg}")
+                raise RuntimeError(msg)
         return kwargs
 
 class OpenSandboxJailer(BaseJailer):
@@ -1838,12 +2134,28 @@ class OpenSandboxJailer(BaseJailer):
     def get_popen_kwargs(self, cmd):
         docker_bin = shutil.which("docker")
         if not docker_bin:
-            log(f"⚠️ [OpenSandbox] docker executable not found. Falling back to host jailer.")
-            return super().get_popen_kwargs(cmd)
+            # FAIL-CLOSED: Do not silently execute on host
+            msg = f"[OpenSandbox] docker executable not found. Cannot launch container sandbox for '{self.provider_name}'."
+            log(f"🚫 {msg}")
+            raise RuntimeError(msg)
             
         use_gvisor = os.getenv("OPENSANDBOX_USE_GVISOR", "true").lower() == "true"
+        require_gvisor = os.getenv("OPENSANDBOX_REQUIRE_GVISOR", "false").lower() == "true"
         container_workspace = "/workspace"
         
+        # Verify Docker daemon is reachable before attempting container execution
+        try:
+            daemon_check = subprocess.run([docker_bin, "info"], capture_output=True, text=True, timeout=4)
+            if daemon_check.returncode != 0:
+                err_detail = (daemon_check.stderr or "").strip()[:200]
+                msg = f"[OpenSandbox] Docker daemon is not accessible: {err_detail}. Container launch aborted."
+                log(f"🚫 {msg}")
+                raise RuntimeError(msg)
+        except subprocess.TimeoutExpired:
+            msg = "[OpenSandbox] Docker daemon check timed out after 4s. Container launch aborted."
+            log(f"🚫 {msg}")
+            raise RuntimeError(msg)
+
         volumes = [f"{self.cwd}:{container_workspace}"]
         if self.allowed_paths:
             for idx, path in enumerate(self.allowed_paths):
@@ -1859,18 +2171,20 @@ class OpenSandboxJailer(BaseJailer):
         ]
         
         # Check if gVisor (runsc) is available in docker info
-        if use_gvisor:
+        if use_gvisor or require_gvisor:
             has_runsc = False
-            try:
-                res = subprocess.run([docker_bin, "info"], capture_output=True, text=True, timeout=3)
-                if "runsc" in res.stdout or "gvisor" in res.stdout:
-                    has_runsc = True
-            except Exception:
-                pass
+            combined = (daemon_check.stdout + (daemon_check.stderr or "")).lower()
+            if "runsc" in combined or "gvisor" in combined:
+                has_runsc = True
                 
             if has_runsc:
                 docker_cmd.extend(["--runtime", "runsc"])
                 log(f"🛡️ [OpenSandbox] Using gVisor (runsc) runtime for kernel-level virtualization.")
+            elif require_gvisor:
+                # FAIL-CLOSED: gVisor was explicitly required but is not available
+                msg = "[OpenSandbox] gVisor (runsc) runtime is required by OPENSANDBOX_REQUIRE_GVISOR but not configured in Docker. Aborting."
+                log(f"🚫 {msg}")
+                raise RuntimeError(msg)
             else:
                 log(f"⚠️ [OpenSandbox] gVisor (runsc) runtime not configured in Docker. Falling back to standard container sandbox.")
                 
@@ -1915,6 +2229,11 @@ class JailFactory:
         if os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER", "false").lower() == "true":
             return BaseJailer(provider_name, cwd, env, allowed_paths)
 
+        # Docker Desktop's Linux containers cannot bind-mount Windows paths reliably
+        # for stdio MCP providers; use the restricted Windows process jail instead.
+        if sys.platform == 'win32':
+            return WindowsJailer(provider_name, cwd, env, allowed_paths)
+
         # 1. OpenSandbox is the primary cross-platform isolated runtime on host machines
         if shutil.which("docker"):
             return OpenSandboxJailer(provider_name, cwd, env, allowed_paths)
@@ -1928,9 +2247,6 @@ class JailFactory:
             if landlock:
                 return LandlockJailer(provider_name, cwd, env, allowed_paths)
         
-        if sys.platform == 'win32':
-            return WindowsJailer(provider_name, cwd, env, allowed_paths)
-            
         return BaseJailer(provider_name, cwd, env, allowed_paths)
 
 def launch_sandboxed_node(cmd, cwd, env, allowed_paths=None, provider_name="unknown"):
@@ -2032,7 +2348,7 @@ _cached_dynamic_bundle = None
 
 def fetch_dynamic_svid_from_agent(target_spiffe_id: str) -> dict | None:
     """
-    Queries the running SPIRE Agent inside Docker container under isolated UID 1001.
+    Fetches this process's X.509-SVID directly from the SPIRE Workload API.
     Returns a dict with {"cert_pem": str, "private_key_pem": str, "bundle_pem": str}
     or None if the agent is not reachable or the identity is not issued.
     """
@@ -2040,70 +2356,114 @@ def fetch_dynamic_svid_from_agent(target_spiffe_id: str) -> dict | None:
     import json
     import sys
     try:
-        # Execute the spire-agent fetch CLI inside the container under UID 1001 isolation
-        cmd = ["docker", "exec", "-u", "1001", "spire-agent", "/opt/spire/bin/spire-agent", "api", "fetch", "x509", "-output", "json"]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        socket_path = os.getenv("SPIRE_AGENT_SOCKET", "/run/spire/sockets/agent.sock")
+        spire_agent_cli = os.getenv("SPIRE_AGENT_CLI_PATH", "/usr/local/bin/spire-agent")
+        cmd = [
+            spire_agent_cli,
+            "api",
+            "fetch",
+            "x509",
+            "-socketPath",
+            socket_path,
+            "-output",
+            "json",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
-            return None
+            raise RuntimeError(result.stderr.strip() or "SPIRE Workload API fetch failed")
         
         data = json.loads(result.stdout)
         svids = data.get("svids", [])
-        if svids:
-            # SPIRE guarantees exactly 1 SVID is returned under UID 1001 isolation!
-            svid = svids[0]
-            if svid.get("spiffe_id") == target_spiffe_id:
-                # Convert base64 DER to PEM format
-                def to_pem(b64_str: str, header: str, footer: str) -> str:
-                    body = b64_str.strip()
-                    chunks = [body[i:i+64] for i in range(0, len(body), 64)]
-                    return f"-----BEGIN {header}-----\n" + "\n".join(chunks) + f"\n-----END {header}-----\n"
+        svid = next(
+            (item for item in svids if item.get("spiffe_id") == target_spiffe_id),
+            None,
+        )
+        if not svid:
+            return None
 
-                def split_der_certs(der_data: bytes) -> list[bytes]:
-                    certs = []
-                    offset = 0
-                    while offset < len(der_data):
-                        if der_data[offset] != 0x30:
-                            break
-                        length_byte = der_data[offset + 1]
-                        if length_byte & 0x80 == 0:
-                            length = length_byte
-                            header_len = 2
-                        else:
-                            num_bytes = length_byte & 0x7f
-                            length = 0
-                            for i in range(num_bytes):
-                                length = (length << 8) | der_data[offset + 2 + i]
-                            header_len = 2 + num_bytes
-                        
-                        cert_len = header_len + length
-                        certs.append(der_data[offset : offset + cert_len])
-                        offset += cert_len
-                    return certs
+        import base64
 
-                cert_pem = to_pem(svid.get("x509_svid"), "CERTIFICATE", "CERTIFICATE")
-                key_pem = to_pem(svid.get("x509_svid_key"), "PRIVATE KEY", "PRIVATE KEY")
-                
-                bundle_b64 = svid.get("bundle")
-                try:
-                    import base64
-                    der_bytes = base64.b64decode(bundle_b64)
-                    der_certs = split_der_certs(der_bytes)
-                    bundle_pems = []
-                    for cert_der in der_certs:
-                        c_b64 = base64.b64encode(cert_der).decode("utf-8")
-                        bundle_pems.append(to_pem(c_b64, "CERTIFICATE", "CERTIFICATE"))
-                    bundle_pem = "".join(bundle_pems)
-                except Exception:
-                    bundle_pem = to_pem(bundle_b64, "CERTIFICATE", "CERTIFICATE")
-                
-                return {
-                    "cert_pem": cert_pem,
-                    "private_key_pem": key_pem,
-                    "bundle_pem": bundle_pem,
-                    "spiffe_id": target_spiffe_id
-                }
+        def to_pem(der_data: bytes, label: str) -> str:
+            body = base64.b64encode(der_data).decode("ascii")
+            chunks = [body[i:i + 64] for i in range(0, len(body), 64)]
+            return (
+                f"-----BEGIN {label}-----\n"
+                + "\n".join(chunks)
+                + f"\n-----END {label}-----\n"
+            )
+
+        def split_der_certs(der_data: bytes) -> list[bytes]:
+            certs = []
+            offset = 0
+            while offset < len(der_data):
+                if offset + 2 > len(der_data) or der_data[offset] != 0x30:
+                    raise ValueError("Invalid DER certificate bundle")
+                length_byte = der_data[offset + 1]
+                if length_byte & 0x80 == 0:
+                    length = length_byte
+                    header_len = 2
+                else:
+                    num_bytes = length_byte & 0x7f
+                    if num_bytes == 0 or offset + 2 + num_bytes > len(der_data):
+                        raise ValueError("Invalid DER certificate length")
+                    length = int.from_bytes(
+                        der_data[offset + 2:offset + 2 + num_bytes],
+                        byteorder="big",
+                    )
+                    header_len = 2 + num_bytes
+
+                cert_end = offset + header_len + length
+                if cert_end > len(der_data):
+                    raise ValueError("Truncated DER certificate bundle")
+                certs.append(der_data[offset:cert_end])
+                offset = cert_end
+            return certs
+
+        cert_der = base64.b64decode(svid["x509_svid"], validate=True)
+        key_der = base64.b64decode(svid["x509_svid_key"], validate=True)
+        bundle_der = base64.b64decode(svid["bundle"], validate=True)
+        cert_pem = to_pem(cert_der, "CERTIFICATE")
+        key_pem = to_pem(key_der, "PRIVATE KEY")
+        bundle_pem = "".join(
+            to_pem(cert, "CERTIFICATE") for cert in split_der_certs(bundle_der)
+        )
+
+        from cryptography import x509 as _x509
+        from cryptography.hazmat.backends import default_backend
+
+        svid_cert = _x509.load_pem_x509_certificate(
+            cert_pem.encode("ascii"), default_backend()
+        )
+        san = svid_cert.extensions.get_extension_for_class(
+            _x509.SubjectAlternativeName
+        )
+        spiffe_uris = [
+            uri for uri in san.value.get_values_for_type(
+                _x509.UniformResourceIdentifier
+            )
+            if uri.startswith("spiffe://")
+        ]
+        if target_spiffe_id not in spiffe_uris:
+            raise ValueError("Fetched SVID certificate URI SAN does not match its SPIFFE ID")
+
+        ca_certs = load_all_pem_certs(bundle_pem)
+        if not ca_certs:
+            raise ValueError("SPIRE returned an empty X.509 trust bundle")
+        verify_signature_against_cas(svid_cert, ca_certs)
+
+        import datetime as _dt
+        now = _dt.datetime.utcnow()
+        if now < svid_cert.not_valid_before or now > svid_cert.not_valid_after:
+            raise ValueError("SPIRE returned an expired or not-yet-valid SVID")
+
+        return {
+            "cert_pem": cert_pem,
+            "private_key_pem": key_pem,
+            "bundle_pem": bundle_pem,
+            "spiffe_id": target_spiffe_id,
+        }
     except Exception as e:
-        print(f"[SPIRE] Failed to fetch dynamic SVID from agent container (UID 1001): {e}", file=sys.stderr)
+        print(f"[SPIRE] Workload API SVID fetch failed: {e}", file=sys.stderr)
     return None
 
 
@@ -2156,30 +2516,26 @@ def decode_header_cert(cert_val: str) -> str:
 def get_spiffe_headers(incoming_headers: dict = None) -> dict:
     import urllib.parse
     headers = {}
-    spiffe_id = None
+    spiffe_id = os.getenv("SPIFFE_BRIDGE_ID", "spiffe://runtime-shield/bridge")
     cert_pem = None
-    
-    if incoming_headers:
-        spiffe_id = incoming_headers.get("X-SPIFFE-ID") or incoming_headers.get("x-spiffe-id")
-        cert_pem = incoming_headers.get("X-SPIFFE-CERT") or incoming_headers.get("x-spiffe-cert")
-        if cert_pem:
-            cert_pem = decode_header_cert(cert_pem)
-            
+
+    # Outbound calls use this gateway's identity, not the inbound caller's identity.
     is_dev_mode = os.getenv("LOCAL_DEV_MODE", "false").lower() == "true"
     
-    # Try dynamic fetch via SPIRE agent CLI inside docker container
-    if not cert_pem:
-        target_id = spiffe_id or os.getenv("SPIFFE_BRIDGE_ID", "spiffe://runtime-shield/bridge")
-        res = fetch_dynamic_svid_from_agent(target_id)
-        if res:
-            cert_pem = res["cert_pem"]
-            spiffe_id = res["spiffe_id"]
-            log(f"✅ Dynamic SVID fetched successfully from SPIRE Agent for {spiffe_id} [SPIFFE_SOURCE=workload_api]")
-        else:
-            log("⚠️ Dynamic SVID fetch failed. Trying local static certificate fallback...")
-
-    if not spiffe_id:
-        spiffe_id = os.getenv("SPIFFE_BRIDGE_ID", "spiffe://runtime-shield/bridge")
+    res = fetch_dynamic_svid_from_agent(spiffe_id)
+    if res:
+        cert_pem = res["cert_pem"]
+        spiffe_id = res["spiffe_id"]
+        log(
+            f"✅ Runtime Shield SPIFFE identity source=live_spire_svid "
+            f"identity={spiffe_id}"
+        )
+    else:
+        log(
+            "⚠️ Runtime Shield SPIFFE live SVID unavailable; "
+            "trying static certificate fallback "
+            f"[SPIFFE_SOURCE=static_fallback] identity={spiffe_id}"
+        )
         
     if not cert_pem:
         # Check env path first, then default directory
@@ -2192,7 +2548,10 @@ def get_spiffe_headers(incoming_headers: dict = None) -> dict:
             try:
                 with open(bridge_crt_path, "r", encoding="utf-8") as f:
                     cert_pem = f.read()
-                log(f"✅ SVID loaded from disk: {bridge_crt_path}")
+                log(
+                    f"✅ Runtime Shield SPIFFE identity source=static_fallback "
+                    f"identity={spiffe_id} path={bridge_crt_path}"
+                )
             except Exception:
                 pass
                 
@@ -2458,7 +2817,7 @@ def verify_svid_cryptographically(spiffe_id: str, cert_pem: str | None = None) -
     if not cert_pem:
         fallback_allowed = os.getenv("SPIFFE_HEADER_ONLY_FALLBACK", "false").lower() == "true"
         if fallback_allowed:
-            if spiffe_allowed(spiffe_id):
+            if spiffe_id in get_allowed_spiffe_ids():
                 return {"valid": True, "reason": f"SVID verified via header-only fallback: {spiffe_id}"}
             else:
                 return {"valid": False, "reason": f"Header-only fallback rejected: '{spiffe_id}' is not in allowlist"}
@@ -2468,24 +2827,27 @@ def verify_svid_cryptographically(spiffe_id: str, cert_pem: str | None = None) -
         from cryptography import x509 as _x509
         from cryptography.hazmat.backends import default_backend
 
-        # Try to retrieve the latest CA trust bundle dynamically from the SPIRE Agent first
+        # Trust both configured roots: live SPIRE SVIDs and local static SVIDs
+        # may be issued by different CAs during development or rotation.
+        ca_certs = []
         dynamic_bundle_pem = get_dynamic_trust_bundle()
         if dynamic_bundle_pem:
-            ca_certs = load_all_pem_certs(dynamic_bundle_pem)
-            log("🔒 [SPIFFE] Live CA Trust Bundle resolved dynamically from SPIRE Agent [SPIFFE_SOURCE=workload_api]")
-        else:
-            _certs_dir = os.path.join(PROJECT_DIR, "spire", "certs")
-            ca_bundle = os.path.join(_certs_dir, "ca.crt")
-            if not os.path.exists(ca_bundle):
-                return {"valid": False, "reason": "Security Violation: SPIFFE CA bundle is missing or unavailable on disk. Cryptographic attestation required."}
+            dynamic_ca_certs = load_all_pem_certs(dynamic_bundle_pem)
+            ca_certs.extend(dynamic_ca_certs)
+            if dynamic_ca_certs:
+                log("🔒 [SPIFFE] Live CA Trust Bundle resolved dynamically from SPIRE Agent [SPIFFE_SOURCE=workload_api]")
 
+        _certs_dir = os.path.join(PROJECT_DIR, "spire", "certs")
+        ca_bundle = os.path.join(_certs_dir, "ca.crt")
+        if os.path.exists(ca_bundle):
             with open(ca_bundle, "r", encoding="utf-8") as f:
-                ca_pem_data = f.read()
-            ca_certs = load_all_pem_certs(ca_pem_data)
-            log("⚠️ [SPIFFE] Falling back to static CA trust bundle from disk [SPIFFE_SOURCE=local_svid]")
+                static_ca_certs = load_all_pem_certs(f.read())
+            ca_certs.extend(static_ca_certs)
+            if static_ca_certs:
+                log("🔒 [SPIFFE] Static CA Trust Bundle loaded from disk [SPIFFE_SOURCE=local_svid]")
 
         if not ca_certs:
-            return {"valid": False, "reason": "Security Violation: No valid CA certificates found in trust bundle."}
+            return {"valid": False, "reason": "Security Violation: No valid CA certificates found in configured trust bundles."}
 
         svid_cert = _x509.load_pem_x509_certificate(cert_pem.encode(), default_backend())
 
@@ -2583,17 +2945,14 @@ def spiffe_allowed(spiffe_id: str) -> bool:
 class JWTVerifier:
     def __init__(self, jwks_url):
         self.jwks_url = jwks_url
-        # PyJWKClient handles fetching and caching the keys dynamically from the JWKS endpoint
-        # Use ssl_context to disable SSL certificate verification in dev/sandbox environments
         import ssl
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
+        ca_bundle = os.getenv("KEYCLOAK_CA_BUNDLE")
+        ssl_context = ssl.create_default_context(cafile=ca_bundle or None)
         self.jwk_client = jwt.PyJWKClient(self.jwks_url, ssl_context=ssl_context)
         
         # Setup Google JWK client dynamically to verify Google OIDC tokens
         self.google_jwks_url = "https://www.googleapis.com/oauth2/v3/certs"
-        self.google_jwk_client = jwt.PyJWKClient(self.google_jwks_url, ssl_context=ssl_context)
+        self.google_jwk_client = jwt.PyJWKClient(self.google_jwks_url)
         
         self.trusted_providers = []
         try:
@@ -2616,6 +2975,8 @@ class JWTVerifier:
                     unverified_header = jwt.get_unverified_header(token)
                     alg = unverified_header.get("alg")
                     if alg == "HS256":
+                        if os.getenv("LOCAL_DEV_MODE", "false").lower() != "true":
+                            return None
                         decoded = jwt.decode(
                             token,
                             "secret",
@@ -2642,17 +3003,7 @@ class JWTVerifier:
                         )
                         log(f"✅ Google OIDC Token Verified via JWKS for user: {decoded.get('email', 'unknown')}")
                     
-                    # Apply Google OIDC mapping
-                    google_admin_emails_raw = os.getenv("GOOGLE_ADMIN_EMAILS", "admin@deeptrustxai.com,admin@example.com")
-                    google_admins = [email.strip().lower() for email in google_admin_emails_raw.split(",")]
-                    
                     email = decoded.get("email", "").lower()
-                    if email in google_admins or (decoded.get("email_verified") and email in google_admins):
-                        decoded["roles"] = ["admin"]
-                        decoded["groups"] = ["Administrators"]
-                    else:
-                        decoded["roles"] = ["user"]
-                        decoded["groups"] = ["Normal-Users"]
                     decoded["preferred_username"] = email or decoded.get("name") or decoded.get("sub")
                     return decoded
             except Exception as google_ex:
@@ -2664,7 +3015,8 @@ class JWTVerifier:
                 
                 kc_url = os.getenv("KEYCLOAK_URL", "http://127.0.0.1:8080")
                 kc_realm = os.getenv("KEYCLOAK_REALM", "master")
-                expected_iss = f"{kc_url}/realms/{kc_realm}"
+                issuer_base = os.getenv("KEYCLOAK_ISSUER_URL", kc_url).rstrip("/")
+                expected_iss = f"{issuer_base}/realms/{kc_realm}"
                 
                 if iss and iss != expected_iss:
                     is_trusted = False
@@ -2673,6 +3025,8 @@ class JWTVerifier:
                             is_trusted = True
                             log(f"🔑 XAA: Found matching trusted identity provider for issuer '{iss}'")
                             try:
+                                if os.getenv("LOCAL_DEV_MODE", "false").lower() != "true":
+                                    return None
                                 decoded = jwt.decode(
                                     token,
                                     "secret",
@@ -2707,6 +3061,8 @@ class JWTVerifier:
                 unverified_header = jwt.get_unverified_header(token)
                 alg = unverified_header.get("alg")
                 if alg == "HS256":
+                    if os.getenv("LOCAL_DEV_MODE", "false").lower() != "true":
+                        return None
                     decoded = jwt.decode(
                         token,
                         "secret",
@@ -2723,19 +3079,20 @@ class JWTVerifier:
             
             kc_url = os.getenv("KEYCLOAK_URL", "http://127.0.0.1:8080")
             kc_realm = os.getenv("KEYCLOAK_REALM", "master")
-            client_id = os.getenv("KEYCLOAK_CLIENT_ID", "admin-cli")
-            expected_iss = f"{kc_url}/realms/{kc_realm}"
+            issuer_base = os.getenv("KEYCLOAK_ISSUER_URL", kc_url).rstrip("/")
+            expected_iss = f"{issuer_base}/realms/{kc_realm}"
 
-            # PyJWT automatically verifies signature, expiration (exp), audience (aud), and issuer (iss)
+            # Validate the signature, expiry, and issuer against the configured Keycloak realm.
             decoded = jwt.decode(
                 token,
                 signing_key.key,
                 algorithms=["RS256"],
+                issuer=expected_iss,
                 options={
                     "verify_signature": True,
                     "verify_exp": True,
                     "verify_aud": False,
-                    "verify_iss": False
+                    "verify_iss": True
                 }
             )
             log(f"✅ Keycloak JWT Signature and Claims Verified via JWKS for user: {decoded.get('preferred_username', 'unknown')}")
@@ -2743,10 +3100,14 @@ class JWTVerifier:
             # Fetch UserInfo if username or groups are missing from access token (lightweight token handling)
             if not decoded.get("preferred_username") or "groups" not in decoded:
                 try:
-                    userinfo_url = f"{kc_url.rstrip('/')}/realms/{kc_realm}/protocol/openid-connect/userinfo"
-                    import urllib3
-                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-                    ui_resp = requests.get(userinfo_url, headers={"Authorization": f"Bearer {token}"}, timeout=3.0, verify=False)
+                    userinfo_base = os.getenv("KEYCLOAK_ISSUER_URL", kc_url).rstrip("/")
+                    userinfo_url = f"{userinfo_base}/realms/{kc_realm}/protocol/openid-connect/userinfo"
+                    ui_resp = requests.get(
+                        userinfo_url,
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=3.0,
+                        verify=os.getenv("KEYCLOAK_CA_BUNDLE") or True,
+                    )
                     if ui_resp.status_code == 200:
                         ui_claims = ui_resp.json()
                         for k, v in ui_claims.items():
@@ -2779,8 +3140,10 @@ class JITTokenManager:
             unverified_claims = jwt.decode(user_token, options={"verify_signature": False, "verify_exp": False, "verify_aud": False})
             iss = unverified_claims.get("iss", "")
             
-            # If Google OIDC, federated SSO, or HS256 token -> downscope directly
-            if alg == "HS256" or "accounts.google.com" in iss or "external-idp" in iss:
+            # Mock downscoping is permitted only in explicitly enabled local development.
+            if os.getenv("LOCAL_DEV_MODE", "false").lower() == "true" and (
+                alg == "HS256" or "accounts.google.com" in iss or "external-idp" in iss
+            ):
                 jit_claims = unverified_claims.copy()
                 jit_claims["scope"] = required_scope or "openid"
                 jit_claims["exp"] = time.time() + 60
@@ -2802,15 +3165,13 @@ class JITTokenManager:
         }
         
         try:
-            import urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             resp = requests.post(
                 self.url, 
                 data=data, 
                 auth=(self.client_id, self.client_secret),
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 timeout=5,
-                verify=False
+                verify=os.getenv("KEYCLOAK_CA_BUNDLE") or True,
             )
             
             if resp.status_code == 200:
@@ -2818,33 +3179,30 @@ class JITTokenManager:
                 jit_token = token_data.get("access_token")
                 if jit_token:
                     ttl = token_data.get("expires_in", 60)
-                    log(f"🎟️ JIT Token Issued Successfully: {jit_token[:15]}... (TTL: {ttl}s)")
+                    log(f"🎟️ JIT Token Issued Successfully (TTL: {ttl}s)")
                     return jit_token
-            else:
-                log(f"⚠️ Keycloak JIT Token Exchange returned HTTP {resp.status_code}: {resp.text}. Generating downscoped JIT token from verified session...")
+                raise RuntimeError("Keycloak JIT token exchange returned no access token")
+            error_detail = resp.json().get("error_description", resp.text)
+            raise RuntimeError(
+                f"Keycloak JIT token exchange returned HTTP {resp.status_code}: {error_detail}"
+            )
         except Exception as net_err:
-            log(f"⚠️ Keycloak JIT exchange request error: {net_err}. Generating downscoped JIT token from verified session...")
-
-        # 3. Fallback: generate signed downscoped token from the verified session claims
-        try:
-            unverified_claims = jwt.decode(user_token, options={"verify_signature": False, "verify_exp": False, "verify_aud": False})
-            jit_claims = unverified_claims.copy()
-            jit_claims["scope"] = required_scope or "openid"
-            jit_claims["exp"] = time.time() + 60
-            fallback_jit = jwt.encode(jit_claims, "secret", algorithm="HS256")
-            log(f"🎟️ JIT Fallback Token Issued for Scope '{required_scope}'")
-            return fallback_jit
-        except Exception as fallback_err:
-            raise RuntimeError(f"Could not issue JIT token: {fallback_err}")
+            if isinstance(net_err, RuntimeError):
+                raise
+            raise RuntimeError(f"Keycloak JIT token exchange request failed: {net_err}") from net_err
 
 # Global Identity Managers
 kc_url = os.getenv("KEYCLOAK_URL") or "http://keycloak:8080"
 kc_realm = os.getenv("KEYCLOAK_REALM") or "master"
 client_id = os.getenv("KEYCLOAK_CLIENT_ID") or "runtime-shield-jit"
-client_secret = os.getenv("KEYCLOAK_CLIENT_SECRET") or os.getenv("RUNTIME_SHIELD_JIT_CLIENT_SECRET") or "vsIwGjbvAqpk1tdDeZGEUZAaFPR0ItG3"
+client_secret = (
+    os.getenv("RUNTIME_SHIELD_JIT_CLIENT_SECRET")
+    or os.getenv("KEYCLOAK_CLIENT_SECRET")
+    or ""
+)
 
-if not os.getenv("KEYCLOAK_CLIENT_SECRET") and not os.getenv("RUNTIME_SHIELD_JIT_CLIENT_SECRET"):
-    log("⚠️ KEYCLOAK_CLIENT_SECRET not explicitly passed via environment. Using standard client fallback.")
+if not client_secret:
+    log("⚠️ Keycloak JIT client secret is not configured; token exchange will fail closed.")
 
 jwks_url = f"{kc_url}/realms/{kc_realm}/protocol/openid-connect/certs"
 token_url = f"{kc_url}/realms/{kc_realm}/protocol/openid-connect/token"
@@ -2959,23 +3317,26 @@ def is_scope_allowed(required_scope, token_scopes):
         return True
     return required_scope in token_scopes
 
-def resolve_userid_by_sub(sub: str) -> str:
-    """Look up userId in the sqlite database using the keycloak_sub claim."""
-    if not sub:
-        return "1"  # Default fallback
+def resolve_userid_by_sub(sub: str, username: str = "") -> str:
+    """Look up a demo transaction user by Keycloak subject, then username."""
     db_path = os.path.join(PROJECT_DIR, "damn-vulnerable-llm-agent", "transactions.db")
     try:
         import sqlite3
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT userId FROM Users WHERE keycloak_sub = ?", (sub,))
-        row = cursor.fetchone()
+        row = None
+        if sub:
+            cursor.execute("SELECT userId FROM Users WHERE keycloak_sub = ?", (sub,))
+            row = cursor.fetchone()
+        if not row and username:
+            cursor.execute("SELECT userId FROM Users WHERE lower(username) = lower(?)", (username,))
+            row = cursor.fetchone()
         conn.close()
         if row:
             return str(row[0])
     except Exception as e:
-        log(f"⚠️ Error resolving userId by sub '{sub}': {e}")
-    return "1"  # Default fallback
+        log(f"⚠️ Error resolving demo transaction user: {e}")
+    return ""
 
 
 
@@ -2985,7 +3346,337 @@ def resolve_userid_by_sub(sub: str) -> str:
 
 async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, user_sub: str = ""):
     messages = body.get("messages", [])
-    
+    user_prompts = [msg.get("content", "") or "" for msg in messages if msg.get("role") == "user"]
+    latest_prompt = user_prompts[-1] if user_prompts else ""
+    prompt_lower = latest_prompt.lower()
+    is_title_generation_request = (
+        prompt_lower.startswith("provide a concise, ")
+        and " title for the conversation" in prompt_lower
+        and "\n\nconversation:" in prompt_lower
+    )
+    if is_title_generation_request:
+        title = "HITL File Write Test" if "secure-experiment-zone/" in prompt_lower else "New Conversation"
+        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
+        model_name = body.get("model", "runtime-shield-agent")
+        if body.get("stream"):
+            async def title_chunks():
+                for chunk in (
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": title},
+                            "finish_reason": None,
+                        }],
+                    },
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    },
+                ):
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(title_chunks(), media_type="text/event-stream")
+
+        return JSONResponse(content={
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": title},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        })
+
+    is_write_request = not is_title_generation_request and (
+        "write_file" in prompt_lower
+        or ("secure-experiment-zone/" in prompt_lower and re.search(r"\b(write|create|save)\b", prompt_lower))
+    )
+
+    if is_write_request:
+        available_tools = []
+        for tool in body.get("tools", []):
+            function = tool.get("function", {}) if isinstance(tool, dict) else {}
+            name = function.get("name", "")
+            if isinstance(name, str):
+                normalized_name = name.lower().replace("-", "_")
+                if normalized_name == "write_file" or normalized_name.startswith("write_file_mcp_"):
+                    available_tools.append(name)
+
+        path_match = re.search(r"(secure-experiment-zone[/\\][\w./\\-]+)", latest_prompt, re.IGNORECASE)
+        target_path = path_match.group(1).rstrip(".,;:") if path_match else ""
+        inline_content_match = re.search(
+            r"with (?:exactly this|the following) content\s*:\s*(?:`(?P<backtick>[^`]*)`|\"(?P<double>[^\"]*)\"|'(?P<single>[^']*)')",
+            latest_prompt,
+            re.IGNORECASE,
+        )
+        if inline_content_match:
+            requested_content = next(
+                content
+                for content in inline_content_match.groupdict().values()
+                if content is not None
+            )
+        else:
+            content_match = re.search(
+                r"with (?:exactly this|the following) content\s*:\s*\r?\n([\s\S]*)",
+                latest_prompt,
+                re.IGNORECASE,
+            )
+            if content_match:
+                requested_content = content_match.group(1).rstrip("\r\n")
+            else:
+                content_match = re.search(
+                    r"with (?:exactly this|the following) content\s*:\s*([^\r\n]+)",
+                    latest_prompt,
+                    re.IGNORECASE,
+                )
+                if content_match:
+                    requested_content = content_match.group(1).strip().rstrip(".")
+                else:
+                    content_match = re.search(
+                        r"with the text\s+([\"'])(.*?)\1",
+                        latest_prompt,
+                        re.IGNORECASE | re.DOTALL,
+                    )
+                    if content_match:
+                        requested_content = content_match.group(2)
+                    else:
+                        content_match = re.search(
+                            r"with the text\s+(.+?)\s*[.!?]?\s*$",
+                            latest_prompt,
+                            re.IGNORECASE | re.DOTALL,
+                        )
+                        requested_content = content_match.group(1).strip() if content_match else None
+
+        normalized_target = target_path.replace("\\", "/").strip("/")
+        latest_user_index = max(
+            (index for index, message in enumerate(messages) if message.get("role") == "user"),
+            default=-1,
+        )
+        matching_write_call_ids = set()
+        for message in messages[latest_user_index + 1:]:
+            if message.get("role") != "assistant":
+                continue
+            for tool_call in message.get("tool_calls", []):
+                function = tool_call.get("function", {})
+                tool_name = function.get("name", "").lower().replace("-", "_")
+                if tool_name != "write_file" and not tool_name.startswith("write_file_mcp_"):
+                    continue
+                try:
+                    arguments = function.get("arguments", {})
+                    if isinstance(arguments, str):
+                        arguments = json.loads(arguments)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                call_path = str(arguments.get("path", "")).replace("\\", "/").strip("/")
+                if (
+                    call_path == normalized_target
+                    and arguments.get("content") == requested_content
+                    and tool_call.get("id")
+                ):
+                    matching_write_call_ids.add(tool_call["id"])
+
+        failed_write_call = False
+        for message in messages[latest_user_index + 1:]:
+            if message.get("role") != "tool" or message.get("tool_call_id") not in matching_write_call_ids:
+                continue
+            result_content = message.get("content", "")
+            if isinstance(result_content, list):
+                result_content = " ".join(
+                    item.get("text", "") for item in result_content if isinstance(item, dict)
+                )
+            elif not isinstance(result_content, str):
+                result_content = json.dumps(result_content)
+            normalized_result = result_content.replace("\\", "/")
+            if (
+                "file written successfully" in normalized_result.lower()
+                and normalized_target in normalized_result.strip("/")
+            ):
+                success_message = f"File written successfully to /app/{normalized_target}."
+                completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+                created = int(time.time())
+                model_name = body.get("model", "runtime-shield-agent")
+                if body.get("stream"):
+                    async def completed_write_chunks():
+                        for chunk in (
+                            {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"role": "assistant", "content": success_message},
+                                    "finish_reason": None,
+                                }],
+                            },
+                            {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                            },
+                        ):
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                        yield "data: [DONE]\n\n"
+
+                    return StreamingResponse(completed_write_chunks(), media_type="text/event-stream")
+
+                return JSONResponse(content={
+                    "id": completion_id,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": success_message},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                })
+            failed_write_call = True
+
+        if failed_write_call:
+            failure_message = (
+                "The write_file tool did not complete successfully. Check its tool error; "
+                "if Keycloak authorization expired, reconnect Runtime Shield HITL and retry."
+            )
+            completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+            created = int(time.time())
+            model_name = body.get("model", "runtime-shield-agent")
+            if body.get("stream"):
+                async def failed_write_chunks():
+                    for chunk in (
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": failure_message},
+                                "finish_reason": None,
+                            }],
+                        },
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        },
+                    ):
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(failed_write_chunks(), media_type="text/event-stream")
+
+            return JSONResponse(content={
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": failure_message},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
+
+        if available_tools and target_path and requested_content is not None:
+            tool_name = available_tools[0]
+            call_id = f"call_{uuid.uuid4().hex}"
+            arguments = json.dumps({"path": target_path, "content": requested_content})
+            completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+            created = int(time.time())
+            model_name = body.get("model", "runtime-shield-agent")
+
+            if body.get("stream"):
+                async def write_tool_call_chunks():
+                    chunks = [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {"name": tool_name, "arguments": ""},
+                                }],
+                            },
+                            "finish_reason": None,
+                        },
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "function": {"arguments": arguments},
+                                }],
+                            },
+                            "finish_reason": None,
+                        },
+                        {"index": 0, "delta": {}, "finish_reason": "tool_calls"},
+                    ]
+                    for chunk in chunks:
+                        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_name, 'choices': [chunk]})}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(write_tool_call_chunks(), media_type="text/event-stream")
+
+            return JSONResponse(content={
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": tool_name, "arguments": arguments},
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
+
+        missing_requirements = []
+        if not available_tools:
+            missing_requirements.append(
+                "select the Runtime Shield HITL write_file MCP tool in this chat "
+                "or the selected LibreChat agent's tools"
+            )
+        if not target_path:
+            missing_requirements.append("include a secure-experiment-zone/ file path")
+        if requested_content is None:
+            missing_requirements.append("specify the exact file content")
+        return JSONResponse(status_code=400, content={
+            "error": {
+                "message": "Cannot submit the write for approval: " + "; ".join(missing_requirements) + ".",
+                "type": "tool_configuration_error",
+                "code": "write_file_unavailable",
+            }
+        })
+
     # Settle Turn boundaries to prevent state leakage/re-entry from previous turns in conversation history
     last_final_answer_idx = -1
     for i, msg in enumerate(messages):
@@ -3098,6 +3789,7 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
                 "reason": "Outbound PII Redacted from mock LLM response",
                 "severity": "medium",
                 "stage": "pii-redaction-outbound",
+                "pii_detected": True,
                 "timestamp": time.time()
             })
             content_text = redacted_content
@@ -3166,7 +3858,7 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
         formatted = format_final_answer(text)
         return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
 
-    target_user_id = resolve_userid_by_sub(user_sub)
+    target_user_id = resolve_userid_by_sub(user_sub, user_id)
     original_query_lower = original_query.lower()
     if any(w in original_query_lower for w in ["transaction", "show", "get", "list"]):
         has_hijacking_attempt = re.search(r'\b(user\s*id|user_?id|user)\b\s*(=?\s*\b\d+\b)', original_query_lower)
@@ -3521,8 +4213,10 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             is_greeting = True
 
     # Print debugging context
-    log(f"[DEBUG QUERY] last_prompt_lower={repr(last_prompt_lower[:120])}...")
-    log(f"[DEBUG QUERY] raw_query_lower={repr(raw_query_lower)}...")
+    log(
+        f"[DEBUG QUERY] prompt_chars={len(last_prompt_lower)}, "
+        f"query_chars={len(raw_query_lower)}"
+    )
     log(f"[DEBUG QUERY] is_list_query={is_list_query} (called={list_dir_called}), is_file_query={is_file_query} (called={read_file_called}), is_keycloak_list_query={is_keycloak_list_query} (called={keycloak_list_called}), is_keycloak_revoke_query={is_keycloak_revoke_query} (called={keycloak_revoke_called})")
     
     if is_fetch_url_query:
@@ -3682,6 +4376,7 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
                     target_path = file_match.group(1).strip()
                 else:
                     target_path = original_query.strip().split()[-1]
+            target_path = target_path.replace("\\", "/").strip()
             
             # Policy evaluation via active_policy_engine
             pol_inp = {
@@ -3705,17 +4400,21 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
                     "stage": "policy-engine",
                     "timestamp": time.time()
                 })
-                real_content = ""
                 try:
-                    clean_p = target_path.lstrip("./").lstrip("/")
-                    fp = os.path.join(PROJECT_DIR, clean_p)
-                    if os.path.exists(fp):
-                        with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-                            real_content = f.read()
+                    file_path = resolve_workspace_file_path(target_path)
+                    if file_path.is_file():
+                        real_content = file_path.read_text(encoding="utf-8", errors="ignore")
                     else:
-                        real_content = "# Research Notes: Meridian Experiment Zone\n\nProject: Neural Shield Protocol\nStatus: Active\nLead: Anika Sharma\nNotes: Security telemetry and OPA RE2 authorization verified."
-                except Exception as ex:
-                    real_content = f"Error reading file: {ex}"
+                        real_content = f"File not found: {target_path}"
+                    real_content = redact_outbound_pii(
+                        real_content,
+                        user_role,
+                        user_id,
+                        "read_file",
+                    )
+                except (OSError, ValueError) as exc:
+                    log(f"File read rejected or failed ({type(exc).__name__})")
+                    real_content = "Unable to read the requested file within the project workspace."
                 text = f"📄 **File Contents (`{target_path}`)**:\n\n```\n{real_content}\n```"
             else:
                 reason = pol_dec.get("reason", "Security violation: Potential directory traversal detected.")
@@ -3761,7 +4460,12 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             formatted = format_action("ReadFile", target_path)
             return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
         else:
-            tool_output = read_file_output or ""
+            tool_output = redact_outbound_pii(
+                read_file_output or "",
+                user_role,
+                user_id,
+                "read_file",
+            )
             if "Security Violation:" in tool_output or "Access Denied" in tool_output:
                 text = f"Blocked by Security Gateway: {tool_output}"
             else:
@@ -4229,10 +4933,50 @@ async def chat_completions_proxy(request: Request):
 
     # Diagnostic Log (User Step 1)
     incoming_headers = dict(request.headers)
-    log(f"📋 [Proxy Ingress] Incoming completions request headers: {incoming_headers}")
+    safe_headers = {
+        key: "[REDACTED]" if key.lower() in {"authorization", "x-shield-token", "cookie", "x-spiffe-cert"} else value
+        for key, value in incoming_headers.items()
+    }
+    log(f"📋 [Proxy Ingress] Incoming completions request headers: {safe_headers}")
 
     # Reload environment to pick up persona shifts dynamically
     load_env_safe()
+
+    gateway_api_key = os.getenv("RUNTIME_SHIELD_GATEWAY_API_KEY", "")
+    if not is_gateway_api_key_configured(gateway_api_key):
+        log("Gateway API authentication is not configured; rejecting completions request.")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": "Gateway API authentication is not configured.",
+                    "type": "authentication_error",
+                    "code": "gateway_auth_not_configured",
+                }
+            },
+        )
+
+    presented_api_key = extract_bearer_token(request.headers.get("Authorization"))
+    if not gateway_api_key_matches(gateway_api_key, presented_api_key):
+        dashboard_state.add_event({
+            "action": "block",
+            "tool": "chat_completion",
+            "agent": "llm-agent",
+            "reason": "Missing or invalid gateway API credential",
+            "severity": "high",
+            "stage": "api-auth",
+            "timestamp": time.time(),
+        })
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": {
+                    "message": "A valid gateway API credential is required.",
+                    "type": "authentication_error",
+                    "code": "invalid_gateway_api_key",
+                }
+            },
+        )
 
     env_role = os.getenv("RUNTIME_ROLE", "user").strip().lower().replace("'", "").replace('"', '')
 
@@ -4313,14 +5057,17 @@ async def chat_completions_proxy(request: Request):
             log(f"📋 [COMPLETIONS TOOLSCOUNT]: {len(body['tools'])}")
             log(f"📋 [COMPLETIONS TOOLS NAMES]: {[t.get('function', {}).get('name') for t in body['tools']]}")
         if "messages" in body:
-            log(f"📋 [COMPLETIONS MESSAGES]: {body['messages']}")
+            log(
+                f"📋 [COMPLETIONS MESSAGES]: "
+                f"count={len(body['messages'])}, "
+                f"roles={[message.get('role') for message in body['messages']]}"
+            )
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     # 2. Extract JWT and verify identity/role
-    auth_header = request.headers.get("Authorization")
     shield_header = request.headers.get("X-Shield-Token")
-    token = shield_header or auth_header
+    token = shield_header
     if token and token.startswith("Bearer "):
         token = token[7:]
 
@@ -4335,22 +5082,12 @@ async def chat_completions_proxy(request: Request):
 
     if token:
         try:
-            log(f"DEBUG PROXY RECEIVED TOKEN: {repr(token)}")
+            log("🔑 Proxy received a bearer token; validating identity claims.")
             claims = get_token_claims(token)
             user_id = claims.get("preferred_username") or claims.get("sub") or "anonymous_user"
             user_sub = claims.get("sub") or ""
             log(f"JWT SUB: {user_sub}")
-            roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
-            groups = claims.get("groups", []) or []
-            scopes = claims.get("scope", "")
-            if isinstance(scopes, str):
-                scopes = scopes.split(" ")
-            if "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
-                user_role = "admin"
-            elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
-                user_role = "privileged"
-            else:
-                user_role = "user"
+            user_role = role_from_verified_claims(claims)
         except Exception as e:
             log(f"⚠️ Proxy failed to decode JWT token: {e}")
 
@@ -4411,11 +5148,15 @@ async def chat_completions_proxy(request: Request):
                 "reason": "Inbound PII Redacted (Email/SSN/Phone/CC)",
                 "severity": "medium",
                 "stage": "pii-redaction-inbound",
+                "pii_detected": True,
                 "timestamp": time.time()
             })
 
     user_content = "\n".join([m.get("content", "") for m in messages if m.get("role") == "user"])
-    log(f"User Prompt: {user_content}")
+    log(
+        f"Inbound prompt processed (chars={len(user_content)}, "
+        f"pii_detected={pii_detected}, role={user_role})"
+    )
 
     # Extract only the actual user query from the latest user message
     user_messages = [m for m in messages if m.get("role") == "user"]
@@ -4430,7 +5171,59 @@ async def chat_completions_proxy(request: Request):
                 actual_user_query = sub_parts[-1].strip()
             else:
                 actual_user_query = parts[-1].strip()
-    log(f"Extracted Actual User Query for Validation: '{actual_user_query}'")
+    log(
+        "Extracted actual user query for validation "
+        f"(chars={len(actual_user_query)}, role={user_role})"
+    )
+
+    honeypot_tool = match_honeypot_prompt(actual_user_query)
+    if honeypot_tool:
+        honeypot_decision = None
+        if active_policy_engine:
+            try:
+                honeypot_decision = active_policy_engine.evaluate_policy({
+                    "user": {"id": user_id or user_sub, "role": user_role, "scopes": []},
+                    "workload": {"spiffe_id": "spiffe://runtime-shield/workload/chat-completion"},
+                    "agent": {
+                        "id": user_sub or "spiffe://runtime-shield/workload/chat-completion",
+                        "risk_score": fraud_engine_instance.agent_risk_scores.get(user_sub, 0)
+                        if fraud_engine_instance and user_sub else 0,
+                    },
+                    "mcp": {"server": "runtime-shield-honeypot", "tool": honeypot_tool, "action": "call"},
+                    "resource": {"path": ""},
+                    "request": {
+                        "contains_pii": False,
+                        "prompt_injection_detected": False,
+                        "original_args": {},
+                    },
+                })
+            except Exception as policy_error:
+                log(f"⚠️ Honeypot policy evaluation failed; enforcing local deny: {policy_error}")
+
+        configured_risk = honeypot_decision.get("risk_delta") if honeypot_decision else None
+        if not isinstance(configured_risk, int) or configured_risk <= 0:
+            configured_risk = fraud_engine_instance.HONEYPOT_PENALTY if fraud_engine_instance else 100
+        agent_id = user_sub or f"chat-user:{user_id}"
+        score, quarantined, reason = record_honeypot_attempt(
+            tool_name=honeypot_tool,
+            agent_id=agent_id,
+            user_id=user_id,
+            risk_delta=configured_risk,
+            rule_id=honeypot_decision.get("rule_id", "block-honeypots")
+            if honeypot_decision else "block-honeypots",
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "message": reason,
+                    "type": "security_violation",
+                    "code": "honeypot_triggered",
+                    "risk_score": score,
+                    "quarantined": quarantined,
+                }
+            },
+        )
 
     # 3. Inbound Security Checks: Llama Guard 4 (Jailbreak Detection)
     if nim_guard_instance and nim_guard_instance.config.get("enabled"):
@@ -4534,7 +5327,7 @@ async def chat_completions_proxy(request: Request):
     prompt_canonical_tool = None
     prompt_target_path = ""
     
-    if semantic_parser_instance:
+    if not prompt_canonical_tool and semantic_parser_instance:
         try:
             parsed_intent = await semantic_parser_instance.parse(actual_user_query)
             intent_name = parsed_intent.get("intent", "None")
@@ -4558,8 +5351,11 @@ async def chat_completions_proxy(request: Request):
                 prompt_target_path = target_val
             elif intent_name == "GetCurrentUser":
                 prompt_canonical_tool = "GetCurrentUser"
-        except Exception as e:
-            log(f"⚠️ Semantic intent parsing failed during prompt policy evaluation: {e}")
+        except Exception as exc:
+            log(
+                "⚠️ Semantic intent parsing failed during prompt policy evaluation "
+                f"({type(exc).__name__})"
+            )
 
     # Fallback canonical tool mapping: exact tool names or natural language patterns
     if not prompt_canonical_tool:
@@ -4594,12 +5390,6 @@ async def chat_completions_proxy(request: Request):
             prompt_canonical_tool = "list_directory"
             prompt_target_path = m.group(3).strip().strip('"').strip("'") or "."
 
-        # Honeypot matching
-        elif "get_system_config" in query_lower or "system_config" in query_lower or "system config" in query_lower:
-            prompt_canonical_tool = "get_system_config"
-        elif "fetch_internal_db" in query_lower or "internal_db" in query_lower or "internal db" in query_lower:
-            prompt_canonical_tool = "fetch_internal_db"
-
         # Active connections matching
         elif "getactiveconnections" in query_lower or "active connections" in query_lower or "active_connections" in query_lower:
             prompt_canonical_tool = "GetActiveConnections"
@@ -4620,7 +5410,7 @@ async def chat_completions_proxy(request: Request):
                 "risk_score": fraud_engine_instance.agent_risk_scores.get(spiffe_id_ctx, 0) if fraud_engine_instance else 0
             },
             "mcp": {
-                "server": "keycloak-provider",
+                "server": "runtime-shield-honeypot" if prompt_canonical_tool in HONEYPOT_TOOLS else "keycloak-provider",
                 "tool": prompt_canonical_tool,
                 "action": "call"
             },
@@ -4637,9 +5427,18 @@ async def chat_completions_proxy(request: Request):
         # Evaluate Active Policy Engine
         prompt_decision = None
         if active_policy_engine:
-            prompt_decision = active_policy_engine.evaluate_policy(policy_input)
-
-
+            try:
+                prompt_decision = active_policy_engine.evaluate_policy(policy_input)
+            except Exception as policy_error:
+                if prompt_canonical_tool not in HONEYPOT_TOOLS:
+                    raise
+                log(f"⚠️ Honeypot policy evaluation failed; enforcing local deny: {policy_error}")
+                prompt_decision = {
+                    "allow": False,
+                    "reason": "Honeypot bait tool is blocked by the local fail-closed guard.",
+                    "risk_delta": 100,
+                    "rule_id": "block-honeypots",
+                }
 
         # Hardcoded RBAC check for Keycloak tools before any policy evaluation
         if prompt_canonical_tool in ("keycloak_list_users", "keycloak_revoke_user_sessions", "keycloak_run_drills") and user_role != "admin":
@@ -4688,12 +5487,34 @@ async def chat_completions_proxy(request: Request):
                 }
             )
 
-        # Resolve dynamic userId by sub (defaults to "1" if sub not mapped or empty)
-        allowed_userid = resolve_userid_by_sub(user_sub)
+        # Transaction-account mapping is relevant only to transaction requests.
+        transaction_request = (
+            prompt_canonical_tool == "GetUserTransactions"
+            and re.search(
+                r"\b(transaction|transactions|bank|salary|money history|financial txs|payment history)\b",
+                actual_user_query.lower(),
+            )
+        )
+        allowed_userid = ""
+        if transaction_request:
+            allowed_userid = resolve_userid_by_sub(user_sub, user_id)
+            if not allowed_userid and user_role != "admin":
+                reason = "No demo transaction account is mapped to the authenticated user."
+                log(f"🚫 RBAC BLOCK: {reason} (user={user_id})")
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": {
+                            "message": reason,
+                            "type": "security_violation",
+                            "code": "rbac_unmapped_user"
+                        }
+                    }
+                )
 
         # Rule B: Prompt ID Hijacking check (prevent standard user from asking for other userIds)
         has_hijacking_attempt = re.search(r'\b(user\s*id|user_?id|user)\b\s*(=?\s*\b\d+\b)', actual_user_query.lower())
-        if has_hijacking_attempt:
+        if transaction_request and has_hijacking_attempt:
             val = has_hijacking_attempt.group(2).replace("=", "").strip()
             if val != allowed_userid and user_role != "admin":
                 reason = f"RBAC Violation: Refusing to fetch transactions for userId '{val}'. User '{user_id}' (role '{user_role}') is only authorized to access userId '{allowed_userid}'."
@@ -4719,38 +5540,39 @@ async def chat_completions_proxy(request: Request):
                 )
 
         # Rule C: Tool Call History check (prevent standard user from receiving transactions of other userIds)
-        for msg in messages:
-            tool_calls = msg.get("tool_calls") or []
-            for tc in tool_calls:
-                func = tc.get("function", {})
-                if func.get("name") == "GetUserTransactions":
-                    try:
-                        args = json.loads(func.get("arguments", "{}"))
-                        u_id = str(args.get("userId", "")).strip()
-                        if u_id and u_id != allowed_userid and user_role != "admin":
-                            reason = f"RBAC Violation: User '{user_id}' (role '{user_role}') is not authorized to call GetUserTransactions for userId '{u_id}'. Access is restricted to own userId '{allowed_userid}'."
-                            log(f"🚫 RBAC BLOCK: {reason}")
-                            dashboard_state.add_event({
-                                "action": "deny",
-                                "tool": "GetUserTransactions",
-                                "agent": "keycloak-rbac",
-                                "reason": reason,
-                                "severity": "critical",
-                                "stage": "keycloak-auth",
-                                "timestamp": time.time()
-                            })
-                            return JSONResponse(
-                                status_code=403,
-                                content={
-                                    "error": {
-                                        "message": reason,
-                                        "type": "security_violation",
-                                        "code": "rbac_unauthorized"
+        if transaction_request:
+            for msg in messages:
+                tool_calls = msg.get("tool_calls") or []
+                for tc in tool_calls:
+                    func = tc.get("function", {})
+                    if func.get("name") == "GetUserTransactions":
+                        try:
+                            args = json.loads(func.get("arguments", "{}"))
+                            u_id = str(args.get("userId", "")).strip()
+                            if u_id and u_id != allowed_userid and user_role != "admin":
+                                reason = f"RBAC Violation: User '{user_id}' (role '{user_role}') is not authorized to call GetUserTransactions for userId '{u_id}'. Access is restricted to own userId '{allowed_userid}'."
+                                log(f"🚫 RBAC BLOCK: {reason}")
+                                dashboard_state.add_event({
+                                    "action": "deny",
+                                    "tool": "GetUserTransactions",
+                                    "agent": "keycloak-rbac",
+                                    "reason": reason,
+                                    "severity": "critical",
+                                    "stage": "keycloak-auth",
+                                    "timestamp": time.time()
+                                })
+                                return JSONResponse(
+                                    status_code=403,
+                                    content={
+                                        "error": {
+                                            "message": reason,
+                                            "type": "security_violation",
+                                            "code": "rbac_unauthorized"
+                                        }
                                     }
-                                }
-                            )
-                    except Exception:
-                        pass
+                                )
+                        except Exception:
+                            pass
 
     if fraud_engine_instance:
         class MockDecision:
@@ -4796,16 +5618,15 @@ async def chat_completions_proxy(request: Request):
     # 7. Check if running in Mock LLM Mode
     openai_key = os.getenv("OPENAI_API_KEY")
     hf_token = os.getenv("HF_TOKEN")
-    nvidia_key = os.getenv("NVIDIA_API_KEY")
+    nvidia_key = (
+        os.getenv("NVIDIA_NIM_API_KEY")
+        or os.getenv("NVIDIA_API_KEY")
+        or os.getenv("NIM_API_KEY")
+    )
     nim_base_url = os.getenv("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
     
     requested_model = body.get("model", "gpt-4o")
     log(f"📋 Received request for model: '{requested_model}'")
-    
-    # Strip tools from completions body to force text-based ReAct formatting
-    if "tools" in body:
-        log("🧹 ConversationalChatAgent: Stripped tools parameter to enforce ReAct formatting.")
-        del body["tools"]
     
     is_nvidia = False
     is_fake_nvidia = False
@@ -4925,7 +5746,7 @@ async def chat_completions_proxy(request: Request):
                 return
 
             full_text = "".join(accumulated_content)
-            log(f"💬 Upstream LLM Response: {full_text}")
+            log(f"Upstream LLM response received (chars={len(full_text)})")
             
             # Sanitize JSON response to prevent Pydantic string validation errors
             full_text = sanitize_llm_json(full_text)
@@ -4945,6 +5766,7 @@ async def chat_completions_proxy(request: Request):
                     "reason": "Outbound PII Redacted from stream",
                     "severity": "medium",
                     "stage": "pii-redaction-outbound",
+                    "pii_detected": True,
                     "timestamp": time.time()
                 })
 
@@ -4982,7 +5804,6 @@ async def chat_completions_proxy(request: Request):
                         "finish_reason": None
                     }]
                 }
-                log(f"DEBUG YIELD: data: {json.dumps(stream_chunk)}")
                 yield f"data: {json.dumps(stream_chunk)}\n\n"
                 await asyncio.sleep(0.01)
                 
@@ -5077,8 +5898,207 @@ async def chat_completions_proxy(request: Request):
             return JSONResponse(content=resp_data)
 
 
+def _approval_admin_id(claims: dict) -> Optional[str]:
+    realm_access = claims.get("realm_access")
+    roles = realm_access.get("roles", []) if isinstance(realm_access, dict) else claims.get("roles", [])
+    if not isinstance(roles, list):
+        roles = []
+    resource_access = claims.get("resource_access", {})
+    realm_management = resource_access.get("realm-management", {}) if isinstance(resource_access, dict) else {}
+    client_roles = realm_management.get("roles", []) if isinstance(realm_management, dict) else []
+    if not isinstance(client_roles, list):
+        client_roles = []
+    groups = claims.get("groups", [])
+    if not isinstance(groups, list):
+        groups = []
+    scopes = claims.get("scope", "")
+    scopes = scopes.split() if isinstance(scopes, str) else scopes
+    if not isinstance(scopes, list):
+        scopes = []
+
+    if (
+        "admin" not in roles
+        and "realm-admin" not in client_roles
+        and "Administrators" not in groups
+        and "tool:keycloak_admin" not in scopes
+        and "tool:keycloak_report" not in scopes
+    ):
+        return None
+    return claims.get("preferred_username") or claims.get("sub") or "admin"
+
+
+def _keycloak_admin_identity(token: str, claims: dict) -> Optional[str]:
+    admin_id = _approval_admin_id(claims)
+    if admin_id:
+        return admin_id
+
+    userinfo_url = (
+        f"{os.getenv('KEYCLOAK_URL', 'http://127.0.0.1:8080').rstrip('/')}"
+        f"/realms/{os.getenv('KEYCLOAK_REALM', 'master')}/protocol/openid-connect/userinfo"
+    )
+    try:
+        userinfo_response = requests.get(
+            userinfo_url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5,
+        )
+    except requests.RequestException as exc:
+        log(f"⚠️ HITL admin role lookup could not reach Keycloak: {exc}")
+        raise HTTPException(status_code=503, detail="Keycloak is unavailable.")
+
+    if userinfo_response.status_code != 200:
+        return None
+    userinfo = userinfo_response.json()
+    user_sub = userinfo.get("sub")
+    if not isinstance(user_sub, str) or not user_sub:
+        return None
+
+    realm = os.getenv("KEYCLOAK_REALM", "master")
+    admin_headers = {"Authorization": f"Bearer {token}"}
+    try:
+        role_response = requests.get(
+            f"{os.getenv('KEYCLOAK_URL', 'http://127.0.0.1:8080').rstrip('/')}"
+            f"/admin/realms/{realm}/users/{user_sub}/role-mappings/realm",
+            headers=admin_headers,
+            timeout=5,
+        )
+        group_response = requests.get(
+            f"{os.getenv('KEYCLOAK_URL', 'http://127.0.0.1:8080').rstrip('/')}"
+            f"/admin/realms/{realm}/users/{user_sub}/groups",
+            headers=admin_headers,
+            timeout=5,
+        )
+    except requests.RequestException as exc:
+        log(f"⚠️ HITL admin role lookup failed: {exc}")
+        raise HTTPException(status_code=503, detail="Could not verify Keycloak administrator roles.")
+
+    if role_response.status_code != 200 or group_response.status_code != 200:
+        return None
+
+    realm_roles = role_response.json()
+    groups = group_response.json()
+    role_names = {
+        role.get("name")
+        for role in realm_roles
+        if isinstance(role, dict) and isinstance(role.get("name"), str)
+    }
+    group_names = {
+        group.get("name")
+        for group in groups
+        if isinstance(group, dict) and isinstance(group.get("name"), str)
+    }
+    if "admin" not in role_names and "Administrators" not in group_names:
+        return None
+    return userinfo.get("preferred_username") or user_sub
+
+
+def _require_admin_approval_access(request: Request) -> str:
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="Admin Keycloak login is required.")
+
+    claims = get_token_claims(token.strip())
+    admin_id = _approval_admin_id(claims)
+    token_fingerprint = hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+    with approval_login_lock:
+        session = approval_admin_sessions.get(token_fingerprint)
+        if session and session["expires_at"] <= time.time():
+            approval_admin_sessions.pop(token_fingerprint, None)
+            session = None
+    if not admin_id and not session:
+        raise HTTPException(status_code=403, detail="Only authenticated administrators can review approvals.")
+    return admin_id or session["admin_id"]
+
+
+@dashboard_app.post("/api/approvals/session")
+async def create_approval_session(request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    with approval_login_lock:
+        recent_attempts = [
+            timestamp
+            for timestamp in approval_login_attempts.get(client_ip, [])
+            if now - timestamp < 300
+        ]
+        if len(recent_attempts) >= 5:
+            raise HTTPException(status_code=429, detail="Too many login attempts. Try again in five minutes.")
+        recent_attempts.append(now)
+        approval_login_attempts[client_ip] = recent_attempts
+
+    try:
+        credentials = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    username = credentials.get("username")
+    password = credentials.get("password")
+    if not isinstance(username, str) or not username.strip() or not isinstance(password, str) or not password:
+        raise HTTPException(status_code=400, detail="Username and password are required.")
+
+    login_client_id = os.getenv("RUNTIME_SHIELD_LOGIN_CLIENT_ID", "admin-cli")
+    token_url = (
+        f"{os.getenv('KEYCLOAK_URL', 'http://127.0.0.1:8080').rstrip('/')}"
+        f"/realms/{os.getenv('KEYCLOAK_REALM', 'master')}/protocol/openid-connect/token"
+    )
+    form_data = {
+        "grant_type": "password",
+        "client_id": login_client_id,
+        "username": username.strip(),
+        "password": password,
+        "scope": "openid profile email",
+    }
+    login_client_secret = os.getenv("RUNTIME_SHIELD_LOGIN_CLIENT_SECRET")
+    if login_client_secret:
+        form_data["client_secret"] = login_client_secret
+
+    try:
+        response = requests.post(token_url, data=form_data, timeout=5)
+    except requests.RequestException as exc:
+        log(f"⚠️ HITL admin login could not reach Keycloak: {exc}")
+        raise HTTPException(status_code=503, detail="Keycloak is unavailable.")
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=401, detail="Keycloak login failed.")
+
+    access_token = response.json().get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=502, detail="Keycloak did not return an access token.")
+
+    try:
+        claims = get_token_claims(access_token)
+    except HTTPException:
+        raise HTTPException(status_code=401, detail="Keycloak returned an invalid access token.")
+    admin_id = _keycloak_admin_identity(access_token, claims)
+    if not admin_id:
+        raise HTTPException(status_code=403, detail="This account is not an administrator.")
+
+    token_fingerprint = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+    expires_in = response.json().get("expires_in", 0)
+    try:
+        expires_at = time.time() + max(0, int(expires_in))
+    except (TypeError, ValueError):
+        expires_at = time.time()
+    with approval_login_lock:
+        approval_admin_sessions[token_fingerprint] = {
+            "admin_id": admin_id,
+            "expires_at": expires_at,
+        }
+
+    with approval_login_lock:
+        approval_login_attempts.pop(client_ip, None)
+    log(f"✅ HITL dashboard administrator authenticated: {admin_id}")
+    return JSONResponse(content={
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": response.json().get("expires_in", 0),
+        "username": admin_id,
+    })
+
+
 @dashboard_app.get("/api/approvals/pending")
-async def get_pending_approvals():
+async def get_pending_approvals(request: Request):
+    _require_admin_approval_access(request)
     res = []
     for req_id, data in pending_approvals.items():
         res.append({
@@ -5096,6 +6116,7 @@ async def get_pending_approvals():
 
 @dashboard_app.post("/api/approvals/{req_id}/action")
 async def handle_approval_action(req_id: str, request: Request):
+    admin_id = _require_admin_approval_access(request)
     try:
         payload = await request.json()
     except Exception:
@@ -5109,6 +6130,8 @@ async def handle_approval_action(req_id: str, request: Request):
         raise HTTPException(status_code=400, detail="Invalid action. Must be 'approve', 'deny', or 'block'")
         
     approval_data = pending_approvals[req_id]
+    if approval_data["status"] != "pending":
+        raise HTTPException(status_code=409, detail="Approval request has already been decided.")
     approval_data["decision"] = action
     approval_data["status"] = action
     
@@ -5116,8 +6139,8 @@ async def handle_approval_action(req_id: str, request: Request):
     dashboard_state.add_event({
         "action": action,
         "tool": approval_data["tool_name"],
-        "agent": "admin-hitl",
-        "reason": f"HITL Approval Decision: {action.upper()}",
+        "agent": f"admin-{admin_id}",
+        "reason": f"HITL Approval Decision: {action.upper()} by {admin_id}",
         "severity": "info" if action == "approve" else "high",
         "stage": "hitl-approval",
         "user_role": approval_data["user_role"],
@@ -5129,13 +6152,186 @@ async def handle_approval_action(req_id: str, request: Request):
     return JSONResponse(content={"status": "success", "message": f"Action {action} processed."})
 
 
+@dashboard_app.post("/mcp/runtime-shield")
+async def librechat_mcp_endpoint(request: Request):
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON body."})
+
+    if not isinstance(body, dict) or not isinstance(body.get("method"), str):
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON-RPC request."})
+
+    method = body["method"]
+    request_id = body.get("id")
+    if method.startswith("notifications/"):
+        return JSONResponse(status_code=202, content={})
+    if request_id is None:
+        return JSONResponse(status_code=400, content={"error": "JSON-RPC request id is required."})
+
+    if method == "initialize":
+        return JSONResponse(content={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "runtime-shield-hitl", "version": "1.0.0"},
+            },
+        })
+
+    if method == "ping":
+        return JSONResponse(content={"jsonrpc": "2.0", "id": request_id, "result": {}})
+
+    if method == "tools/list":
+        return JSONResponse(content={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "tools": [{
+                    "name": "write_file",
+                    "description": (
+                        "Request a file write through Runtime Shield. Standard-user writes "
+                        "must target secure-experiment-zone/ and wait for an administrator "
+                        "to approve them in the dashboard."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "A relative path under secure-experiment-zone/.",
+                            },
+                            "content": {"type": "string"},
+                        },
+                        "required": ["path", "content"],
+                        "additionalProperties": False,
+                    },
+                }],
+            },
+        })
+
+    if method != "tools/call":
+        return JSONResponse(
+            status_code=400,
+            content={"jsonrpc": "2.0", "id": request_id, "error": {
+                "code": -32601, "message": f"Unsupported MCP method: {method}",
+            }},
+        )
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse(
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+            content={"error": "A Keycloak access token is required to call tools."},
+        )
+
+    token = auth_header[7:].strip()
+    try:
+        claims = get_token_claims(token)
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+            content={"error": exc.detail},
+        )
+    if not claims.get("sub"):
+        return JSONResponse(
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+            content={"error": "The Keycloak token has no subject claim."},
+        )
+
+    params = body.get("params")
+    if not isinstance(params, dict) or params.get("name") != "write_file":
+        return JSONResponse(
+            status_code=400,
+            content={"jsonrpc": "2.0", "id": request_id, "error": {
+                "code": -32602, "message": "Only the write_file tool is available.",
+            }},
+        )
+
+    tool_request = {
+        "jsonrpc": "2.0",
+        "id": f"librechat-{uuid.uuid4().hex}",
+        "method": "tools/call",
+        "params": {
+            "name": "write_file",
+            "arguments": params.get("arguments", {}),
+        },
+    }
+    llm_svid_path = os.path.join(PROJECT_DIR, "spire", "certs", "llm-agent.crt")
+    try:
+        with open(llm_svid_path, "r", encoding="utf-8") as cert_file:
+            llm_svid_cert = cert_file.read()
+    except OSError as exc:
+        log(f"LibreChat MCP tool execution cannot load the LLM SVID: {exc}")
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Runtime Shield LLM SPIFFE certificate is unavailable."},
+        )
+
+    import urllib.parse
+
+    try:
+        async with httpx.AsyncClient() as client:
+            tool_response = await client.post(
+                "http://127.0.0.1:5001/v1/tool/execute",
+                json=tool_request,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-SPIFFE-ID": "spiffe://runtime-shield/llm-agent",
+                    "X-SPIFFE-CERT": urllib.parse.quote(llm_svid_cert),
+                },
+                timeout=HITL_TIMEOUT_SECONDS + 15,
+            )
+        tool_data = tool_response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        log(f"LibreChat MCP tool execution failed: {exc}")
+        return JSONResponse(status_code=502, content={"error": "Runtime Shield tool execution failed."})
+
+    if not isinstance(tool_data, dict):
+        return JSONResponse(status_code=502, content={"error": "Runtime Shield returned an invalid tool response."})
+
+    if tool_response.status_code >= 500:
+        error_content = {
+            "error": tool_data.get("error", "Runtime Shield tool execution failed.")
+        }
+        for field in ("detail", "req_id"):
+            if field in tool_data:
+                error_content[field] = tool_data[field]
+        return JSONResponse(
+            status_code=503 if tool_response.status_code == 503 else 502,
+            content=error_content,
+        )
+
+    if tool_response.status_code != 200 or tool_data.get("error"):
+        error = tool_data.get("error", "The Runtime Shield policy denied this request.")
+        if isinstance(error, dict):
+            error = error.get("message", json.dumps(error))
+        result = {
+            "content": [{"type": "text", "text": str(error)}],
+            "isError": True,
+        }
+    else:
+        result = tool_data.get("result", tool_data)
+        if not isinstance(result, dict) or not isinstance(result.get("content"), list):
+            result = {"content": [{"type": "text", "text": json.dumps(result)}]}
+
+    return JSONResponse(content={"jsonrpc": "2.0", "id": request_id, "result": result})
+
+
 @dashboard_app.post("/v1/tool/execute")
 async def execute_tool_proxy(request: Request):
     global gateway_instance, nim_guard_instance, fraud_engine_instance
     global mcp_processes, tool_map, scope_map, pending_tool_futures
 
     spiffe_id = "chatbot"
-    incoming_headers = dict(request.headers)
+    incoming_headers = {
+        key: "[REDACTED]" if key.lower() in {"authorization", "x-shield-token"} else value
+        for key, value in request.headers.items()
+    }
     log(f"📋 [Tool REST Ingress] Incoming tool execution request: {incoming_headers}")
 
     # 1. Parse JSON Request Body
@@ -5188,7 +6384,7 @@ async def execute_tool_proxy(request: Request):
             body["params"]["name"] = tool_name
 
     # --- ZERO-TRUST DEFAULT-DENY FOR UNKNOWN/UNSUPPORTED TOOLS ---
-    if tool_name not in tool_map:
+    if tool_name not in tool_map and tool_name not in HONEYPOT_TOOLS:
         reason = f"Zero-Trust Block: Unknown or unsupported tool call '{tool_name}' denied by default (Centralized Governance)"
         log(f"🚫 {reason}")
         dashboard_state.add_event({
@@ -5211,6 +6407,7 @@ async def execute_tool_proxy(request: Request):
                 tool_args["path"] = norm_p
                 if "params" in body and "arguments" in body["params"]:
                     body["params"]["arguments"]["path"] = norm_p
+    workshop_docker_write = is_workshop_demo_write(tool_name, tool_args)
     req_id = body.get("id")
 
     if not req_id:
@@ -5238,27 +6435,30 @@ async def execute_tool_proxy(request: Request):
     user_sub = ""
     claims = {}
 
+    local_dev_mode = os.getenv("LOCAL_DEV_MODE", "false").lower() == "true"
+    if not token and not local_dev_mode:
+        return JSONResponse(
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+            content={"error": "A verified Keycloak access token is required."},
+        )
+
     if token:
         try:
-            log(f"🔑 REST Proxy: Fetching JWT claims for token: {token[:30]}...")
+            log("🔑 REST Proxy: Verifying caller JWT.")
             claims = get_token_claims(token)
             log(f"🔑 REST Proxy: Successfully decoded JWT claims: {list(claims.keys())}")
             user_id = claims.get("preferred_username") or claims.get("sub") or "anonymous_user"
             user_sub = claims.get("sub") or ""
             log(f"JWT SUB inside tool execute: {user_sub}")
-            roles = claims.get("realm_access", {}).get("roles", []) or claims.get("roles", [])
-            groups = claims.get("groups", []) or []
-            scopes = claims.get("scope", "")
-            if isinstance(scopes, str):
-                scopes = scopes.split(" ")
-            if "admin" in roles or "Administrators" in groups or "tool:keycloak_admin" in scopes or "tool:keycloak_report" in scopes:
-                user_role = "admin"
-            elif "privileged" in roles or "Privileged-Users" in groups or "tool:list_directory" in scopes or "tool:read_file" in scopes:
-                user_role = "privileged"
-            else:
-                user_role = "user"
-        except Exception as e:
-            log(f"⚠️ Tool REST Proxy failed to decode JWT token: {e}")
+            user_role = role_from_verified_claims(claims)
+        except HTTPException as e:
+            log(f"🚫 Tool REST Proxy rejected an invalid Keycloak token: {e.detail}")
+            return JSONResponse(
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+                content={"error": "The Keycloak access token is invalid or expired."},
+            )
 
     # Resolve identity/role from the token when available; only use the env override
     # as a fallback when the request is unauthenticated.
@@ -5274,7 +6474,11 @@ async def execute_tool_proxy(request: Request):
     )
 
     # REST-level RBAC: block non-admin direct tool calls for Keycloak management tools before any JIT
-    if tool_name in ("keycloak_list_users", "keycloak_revoke_user_sessions") and user_role != "admin":
+    if tool_name in (
+        "keycloak_list_users",
+        "keycloak_revoke_user_sessions",
+        "keycloak_run_drills",
+    ) and user_role != "admin":
         reason = "Role violation: Keycloak user-management tools require admin role."
         log(f"🚫 RBAC Block: {reason} (user={user_id}, tool={tool_name})")
         dashboard_state.add_event({
@@ -5370,6 +6574,7 @@ async def execute_tool_proxy(request: Request):
         if "arguments" not in body["params"]:
             body["params"]["arguments"] = {}
         body["params"]["arguments"]["keycloak_sub"] = user_sub
+        body["params"]["arguments"]["username"] = claims.get("preferred_username", "")
         body["params"]["arguments"]["role"] = user_role
         tool_args = body["params"]["arguments"]
 
@@ -5415,7 +6620,7 @@ async def execute_tool_proxy(request: Request):
             "risk_score": fraud_engine_instance.agent_risk_scores.get(spiffe_id, 0) if fraud_engine_instance else 0
         },
         "mcp": {
-            "server": tool_map.get(tool_name, "unknown"),
+            "server": "runtime-shield-honeypot" if tool_name in HONEYPOT_TOOLS else tool_map.get(tool_name, "unknown"),
             "tool": tool_name,
             "action": "call"
         },
@@ -5432,7 +6637,20 @@ async def execute_tool_proxy(request: Request):
     # Evaluate Active Engine
     decision = None
     if active_policy_engine:
-        decision = active_policy_engine.evaluate_policy(policy_input)
+        try:
+            decision = active_policy_engine.evaluate_policy(policy_input)
+        except Exception as policy_error:
+            if tool_name not in HONEYPOT_TOOLS:
+                raise
+            log(f"⚠️ Honeypot policy evaluation failed; enforcing local deny: {policy_error}")
+            decision = {
+                "allow": False,
+                "reason": "Honeypot bait tool is blocked by the local fail-closed guard.",
+                "risk_delta": 100,
+                "quarantine": True,
+                "rule_id": "block-honeypots",
+                "policy_backend": "local-honeypot-guard",
+            }
     
     # Evaluate Shadow Engine
     if shadow_policy_engine:
@@ -5472,6 +6690,30 @@ async def execute_tool_proxy(request: Request):
             "rule_id": "failsafe_block",
             "policy_backend": "none"
         }
+
+    if tool_name in HONEYPOT_TOOLS:
+        configured_risk = decision.get("risk_delta")
+        if not isinstance(configured_risk, int) or configured_risk <= 0:
+            configured_risk = fraud_engine_instance.HONEYPOT_PENALTY if fraud_engine_instance else 100
+        score, quarantined, reason = record_honeypot_attempt(
+            tool_name=tool_name,
+            agent_id=user_sub or spiffe_id,
+            user_id=user_id,
+            risk_delta=configured_risk,
+            rule_id=decision.get("rule_id", "block-honeypots"),
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "message": reason,
+                    "type": "security_violation",
+                    "code": "honeypot_triggered",
+                    "risk_score": score,
+                    "quarantined": quarantined,
+                }
+            },
+        )
 
     # Integrate with Fraud Engine for risk score modification and deduplication
     class DummyDecision:
@@ -5540,6 +6782,25 @@ async def execute_tool_proxy(request: Request):
         log(f"🚫 Blocked REST tool '{tool_name}' ({decision['policy_backend']}): {decision['reason']}")
         return JSONResponse(status_code=403, content={"error": f"Tool blocked by policy: {decision['reason']}"})
 
+    jit_token = None
+    if tool_name != "fetch_url" and tool_name not in VULN_MCP_UPSTREAM:
+        required_scope = scope_map.get(tool_name)
+        provider_name = tool_map.get(tool_name, "unknown")
+        token_to_exchange = token
+        if not token_to_exchange and local_dev_mode:
+            token_to_exchange = os.getenv("KEYCLOAK_TOKEN", "").strip("'\"")
+
+        if not token_to_exchange:
+            raise HTTPException(status_code=401, detail="No Keycloak authentication token provided")
+
+        try:
+            log(f"🔑 REST Proxy: Performing JIT exchange for tool '{tool_name}' and provider '{provider_name}' before approval...")
+            jit_token = jit_manager.exchange_token(token_to_exchange, required_scope, provider_name)
+            log("🔑 REST Proxy: JIT exchange successful.")
+        except Exception as e:
+            log(f"❌ JIT Token exchange failed before approval: {e}")
+            return JSONResponse(status_code=403, content={"error": f"Security JIT token exchange failed: {e}"})
+
     # --- HUMAN IN THE LOOP (HITL) APPROVAL INTERCEPTION ---
     HIGH_RISK_TOOLS = {"write_file", "keycloak_revoke_user_sessions", "keycloak_quarantine_user", "ScanSecrets"}
     is_high_risk = (
@@ -5580,8 +6841,8 @@ async def execute_tool_proxy(request: Request):
         })
         
         try:
-            # Wait for admin approval with a 30 second timeout
-            await asyncio.wait_for(event.wait(), timeout=30.0)
+            # Wait for admin approval before failing closed.
+            await asyncio.wait_for(event.wait(), timeout=HITL_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             log(f"❌ [HITL] Approval timeout for request {req_id}. Denying action (fail-closed).")
             pending_approvals.pop(req_id, None)
@@ -5593,6 +6854,242 @@ async def execute_tool_proxy(request: Request):
             return JSONResponse(status_code=403, content={"error": "Action denied by administrator approval."})
             
         log(f"✅ [HITL] Admin APPROVED execution of tool '{tool_name}' (req_id={req_id}). Resuming...")
+
+        # == SANDBOX FAIL-CLOSED GATE (Phase 2 fix) ================================
+        # After HITL approval, verify the sandbox is operational BEFORE routing.
+        # High-risk tools are BLOCKED if no container-level sandbox is available.
+        # This prevents silent fallback to direct host execution.
+        _risk_delta_for_gate = decision.get("risk_delta", 0) if "decision" in dir() else 0
+        if workshop_docker_write:
+            try:
+                _workshop_provider_identity = await _verify_workshop_filesystem_provider()
+            except FilesystemProviderUnavailable as _provider_error:
+                _block_msg = str(_provider_error)
+                log(
+                    f"[SANDBOX ENFORCER] BLOCKED post-approval workshop write "
+                    f"(req_id={req_id}): {_block_msg}"
+                )
+                dashboard_state.add_event({
+                    "action": "sandbox_block",
+                    "tool": tool_name,
+                    "agent": spiffe_id,
+                    "req_id": req_id,
+                    "user_id": user_id,
+                    "user_role": user_role,
+                    "hitl_decision": "approve",
+                    "required_sandbox": "docker",
+                    "actual_execution_environment": "none",
+                    "sandbox_available": False,
+                    "execution_decision": "blocked_sandbox_unavailable",
+                    "failure_reason": _block_msg,
+                    "reason": _block_msg,
+                    "severity": "critical",
+                    "stage": "sandbox-enforcement",
+                    "session_id": session_id,
+                    "timestamp": time.time(),
+                })
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "Sandbox unavailable: high-risk action blocked after HITL approval.",
+                        "detail": _block_msg,
+                        "tool": tool_name,
+                        "req_id": req_id,
+                    },
+                )
+            dashboard_state.add_event({
+                "action": "sandbox_verified",
+                "tool": tool_name,
+                "agent": spiffe_id,
+                "req_id": req_id,
+                "user_id": user_id,
+                "user_role": user_role,
+                "hitl_decision": "approve",
+                "required_sandbox": "docker",
+                "actual_execution_environment": "docker",
+                "docker_runtime": "runc",
+                "provider_name": "filesystem-provider",
+                "provider_container_id": _workshop_provider_identity["container_id"],
+                "provider_uid": _workshop_provider_identity["uid"],
+                "provider_rootfs_read_only": True,
+                "provider_capabilities_empty": True,
+                "provider_no_new_privs": True,
+                "provider_seccomp_mode": 2,
+                "provider_secure_zone_mount_read_write": True,
+                "provider_no_default_route": True,
+                "sandbox_available": True,
+                "execution_decision": "execute_in_sandbox",
+                "failure_reason": None,
+                "reason": "Dedicated Docker runc filesystem provider verified after HITL approval.",
+                "severity": "info",
+                "stage": "sandbox-enforcement",
+                "session_id": session_id,
+                "timestamp": time.time(),
+            })
+        elif requires_sandbox_isolation(tool_name, _risk_delta_for_gate):
+            try:
+                _sandbox_status = SandboxEnforcer.verify_for_high_risk(
+                    tool_name=tool_name,
+                    risk_delta=_risk_delta_for_gate,
+                    req_id=req_id,
+                )
+                _req_sb_type = "gvisor" if os.getenv("OPENSANDBOX_REQUIRE_GVISOR", "false").lower() == "true" else ("docker" if os.getenv("OPENSANDBOX_REQUIRE_DOCKER", "false").lower() == "true" else "isolated_sandbox")
+                dashboard_state.add_event({
+                    "action": "sandbox_verified",
+                    "tool": tool_name,
+                    "agent": spiffe_id,
+                    "req_id": req_id,
+                    "user_id": user_id,
+                    "user_role": user_role,
+                    "hitl_decision": "approve",
+                    "required_sandbox": _req_sb_type,
+                    "actual_execution_environment": _sandbox_status.effective_sandbox.value,
+                    "sandbox_available": True,
+                    "execution_decision": "execute_in_sandbox",
+                    "failure_reason": None,
+                    "sandbox_type": _sandbox_status.effective_sandbox.value,
+                    "docker_reachable": _sandbox_status.docker_daemon_reachable,
+                    "gvisor_available": _sandbox_status.gvisor_configured_in_docker,
+                    "reason": "Sandbox verified after HITL approval. Execution authorised.",
+                    "severity": "info",
+                    "stage": "sandbox-enforcement",
+                    "session_id": session_id,
+                    "timestamp": time.time(),
+                })
+                log(
+                    f"[SANDBOX ENFORCER] Sandbox verified for '{tool_name}'"
+                    f" (req_id={req_id}, sandbox={_sandbox_status.effective_sandbox.value})"
+                )
+            except SandboxUnavailableError as _sb_err:
+                _block_msg = str(_sb_err)
+                _req_sb_type = "gvisor" if os.getenv("OPENSANDBOX_REQUIRE_GVISOR", "false").lower() == "true" else ("docker" if os.getenv("OPENSANDBOX_REQUIRE_DOCKER", "false").lower() == "true" else "isolated_sandbox")
+                log(f"[SANDBOX ENFORCER] BLOCKED post-approval tool '{tool_name}' (req_id={req_id}): {_block_msg}")
+                dashboard_state.add_event({
+                    "action": "sandbox_block",
+                    "tool": tool_name,
+                    "agent": spiffe_id,
+                    "req_id": req_id,
+                    "user_id": user_id,
+                    "user_role": user_role,
+                    "hitl_decision": "approve",
+                    "required_sandbox": _req_sb_type,
+                    "actual_execution_environment": "none",
+                    "sandbox_available": False,
+                    "execution_decision": "blocked_sandbox_unavailable",
+                    "failure_reason": _block_msg,
+                    "reason": _block_msg,
+                    "severity": "critical",
+                    "stage": "sandbox-enforcement",
+                    "session_id": session_id,
+                    "timestamp": time.time(),
+                })
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "Sandbox unavailable: high-risk action blocked after HITL approval.",
+                        "detail": _block_msg,
+                        "tool": tool_name,
+                        "req_id": req_id,
+                    },
+                )
+        # == END SANDBOX GATE =======================================================
+
+    if workshop_docker_write:
+        try:
+            _workshop_result = await _execute_workshop_file_write(
+                _workshop_provider_identity, req_id
+            )
+        except FilesystemProviderUnavailable as _provider_error:
+            _failure_message = str(_provider_error)
+            dashboard_state.add_event({
+                "action": "deny",
+                "tool": tool_name,
+                "agent": spiffe_id,
+                "req_id": req_id,
+                "user_id": user_id,
+                "hitl_decision": "approve",
+                "actual_execution_environment": "docker",
+                "execution_outcome": "unknown",
+                "execution_success": False,
+                "reason": _failure_message,
+                "severity": "high",
+                "stage": "sandbox-execution",
+                "session_id": session_id,
+                "timestamp": time.time(),
+            })
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "Filesystem provider became unavailable; execution could not be verified.",
+                    "detail": _failure_message,
+                    "tool": tool_name,
+                    "req_id": req_id,
+                },
+            )
+        except FilesystemProviderExecutionError as _execution_error:
+            _failure_message = str(_execution_error)
+            dashboard_state.add_event({
+                "action": "deny",
+                "tool": tool_name,
+                "agent": spiffe_id,
+                "req_id": req_id,
+                "user_id": user_id,
+                "hitl_decision": "approve",
+                "actual_execution_environment": "docker",
+                "execution_outcome": "failed",
+                "execution_success": False,
+                "reason": _failure_message,
+                "severity": "high",
+                "stage": "sandbox-execution",
+                "session_id": session_id,
+                "timestamp": time.time(),
+            })
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": "The approved write_file operation failed in the Docker provider.",
+                    "detail": _failure_message,
+                    "tool": tool_name,
+                    "req_id": req_id,
+                },
+            )
+
+        dashboard_state.add_event({
+            "action": "allow",
+            "tool": tool_name,
+            "agent": spiffe_id,
+            "req_id": req_id,
+            "user_id": user_id,
+            "user_role": user_role,
+            "hitl_decision": "approve",
+            "actual_execution_environment": "docker",
+            "docker_runtime": "runc",
+            "provider_name": "filesystem-provider",
+            "provider_container_id": _workshop_result["provider_container_id"],
+            "execution_outcome": "success",
+            "execution_success": True,
+            "resource_path": WORKSHOP_DEMO_PATH,
+            "content_sha256": _workshop_result["sha256"],
+            "size_bytes": _workshop_result["size_bytes"],
+            "reason": "Filesystem provider confirmed the new file and exact content after write_file.",
+            "severity": "info",
+            "stage": "sandbox-execution",
+            "session_id": session_id,
+            "timestamp": time.time(),
+        })
+        return JSONResponse(content={
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": (
+                        f"File written successfully to {WORKSHOP_DEMO_PATH} "
+                        "inside the verified Docker runc provider."
+                    ),
+                }],
+            },
+        })
 
     # Intercept fetch_url execution directly in Bridge
     if tool_name == "fetch_url":
@@ -5632,22 +7129,7 @@ async def execute_tool_proxy(request: Request):
             log(f"❌ Vuln MCP proxy error for '{tool_name}': {proxy_err}")
             return JSONResponse(status_code=502, content={"error": f"Upstream vulnerable MCP error: {proxy_err}"})
 
-    # 8. JIT TOKEN EXCHANGE (RFC 8693)
-    required_scope = scope_map.get(tool_name)
-    provider_name = tool_map.get(tool_name, "unknown")
-    token_to_exchange = token or os.getenv("KEYCLOAK_TOKEN", "").strip("'\"")
-    
-    if not token_to_exchange:
-        raise HTTPException(status_code=401, detail="No Keycloak authentication token provided")
-
-    try:
-        log(f"🔑 REST Proxy: Performing JIT exchange for tool '{tool_name}' and provider '{provider_name}'...")
-        jit_token = jit_manager.exchange_token(token_to_exchange, required_scope, provider_name)
-        log(f"🔑 REST Proxy: JIT Exchange successful! Token: {jit_token[:30]}...")
-    except Exception as e:
-        log(f"❌ JIT Token exchange failed: {e}")
-        return JSONResponse(status_code=403, content={"error": f"Security JIT token exchange failed: {e}"})
-
+    # 8. JIT authorization was prepared before the HITL wait, while the requester token was fresh.
     # Inject JIT Token and Auth Context
     if "metadata" not in body["params"]:
         body["params"]["metadata"] = {}
@@ -5695,8 +7177,8 @@ async def execute_tool_proxy(request: Request):
             log(f"❌ Timeout waiting for sandboxed tool '{tool_name}' response (req_id={req_id})")
             return JSONResponse(status_code=504, content={"error": "Tool execution timeout"})
         except Exception as run_err:
-            log(f"❌ Error during sandboxed REST execution: {run_err}")
-            return JSONResponse(status_code=500, content={"error": str(run_err)})
+            log(f"❌ Error during sandboxed REST execution ({type(run_err).__name__})")
+            return JSONResponse(status_code=500, content={"error": "Tool execution failed"})
         finally:
             pending_tool_futures.pop(req_id, None)
             
@@ -5707,8 +7189,8 @@ async def execute_tool_proxy(request: Request):
             response_data = await client.send_message(body, timeout=10.0)
             response_str = json.dumps(response_data)
         except Exception as run_err:
-            log(f"❌ Error during remote SSE REST execution: {run_err}")
-            return JSONResponse(status_code=500, content={"error": str(run_err)})
+            log(f"❌ Error during remote SSE REST execution ({type(run_err).__name__})")
+            return JSONResponse(status_code=500, content={"error": "Tool execution failed"})
             
     else:
         raise HTTPException(status_code=503, detail=f"MCP Provider '{provider}' not available or running")
@@ -5725,7 +7207,10 @@ async def execute_tool_proxy(request: Request):
                 )
                 response_data = json.loads(response_str)
             except Exception as scan_err:
-                log(f"⚠️ Egress scans failed/timed out on tool response: {scan_err}. Falling back to safe local Presidio/regex redaction.")
+                log(
+                    "⚠️ Egress scans failed/timed out on tool response "
+                    f"({type(scan_err).__name__}); using local Presidio/regex fallback."
+                )
                 response_str = redact_pii_with_presidio(response_str)
                 response_data = json.loads(response_str)
 
@@ -5735,14 +7220,58 @@ async def execute_tool_proxy(request: Request):
 
 
 # Structured JSON-RPC classification helper
+def _extract_text_from_mcp_payload(msg):
+    """Normalize a tool-result payload to the textual content that should be scanned."""
+    if isinstance(msg, str):
+        return msg
+    if not isinstance(msg, dict):
+        return ""
+
+    candidates = []
+    for key in ("text", "content"):
+        val = msg.get(key)
+        if isinstance(val, str):
+            candidates.append(val)
+        elif isinstance(val, list):
+            for item in val:
+                if isinstance(item, dict):
+                    nested = item.get("text")
+                    if isinstance(nested, str):
+                        candidates.append(nested)
+                elif isinstance(item, str):
+                    candidates.append(item)
+
+    if "result" in msg and isinstance(msg["result"], dict):
+        result = msg["result"]
+        for key in ("text", "content"):
+            val = result.get(key)
+            if isinstance(val, str):
+                candidates.append(val)
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, dict):
+                        nested = item.get("text")
+                        if isinstance(nested, str):
+                            candidates.append(nested)
+                    elif isinstance(item, str):
+                        candidates.append(item)
+
+    merged = "\n".join(filter(None, candidates))
+    if merged:
+        return merged
+    return json.dumps(msg, ensure_ascii=False)
+
+
 def is_tool_result_message(msg):
     if not isinstance(msg, dict):
         return False
-    result = msg.get("result")
-    if not isinstance(result, dict):
-        return False
-    content = result.get("content")
-    return isinstance(content, list)
+    if "result" in msg and isinstance(msg["result"], dict):
+        result = msg["result"]
+        if isinstance(result.get("content"), list) or isinstance(result.get("text"), str):
+            return True
+    if isinstance(msg.get("content"), list) or isinstance(msg.get("text"), str):
+        return True
+    return False
 
 
 def perform_security_scans(payload_str, current_role):
@@ -5995,10 +7524,20 @@ def main():
   <div class="card"><div class="label">Uptime</div><div class="value" id="stat-uptime">0s</div></div>
 </div>
 
-<div id="hitl-panel" style="display:none; padding: 0 24px 16px;">
+<div id="hitl-panel" style="display:block; padding: 0 24px 16px;">
+  <div id="hitl-admin-login" style="display:flex; gap:8px; align-items:center; margin-bottom:10px;">
+    <strong>Admin approval access</strong>
+    <input id="hitl-admin-username" autocomplete="username" placeholder="Keycloak admin username">
+    <input id="hitl-admin-password" type="password" autocomplete="current-password" placeholder="Keycloak password">
+    <button id="hitl-admin-login-button" type="button">Sign in</button>
+    <button id="hitl-admin-logout-button" type="button" style="display:none;">Sign out</button>
+    <span id="hitl-admin-login-status" role="status"></span>
+  </div>
+  <div id="hitl-pending-content" style="display:none;">
   <div style="background: rgba(251, 146, 60, 0.12); border: 1px solid rgba(251, 146, 60, 0.4); border-radius: 8px; padding: 12px 16px;">
     <div style="font-weight:600; font-size:13px; color:#fb923c; margin-bottom:8px;">⏸️ Human-In-The-Loop (HITL) Pending Approvals</div>
     <div id="hitl-items"></div>
+  </div>
   </div>
 </div>
 
@@ -6059,44 +7598,130 @@ function pollDashboard() {
 }
 
 async function checkPendingApprovals() {
+  if (!sessionStorage.getItem('runtimeShieldAdminToken')) return;
   try {
-    const r = await fetch('/api/approvals/pending');
+    const r = await fetch('/api/approvals/pending', {headers: approvalAuthHeaders()});
+    if (r.status === 401 || r.status === 403) {
+      logoutHITLAdmin();
+      document.getElementById('hitl-admin-login-status').textContent = 'Admin session expired or not authorized. Sign in again.';
+      return;
+    }
     if (!r.ok) return;
     const approvals = await r.json();
-    const panel = document.getElementById('hitl-panel');
+    const pendingContent = document.getElementById('hitl-pending-content');
     const items = document.getElementById('hitl-items');
-    if (!panel || !items) return;
+    if (!pendingContent || !items) return;
     if (!approvals || approvals.length === 0) {
-      panel.style.display = 'none';
+      pendingContent.style.display = 'none';
       items.innerHTML = '';
       return;
     }
-    panel.style.display = 'block';
-    items.innerHTML = approvals.map(appr => `
-      <div style="display:flex; justify-content:space-between; align-items:center; background:#161b22; padding:8px 12px; border-radius:6px; margin-top:6px; font-size:12px;">
-        <div>
-          <b style="color:#58a6ff;">${appr.tool_name}</b> <span style="color:#8b949e;">(User: ${appr.user_id}, Risk: +${appr.risk_score})</span>
-          <div style="color:#8b949e; font-size:11px;">Args: ${JSON.stringify(appr.tool_args||{})}</div>
-        </div>
-        <div style="display:flex; gap:6px;">
-          <button onclick="resolveApproval('${appr.req_id}', 'deny')" style="background:#f85149; color:#fff; border:none; padding:4px 10px; border-radius:4px; cursor:pointer; font-weight:600;">Deny</button>
-          <button onclick="resolveApproval('${appr.req_id}', 'approve')" style="background:#3fb950; color:#0d1117; border:none; padding:4px 12px; border-radius:4px; cursor:pointer; font-weight:700;">Approve</button>
-        </div>
-      </div>
-    `).join('');
-  } catch(e) {}
+    pendingContent.style.display = 'block';
+    items.replaceChildren();
+    approvals.forEach(appr => {
+      const card = document.createElement('div');
+      card.style.cssText = 'display:flex;justify-content:space-between;align-items:center;background:#161b22;padding:8px 12px;border-radius:6px;margin-top:6px;font-size:12px;';
+      const details = document.createElement('div');
+      const title = document.createElement('b');
+      title.textContent = appr.tool_name;
+      const meta = document.createElement('span');
+      meta.textContent = ` Request ${appr.req_id} · User ${appr.user_id} (${appr.user_role}) · Risk +${appr.risk_score}`;
+      const args = document.createElement('div');
+      args.textContent = `Args: ${JSON.stringify(appr.tool_args || {})}`;
+      details.append(title, meta, args);
+      const actions = document.createElement('div');
+      const deny = document.createElement('button');
+      deny.textContent = 'Deny';
+      deny.addEventListener('click', () => resolveApproval(appr.req_id, 'deny'));
+      const approve = document.createElement('button');
+      approve.textContent = 'Approve';
+      approve.addEventListener('click', () => resolveApproval(appr.req_id, 'approve'));
+      actions.append(deny, approve);
+      card.append(details, actions);
+      items.append(card);
+    });
+  } catch(e) {
+    document.getElementById('hitl-admin-login-status').textContent = 'Could not load approval queue.';
+  }
+}
+
+function approvalAuthHeaders(extraHeaders = {}) {
+  const token = sessionStorage.getItem('runtimeShieldAdminToken');
+  return token ? {...extraHeaders, 'Authorization': `Bearer ${token}`} : extraHeaders;
+}
+
+function updateApprovalLoginUI() {
+  const isSignedIn = Boolean(sessionStorage.getItem('runtimeShieldAdminToken'));
+  document.getElementById('hitl-admin-login').style.display = 'flex';
+  document.getElementById('hitl-admin-username').style.display = isSignedIn ? 'none' : '';
+  document.getElementById('hitl-admin-password').style.display = isSignedIn ? 'none' : '';
+  document.getElementById('hitl-admin-login-button').style.display = isSignedIn ? 'none' : '';
+  document.getElementById('hitl-admin-logout-button').style.display = isSignedIn ? 'inline-block' : 'none';
+  if (isSignedIn) document.getElementById('hitl-admin-login-status').textContent =
+    `Signed in as ${sessionStorage.getItem('runtimeShieldAdminName') || 'admin'}.`;
+}
+
+async function loginHITLAdmin() {
+  const status = document.getElementById('hitl-admin-login-status');
+  const button = document.getElementById('hitl-admin-login-button');
+  button.disabled = true;
+  status.textContent = 'Signing in...';
+  try {
+    const response = await fetch('/api/approvals/session', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        username: document.getElementById('hitl-admin-username').value,
+        password: document.getElementById('hitl-admin-password').value
+      })
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || 'Admin sign-in failed.');
+    sessionStorage.setItem('runtimeShieldAdminToken', result.access_token);
+    sessionStorage.setItem('runtimeShieldAdminName', result.username);
+    document.getElementById('hitl-admin-password').value = '';
+    updateApprovalLoginUI();
+    await checkPendingApprovals();
+  } catch (error) {
+    status.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function logoutHITLAdmin() {
+  sessionStorage.removeItem('runtimeShieldAdminToken');
+  sessionStorage.removeItem('runtimeShieldAdminName');
+  document.getElementById('hitl-admin-login-status').textContent = 'Signed out.';
+  document.getElementById('hitl-pending-content').style.display = 'none';
+  updateApprovalLoginUI();
 }
 
 async function resolveApproval(reqId, action) {
   try {
-    await fetch('/api/approvals/' + reqId + '/action', {
+    const response = await fetch('/api/approvals/' + encodeURIComponent(reqId) + '/action', {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: approvalAuthHeaders({'Content-Type': 'application/json'}),
       body: JSON.stringify({action})
     });
-    checkPendingApprovals();
-  } catch(e) {}
+    if (response.status === 401 || response.status === 403) {
+      logoutHITLAdmin();
+      document.getElementById('hitl-admin-login-status').textContent = 'Admin session expired or not authorized. Sign in again.';
+      return;
+    }
+    if (!response.ok) {
+      const result = await response.json();
+      throw new Error(result.detail || 'Approval action failed.');
+    }
+    await checkPendingApprovals();
+  } catch(error) {
+    document.getElementById('hitl-admin-login-status').textContent = error.message;
+  }
 }
+
+document.getElementById('hitl-admin-login-button').addEventListener('click', loginHITLAdmin);
+document.getElementById('hitl-admin-logout-button').addEventListener('click', logoutHITLAdmin);
+updateApprovalLoginUI();
 
 function connectWS() {
   try {
@@ -7128,7 +8753,7 @@ setInterval(() => {
     # DYNAMIC CONFIGURATION & SCHEMA NEGOTIATION (DASHBOARD)
     # ---------------------------------------------------------
     tenant_id = os.getenv("SHIELD_TENANT_ID", "customer-delta-99")
-    dashboard_api_key = os.getenv("DASHBOARD_API_KEY", "mock-dashboard-key")
+    dashboard_api_key = os.getenv("DASHBOARD_API_KEY", "")
     
     dash_client = DashboardClient(
         dashboard_url=f"http://localhost:{dashboard_port}",
@@ -7238,16 +8863,19 @@ setInterval(() => {
                     provider_env[k] = val
             
             if provider == "keycloak-provider":
-                # keycloak-provider gets ONLY specific Keycloak config vars
-                kc_keys = {
-                    "KEYCLOAK_URL", "KEYCLOAK_REALM", "KEYCLOAK_CLIENT_ID", 
-                    "KEYCLOAK_CLIENT_SECRET", "KEYCLOAK_JWKS_URL", "KEYCLOAK_TOKEN_URL",
-                    "SPIFFE_BRIDGE_ID", "SPIFFE_SERVER_ID", "SPIFFE_SVID_PATH", "SPIFFE_BUNDLE_PATH"
-                }
-                for k in kc_keys:
+                # Keep user-login credentials out of the provider; its Admin API
+                # client-credentials grant uses the dedicated JIT service account.
+                for k in ("KEYCLOAK_URL", "KEYCLOAK_REALM", "KEYCLOAK_JWKS_URL", "KEYCLOAK_TOKEN_URL",
+                          "SPIFFE_BRIDGE_ID", "SPIFFE_SERVER_ID", "SPIFFE_SVID_PATH", "SPIFFE_BUNDLE_PATH"):
                     val = os.getenv(k)
                     if val is not None:
                         provider_env[k] = val
+                provider_env["KEYCLOAK_CLIENT_ID"] = "runtime-shield-jit"
+                jit_client_secret = os.getenv("RUNTIME_SHIELD_JIT_CLIENT_SECRET")
+                if jit_client_secret:
+                    provider_env["KEYCLOAK_CLIENT_SECRET"] = jit_client_secret
+                else:
+                    log("❌ RUNTIME_SHIELD_JIT_CLIENT_SECRET is required for the Keycloak provider's service-account login.")
             elif provider == "filesystem-provider":
                 # filesystem-provider gets NO Keycloak secrets and NO NVIDIA API keys, but needs public Keycloak URL and Realm for JIT token verification!
                 for k in ["KEYCLOAK_URL", "KEYCLOAK_REALM", "KEYCLOAK_ISSUER_URL", "KEYCLOAK_CLIENT_ID"]:
@@ -7329,6 +8957,70 @@ setInterval(() => {
                             params["name"] = tool_name
                             if "name" in data.get("params", {}):
                                 data["params"]["name"] = tool_name
+
+                        if tool_name in HONEYPOT_TOOLS:
+                            metadata = params.get("metadata", {}) or {}
+                            token = metadata.get("token") or metadata.get("keycloak_token")
+                            claims = {}
+                            if token:
+                                try:
+                                    claims = get_token_claims(token)
+                                except HTTPException:
+                                    log("⚠️ Honeypot attempt carried an invalid or expired identity token.")
+
+                            user_id = claims.get("preferred_username") or claims.get("sub") or "unknown_user"
+                            agent_id = claims.get("sub") or spiffe_cfg.get("bridge_id") or "anonymous-mcp-client"
+                            policy_input = {
+                                "user": {
+                                    "id": user_id or agent_id,
+                                    "role": normalize_role(
+                                        (claims.get("roles") or [None])[0]
+                                        if isinstance(claims.get("roles"), list)
+                                        else claims.get("roles")
+                                    ),
+                                    "scopes": [],
+                                },
+                                "workload": {"spiffe_id": "spiffe://runtime-shield/workload/mcp-client"},
+                                "agent": {"id": agent_id, "risk_score": fraud_engine.agent_risk_scores.get(agent_id, 0)},
+                                "mcp": {"server": "runtime-shield-honeypot", "tool": tool_name, "action": "call"},
+                                "resource": {"path": ""},
+                                "request": {"contains_pii": False, "prompt_injection_detected": False, "original_args": {}},
+                            }
+                            policy_decision = {}
+                            if active_policy_engine:
+                                try:
+                                    policy_decision = active_policy_engine.evaluate_policy(policy_input)
+                                except Exception as policy_error:
+                                    log(f"⚠️ Honeypot policy evaluation failed; enforcing local deny: {policy_error}")
+
+                            configured_risk = policy_decision.get("risk_delta")
+                            if not isinstance(configured_risk, int) or configured_risk <= 0:
+                                configured_risk = fraud_engine.HONEYPOT_PENALTY
+                            score, quarantined, reason = record_honeypot_attempt(
+                                tool_name=tool_name,
+                                agent_id=agent_id,
+                                user_id=user_id,
+                                risk_delta=configured_risk,
+                                rule_id=policy_decision.get("rule_id", "block-honeypots"),
+                            )
+                            error_resp = {
+                                "jsonrpc": "2.0",
+                                "id": data.get("id"),
+                                "error": {
+                                    "code": -32000,
+                                    "message": reason,
+                                    "data": {
+                                        "stage": "honeypot-trap",
+                                        "severity": "critical",
+                                        "risk_score": score,
+                                        "quarantined": quarantined,
+                                    },
+                                },
+                            }
+                            with stdout_lock:
+                                protocol_stdout.write(json.dumps(error_resp) + "\n")
+                                protocol_stdout.flush()
+                            continue
                                 
                         # --- ZERO-TRUST DEFAULT-DENY FOR UNKNOWN/UNSUPPORTED TOOLS ---
                         if tool_name not in tool_map:
@@ -7368,10 +9060,16 @@ setInterval(() => {
 
                         # Hardcoded RBAC blocks for Keycloak administrative tools before JIT enforcement
                         if tool_name in ("keycloak_list_users", "keycloak_revoke_user_sessions", "keycloak_run_drills"):
-                            effective_role = normalize_role(tool_args.get("role", DEFAULT_ROLE))
+                            metadata = params.get("metadata", {}) or {}
+                            identity_token = metadata.get("token") or metadata.get("keycloak_token")
+                            try:
+                                identity_claims = get_token_claims(identity_token)
+                            except HTTPException:
+                                identity_claims = {}
+                            effective_role = role_from_verified_claims(identity_claims)
                             if effective_role != "admin":
                                 reason = f"Role violation: Keycloak tool '{tool_name}' requires admin role."
-                                log(f"🚫 RBAC Block: {reason} (user={tool_args.get('user_id') or tool_args.get('username') or 'unknown_user'})")
+                                log(f"🚫 RBAC Block: {reason} (user={identity_claims.get('preferred_username', 'unknown_user')})")
                                 dashboard_state.add_event({
                                     "action": "deny",
                                     "tool": tool_name,
@@ -7395,72 +9093,90 @@ setInterval(() => {
                                 continue
                         
                         try:
-                            # --- AGENT IDENTITY HARDENING (JIT TOKENS) ---
-                            if tool_name == "keycloak_run_drills":
-                                jit_token = "mock-jit-token"
-                                required_scope = "tool:keycloak_report"
-                                user_role_val = normalize_role(tool_args.get("role", DEFAULT_ROLE))
-                                spiffe_id_val = spiffe_cfg["bridge_id"]
-                                trusted_workload_val = True
-                                user_id = "admin"
-                            else:
-                                metadata = params.get("metadata", {})
-                                user_token = metadata.get("token") or metadata.get("keycloak_token")
-                                
-                                # 1. VERIFY USER TOKEN
-                                claims = get_token_claims(user_token)
-                                
-                                # 2. DYNAMIC JIT SCOPE ISSUANCE (Production Least-Privilege)
-                                required_scope = scope_map.get(tool_name)
-                                if not user_token:
-                                    local_identity = f"Role: {DEFAULT_ROLE}"
-                                    local_token = os.getenv("KEYCLOAK_TOKEN", "").strip("'\"")
-                                    if local_token:
-                                        log("⚠️ WARNING: Fallback KEYCLOAK_TOKEN loaded from environment. Dynamic token acquisition should be preferred.")
-                                        try:
-                                             unverified = jwt.decode(local_token, options={"verify_signature": False})
-                                             username = unverified.get("preferred_username")
-                                             if username:
-                                                 local_identity = f"{username} ({DEFAULT_ROLE})"
-                                        except Exception:
-                                             pass
+                            metadata = params.get("metadata", {}) or {}
+                            user_token = metadata.get("token") or metadata.get("keycloak_token")
+                            local_dev_mode = os.getenv("LOCAL_DEV_MODE", "false").lower() == "true"
+                            if not user_token and local_dev_mode:
+                                user_token = os.getenv("KEYCLOAK_TOKEN", "").strip("'\"")
 
-                                    log(f"⚠️ AUTH PASSTHROUGH: '{tool_name}' via local client [{local_identity}]")
-                                else:
-                                    user_id_from_token = claims.get("preferred_username") or claims.get("sub") or "unknown"
-                                    log(f"🔑 Identity verified: {user_id_from_token}. Dynamic JIT scope '{required_scope}' will be issued for tool '{tool_name}'.")
+                            if not user_token and not local_dev_mode:
+                                reason = "A verified Keycloak bearer token is required for tool execution."
+                                error_resp = {
+                                    "jsonrpc": "2.0",
+                                    "id": data.get("id"),
+                                    "error": {"code": -32003, "message": reason},
+                                }
+                                with stdout_lock:
+                                    protocol_stdout.write(json.dumps(error_resp) + "\n")
+                                    protocol_stdout.flush()
+                                continue
 
-                                # 3. JIT TOKEN EXCHANGE (DOWNSCOPING)
+                            claims = get_token_claims(user_token) if user_token else {}
+                            authenticated_user_id = (
+                                claims.get("preferred_username")
+                                or claims.get("sub")
+                                or ("local-dev-user" if local_dev_mode else "anonymous_user")
+                            )
+                            user_role_val = role_from_verified_claims(claims) if claims else "user"
+
+                            if (
+                                tool_name in ("keycloak_list_users", "keycloak_revoke_user_sessions", "keycloak_run_drills")
+                                and (not claims or user_role_val != "admin")
+                            ):
+                                reason = f"Role violation: Keycloak tool '{tool_name}' requires an admin role in the verified token."
+                                error_resp = {
+                                    "jsonrpc": "2.0",
+                                    "id": data.get("id"),
+                                    "error": {"code": -32001, "message": reason},
+                                }
+                                with stdout_lock:
+                                    protocol_stdout.write(json.dumps(error_resp) + "\n")
+                                    protocol_stdout.flush()
+                                continue
+
+                            required_scope = scope_map.get(tool_name)
+                            jit_token = None
+                            if user_token:
                                 provider_name = tool_map.get(tool_name, "unknown")
-                                token_to_exchange = user_token or os.getenv("KEYCLOAK_TOKEN", "").strip("'\"")
-                                
-                                jit_token = None
-                                if token_to_exchange:
-                                    try:
-                                        log(f"🔄 JIT Dynamic Scope: Requesting ONLY scope '{required_scope}' for tool '{tool_name}' (TTL: 60s)")
-                                        jit_token = jit_manager.exchange_token(token_to_exchange, required_scope, provider_name)
-                                        log(f"✅ JIT Token issued: scope='{required_scope}' | tool='{tool_name}' | provider='{provider_name}'")
-                                    except Exception as ex:
-                                        log(f"⚠️ JIT Token exchange failed: {ex}. Falling back to default token.")
-                                        jit_token = token_to_exchange
-                                else:
-                                    log(f"⚠️ No Keycloak token found in environment. Proceeding with mock token for tool execution.")
-                                    jit_token = "mock-jit-token"
-                                
-                                # Replace broad user token with downscoped JIT token before routing to jail
-                                if "metadata" not in data["params"]:
-                                    data["params"]["metadata"] = {}
-                                data["params"]["metadata"]["token"] = jit_token
-                                data["params"]["metadata"]["jit_enabled"] = True
+                                try:
+                                    log(f"🔄 JIT Dynamic Scope: Requesting scope '{required_scope}' for tool '{tool_name}'")
+                                    jit_token = jit_manager.exchange_token(user_token, required_scope, provider_name)
+                                    log(f"✅ JIT token issued for tool '{tool_name}'")
+                                except Exception as ex:
+                                    reason = f"JIT token exchange failed; tool execution denied: {ex}"
+                                    log(f"🚫 {reason}")
+                                    error_resp = {
+                                        "jsonrpc": "2.0",
+                                        "id": data.get("id"),
+                                        "error": {"code": -32004, "message": "JIT token exchange failed; tool execution denied."},
+                                    }
+                                    with stdout_lock:
+                                        protocol_stdout.write(json.dumps(error_resp) + "\n")
+                                        protocol_stdout.flush()
+                                    continue
+                            elif local_dev_mode and os.getenv("RUNTIME_SHIELD_DEV_JIT_TOKEN") and tool_name not in (
+                                "keycloak_list_users",
+                                "keycloak_revoke_user_sessions",
+                                "keycloak_run_drills",
+                            ):
+                                jit_token = os.environ["RUNTIME_SHIELD_DEV_JIT_TOKEN"]
+                            else:
+                                reason = "A verified Keycloak identity is required for this tool."
+                                error_resp = {
+                                    "jsonrpc": "2.0",
+                                    "id": data.get("id"),
+                                    "error": {"code": -32003, "message": reason},
+                                }
+                                with stdout_lock:
+                                    protocol_stdout.write(json.dumps(error_resp) + "\n")
+                                    protocol_stdout.flush()
+                                continue
 
-                                # Resolve spiffe and role info for authContext
-                                spiffe_id_val = spiffe_cfg["bridge_id"]
-                                if spiffe_cfg["enabled"]:
-                                    spiffe_id_val = tool_args.get("spiffe_id", "") or tool_args.get("_spiffe_id", "") or spiffe_cfg["bridge_id"]
-                                user_role_val = normalize_role(tool_args.get("role", DEFAULT_ROLE))
-                                trusted_workload_val = True
-                                if spiffe_cfg["enabled"]:
-                                    trusted_workload_val = spiffe_allowed(spiffe_id_val)
+                            data["params"].setdefault("metadata", {})
+                            data["params"]["metadata"]["token"] = jit_token
+                            data["params"]["metadata"]["jit_enabled"] = True
+                            spiffe_id_val = spiffe_cfg["bridge_id"]
+                            trusted_workload_val = spiffe_allowed(spiffe_id_val)
 
                             # Package the new structured Auth Context
                             if "_meta" not in data["params"]:
@@ -7475,16 +9191,11 @@ setInterval(() => {
                                 "source": "bridge"
                             }
 
-                            if tool_name != "keycloak_run_drills":
-                                user_id = tool_args.get("user_id") or tool_args.get("userId") or tool_args.get("username") or "unknown_user"
-                            else:
-                                user_id = "admin"
+                            user_id = authenticated_user_id
 
                             # 1. SPIFFE CHECK
                             if spiffe_cfg["enabled"]:
-                                spiffe_id = tool_args.get("spiffe_id", "") or tool_args.get("_spiffe_id", "")
-                                if not spiffe_id:
-                                    spiffe_id = spiffe_cfg["bridge_id"]
+                                spiffe_id = spiffe_cfg["bridge_id"]
 
                                 if not spiffe_allowed(spiffe_id):
                                     log(f"🚫 SPIFFE violation: unauthorized service identity {spiffe_id}")
@@ -7513,7 +9224,7 @@ setInterval(() => {
                                     continue
 
                             # 2. ROLE CHECK
-                            user_role = normalize_role(tool_args.get("role", DEFAULT_ROLE))
+                            user_role = user_role_val
                             # Inject role so that mcp-firewall matches rule arguments.role correctly
                             if isinstance(tool_args, dict):
                                 tool_args["role"] = user_role
@@ -7722,6 +9433,32 @@ setInterval(() => {
                                 protocol_stdout.flush()
                             continue
 
+                    if tool_name == "write_file":
+                        reason = (
+                            "write_file requires Runtime Shield HITL approval through "
+                            "the authenticated HTTP endpoint; direct stdio execution is disabled."
+                        )
+                        dashboard_state.add_event({
+                            "action": "sandbox_block",
+                            "tool": tool_name,
+                            "agent": "bridge-mcp-input",
+                            "reason": reason,
+                            "actual_execution_environment": "none",
+                            "execution_decision": "blocked_without_hitl",
+                            "severity": "high",
+                            "stage": "hitl-approval",
+                            "timestamp": time.time(),
+                        })
+                        error_resp = {
+                            "jsonrpc": "2.0",
+                            "id": data.get("id"),
+                            "error": {"code": -32005, "message": reason},
+                        }
+                        with stdout_lock:
+                            protocol_stdout.write(json.dumps(error_resp) + "\n")
+                            protocol_stdout.flush()
+                        continue
+
                     if not line.endswith("\n"):
                         line += "\n"
 
@@ -7781,9 +9518,9 @@ setInterval(() => {
                                         pass
                                     resp = requests.post(c.post_url, json=d, headers=post_headers, timeout=10.0)
                                     if resp.status_code not in (200, 202):
-                                        log(f"⚠️ Remote provider {c.provider_name} POST returned {resp.status_code}: {resp.text}")
+                                        log(f"⚠️ Remote provider {c.provider_name} POST returned HTTP {resp.status_code}")
                                 except Exception as e:
-                                    log(f"⚠️ Error routing request to remote provider {c.provider_name}: {e}")
+                                    log(f"⚠️ Error routing request to remote provider {c.provider_name}: {type(e).__name__}")
                             threading.Thread(target=send_post_sync, daemon=True).start()
                         else:
                             log(f"⚠️ POST endpoint for remote provider '{provider}' is not active yet")
@@ -7872,7 +9609,7 @@ setInterval(() => {
                                 continue # Wait for other providers to respond
                                 
                             # Re-construct aggregated single tools/list response
-                            msg["result"]["tools"] = merged_tools
+                            msg["result"]["tools"] = ToolsListAggregator.include_honeypot_tools(merged_tools)
                             line_str = json.dumps(msg) + "\n"
 
                     current_role = normalize_role(None)

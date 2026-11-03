@@ -1,19 +1,24 @@
 node_modules/
-node_modules/
 .env
 venv/
 .venv/
 *.log
 dist/
 keycloak_data/
+keycloak-tls/
+librechat.runtime.yaml
 telemetry.db*
 __pycache__/
+# Ignore newly generated local SPIRE private keys; the existing tracked keys need planned rotation/history cleanup.
+/spire/certs/*.key
+/spire/certs/*.crt
 
 # Test & scratch artifacts
 tests/
 scratch/
 temp_repo/
 .pytest_cache/
+secure-experiment-zone/hitl-demo*.txt
 # Governance memory session files and temp files
 governance_memory/short_term/sessions/
 query

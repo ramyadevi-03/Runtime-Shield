@@ -1,0 +1,4 @@
+services:
+  chatbot:
+    volumes:
+      - ./librechat.runtime.yaml:/app/librechat.yaml:ro

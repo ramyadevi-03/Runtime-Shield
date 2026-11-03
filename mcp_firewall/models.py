@@ -212,12 +212,31 @@ class PIIConfig(BaseModel):
     ])
     outbound_patterns: list[dict[str, str]] = Field(default_factory=lambda: [
         {"name": "Email Address", "pattern": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "placeholder": "[PII REDACTED by mcp-firewall]"},
+        {
+            "name": "Phone (US)",
+            "pattern": r"\b(?:\+?1[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]?\d{3}[\s.-]?\d{4}\b",
+            "placeholder": "[PII REDACTED by mcp-firewall]",
+        },
         {"name": "Phone (International)", "pattern": r"\+\d{1,3}[\s.-]?\(?\d{1,4}\)?[\s.-]?\d{2,4}[\s.-]?\d{2,4}[\s.-]?\d{0,4}", "placeholder": "[PII REDACTED by mcp-firewall]"},
         {"name": "SSN (US)", "pattern": r"\b\d{3}-\d{2}-\d{4}\b", "placeholder": "[PII REDACTED by mcp-firewall]"},
+        {
+            "name": "Credit Card (grouped)",
+            "pattern": r"\b(?:\d{4}[- ]?){3}\d{4}\b",
+            "placeholder": "[PII REDACTED by mcp-firewall]",
+        },
         {"name": "Credit Card", "pattern": r"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b", "placeholder": "[PII REDACTED by mcp-firewall]"},
         {"name": "IBAN", "pattern": r"\b[A-Z]{2}\d{2}[A-Z0-9]{4,30}\b", "placeholder": "[PII REDACTED by mcp-firewall]"},
         {"name": "AHV (Swiss SSN)", "pattern": r"\b756\.\d{4}\.\d{4}\.\d{2}\b", "placeholder": "[PII REDACTED by mcp-firewall]"},
-        {"name": "IPv4 Address", "pattern": r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b", "placeholder": "[PII REDACTED by mcp-firewall]"}
+        {
+            "name": "IPv4 Address",
+            "pattern": r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b",
+            "placeholder": "[PII REDACTED by mcp-firewall]",
+        },
+        {
+            "name": "Titled Person Name",
+            "pattern": r"\b(?:Dr|Mr|Mrs|Ms|Miss|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b",
+            "placeholder": "[PII REDACTED by mcp-firewall]",
+        },
     ])
 
 

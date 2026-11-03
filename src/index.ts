@@ -175,9 +175,14 @@ function wrapToolsWithJitVerification(serverInstance: any) {
         if (filePath && typeof filePath === "string") {
           // 1. Normalize separators
           let normalizedPath = filePath.replace(/\\/g, "/");
+          const pathSegments = normalizedPath.split("/").map((segment: string) => segment.toLowerCase());
+          if (pathSegments.some((segment: string) => segment === ".env" || segment.startsWith(".env.") || segment.startsWith(".env-"))) {
+            console.error(`❌ [JIT Security Gateway] DENIED: Sensitive environment file path blocked: '${filePath}'`);
+            throw new Error("Security Violation: Environment and secret files are not accessible through filesystem tools.");
+          }
           
           // 2. Traversal and absolute path pattern checks
-          const segments = normalizedPath.split("/").map(s => s.trim()).filter(Boolean);
+          const segments = normalizedPath.split("/").map((s: string) => s.trim()).filter(Boolean);
           const hasTraversal = segments.includes("..") || segments.some(s => s === ".." || s.startsWith("..") || s.endsWith(".."));
           const hasTrailingDot = normalizedPath.endsWith("/.") || normalizedPath.endsWith("/..") || normalizedPath === "." || normalizedPath === "..";
           const isAbsolute = normalizedPath.startsWith("/") || normalizedPath.includes(":") || normalizedPath.startsWith("//");

@@ -27,8 +27,8 @@ mcpServers:
       client_id: "${RUNTIME_SHIELD_MCP_CLIENT_ID}"
       client_secret: "${RUNTIME_SHIELD_MCP_CLIENT_SECRET}"
       redirect_uri: "http://localhost:3080/api/mcp/runtime-shield-hitl/oauth/callback"
-      scope: "openid"
-    serverInstructions: "Use write_file only for user-requested changes under secure-experiment-zone/. The administrator must approve each write in the Runtime Shield dashboard."
+      scope: "openid repository:read"
+    serverInstructions: "Use github.read_repository only for the fixed local runtime-shield/demo repository; never choose a credential or upstream host. write_file is limited to secure-experiment-zone/ and requires administrator approval in the Runtime Shield dashboard."
 
 # Custom Endpoints configuring Runtime Shield Gateway
 endpoints:

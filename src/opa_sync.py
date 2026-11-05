@@ -1,6 +1,5 @@
 import os
 import json
-import hashlib
 import logging
 import time
 import requests
@@ -41,10 +40,8 @@ def get_opa_status() -> dict:
 
 def sync_policies(max_retries: int = 15, retry_interval: float = 2.0) -> bool:
     """
-    Loads pre-normalized rules from rules/runtime_shield_data.json and the Rego
-    policy from rules/runtime_shield.rego, then pushes both to the OPA server.
-
-    Includes retry logic to wait for OPA server readiness during container startup.
+    Confirm the read-only mounted policy is loaded by OPA. Runtime Shield never
+    writes policy/data through OPA's unauthenticated management API.
     """
     global _last_sync_status, _last_data_hash, _last_sync_time, _opa_reachable
     project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -71,39 +68,32 @@ def sync_policies(max_retries: int = 15, retry_interval: float = 2.0) -> bool:
         return False
 
     try:
-        # Load pre-normalized rules from the OPA-native JSON data file
         with open(data_path, "r", encoding="utf-8") as f:
             data_payload = json.load(f)
-
-        rules = data_payload.get("rules", [])
-
-        # 1. Upload Rego Policy
         with open(rego_path, "r", encoding="utf-8") as f:
             rego_content = f.read()
-
-        logger.info(f"Syncing Rego policy to OPA at {base_url}...")
-        resp_pol = requests.put(
-            f"{base_url}/v1/policies/runtime_shield",
-            data=rego_content,
-            headers={"Content-Type": "text/plain"},
-            timeout=5.0
+        if not isinstance(data_payload.get("rules"), list) or "package runtime_shield.authz" not in rego_content:
+            raise ValueError("Runtime Shield policy files are invalid")
+        check = requests.post(
+            f"{base_url}/v1/data/runtime_shield/authz/decision",
+            json={"input": {
+                "user": {"sub": "policy-health-probe", "scopes": ["health:probe"]},
+                "workload": {"id": "policy-health-probe"},
+                "agent": {"id": "policy-health-probe"},
+                "mcp": {"tool": "__policy_health_probe__"},
+                "resource": {},
+                "request": {"original_args": {}},
+            }},
+            timeout=3.0,
         )
-        resp_pol.raise_for_status()
-
-        # 2. Upload JSON Data
-        logger.info(f"Syncing {len(rules)} rules to OPA from runtime_shield_data.json...")
-        resp_data = requests.put(
-            f"{base_url}/v1/data/runtime_shield",
-            json=data_payload,
-            timeout=5.0
-        )
-        resp_data.raise_for_status()
-
-        config_hash = hashlib.md5(json.dumps(rules, sort_keys=True).encode()).hexdigest()
-        _last_data_hash = config_hash[:8]
+        check.raise_for_status()
+        loaded_decision = check.json().get("result", {})
+        if loaded_decision.get("rule_id") != "default_deny" or loaded_decision.get("allow") is not False:
+            raise ValueError("OPA did not return the expected default-deny policy result")
+        _last_data_hash = "read-only"
         _last_sync_status = "success"
         _last_sync_time = time.time()
-        logger.info(f"✅ Successfully synchronized OPA rules. (Data Hash: {_last_data_hash})")
+        logger.info("✅ OPA policy is loaded from read-only mounted files; management API was not used.")
         return True
 
     except requests.exceptions.RequestException as e:

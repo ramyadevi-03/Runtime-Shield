@@ -25,10 +25,61 @@ decision := out if {
 }
 
 rule_matches(rule) if {
+    identity_context_valid
     regex.match(rule.tool, input.mcp.tool)
     role_matches(rule)
+    scope_matches(rule)
+    workload_matches(rule)
+    agent_matches(rule)
     path_matches(rule)
     extra_field_matches(rule)
+}
+
+workload_matches(rule) if {
+    required := object.get(rule, "required_workloads", [])
+    count(required) == 0
+}
+workload_matches(rule) if {
+    required := object.get(rule, "required_workloads", [])
+    count(required) > 0
+    actual := object.get(object.get(input, "workload", {}), "spiffe_id", "")
+    actual in required
+}
+
+agent_matches(rule) if {
+    required := object.get(rule, "required_agents", [])
+    count(required) == 0
+}
+agent_matches(rule) if {
+    required := object.get(rule, "required_agents", [])
+    count(required) > 0
+    actual := object.get(object.get(input, "agent", {}), "id", "")
+    actual in required
+}
+
+scope_matches(rule) if {
+    required := object.get(rule, "required_scopes", [])
+    count(required) == 0
+}
+scope_matches(rule) if {
+    required := object.get(rule, "required_scopes", [])
+    count(required) > 0
+    actual := object.get(object.get(input, "user", {}), "scopes", [])
+    every scope in required { scope in actual }
+}
+
+# Every allow rule is bound to a verified subject, workload, agent identity,
+# and non-empty scopes. The bridge populates these only from verified claims
+# and configured workload identity; missing context always denies.
+identity_context_valid if {
+    subject := object.get(object.get(input, "user", {}), "sub", "")
+    subject != ""
+    workload := object.get(object.get(input, "workload", {}), "id", "")
+    workload != ""
+    agent := object.get(object.get(input, "agent", {}), "id", "")
+    agent != ""
+    scopes := object.get(object.get(input, "user", {}), "scopes", [])
+    count(scopes) > 0
 }
 
 role_matches(rule) if {

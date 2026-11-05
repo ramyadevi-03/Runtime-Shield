@@ -1,0 +1,32 @@
+{
+  "credentials": {
+    "demo-agent": [
+      "github-production"
+    ]
+  },
+  "tools": {
+    "demo-agent": [
+      "github.read_repository"
+    ]
+  },
+  "operations": {
+    "demo-agent": [
+      "repository:read"
+    ]
+  },
+  "resources": {
+    "demo-agent": [
+      "runtime-shield"
+    ]
+  },
+  "workloads": {
+    "demo-agent": [
+      "agent-runtime"
+    ]
+  },
+  "manifest_hashes": [
+    "sha256:ef6a79401b0d41c9773560c22bfb8d47efb591562b6a2162162c227b748999a7"
+  ],
+  "max_lease_seconds": 300,
+  "max_delegation_depth": 3
+}

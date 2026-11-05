@@ -2048,9 +2048,11 @@ class BaseJailer:
         self.cwd = cwd
         self.env = env
         self.allowed_paths = allowed_paths
+        self.isolation = "none"
+        self.drop_privileges = False
 
     def get_popen_kwargs(self, cmd):
-        return {
+        kwargs = {
             "cwd": self.cwd,
             "stdin": subprocess.PIPE,
             "stdout": subprocess.PIPE,
@@ -2060,6 +2062,9 @@ class BaseJailer:
             "bufsize": 1,
             "env": self.env
         }
+        if self.drop_privileges and os.name == "posix":
+            kwargs.update({"user": 65534, "group": 65534, "extra_groups": []})
+        return kwargs
 
 class LandlockJailer(BaseJailer):
     def get_popen_kwargs(self, cmd):
@@ -2224,9 +2229,12 @@ class OpenSandboxJailer(BaseJailer):
 class JailFactory:
     @staticmethod
     def get_jailer(provider_name, cwd, env, allowed_paths):
-        # When running inside a container (e.g. Docker / Dokploy), internal MCP servers run directly
+        # A shared gateway container is not independent provider isolation.
         if os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER", "false").lower() == "true":
-            return BaseJailer(provider_name, cwd, env, allowed_paths)
+            log(f"⚠️ Provider {provider_name} is running without independent process/container isolation")
+            jailer = BaseJailer(provider_name, cwd, env, allowed_paths)
+            jailer.drop_privileges = True
+            return jailer
 
         # Docker Desktop's Linux containers cannot bind-mount Windows paths reliably
         # for stdio MCP providers; use the restricted Windows process jail instead.
@@ -3132,26 +3140,9 @@ class JITTokenManager:
         Exchanges a broad user token for a short-lived, downscoped JIT token.
         Implements RFC 8693 (Token Exchange).
         """
-        # 1. Check if token is a Google OIDC token or HS256 mock/federated token
-        try:
-            unverified_header = jwt.get_unverified_header(user_token)
-            alg = unverified_header.get("alg")
-            unverified_claims = jwt.decode(user_token, options={"verify_signature": False, "verify_exp": False, "verify_aud": False})
-            iss = unverified_claims.get("iss", "")
-            
-            # Mock downscoping is permitted only in explicitly enabled local development.
-            if os.getenv("LOCAL_DEV_MODE", "false").lower() == "true" and (
-                alg == "HS256" or "accounts.google.com" in iss or "external-idp" in iss
-            ):
-                jit_claims = unverified_claims.copy()
-                jit_claims["scope"] = required_scope or "openid"
-                jit_claims["exp"] = time.time() + 60
-                mock_jit = jwt.encode(jit_claims, "secret", algorithm="HS256")
-                log(f"🎟️ JIT Federated/Google Token Downscoped Successfully for Scope '{required_scope}'")
-                return mock_jit
-        except Exception as ex:
-            log(f"⚠️ Failed federated JIT downscope check: {ex}")
-
+        if not required_scope:
+            raise RuntimeError("Provider scope is not configured")
+        expected_workload = os.getenv("RUNTIME_SHIELD_JIT_WORKLOAD_ID", "spiffe://runtime-shield/bridge")
         log(f"🔄 JIT: Exchanging user token for downscoped '{required_scope}' token (Audience: {self.client_id})")
         
         # 2. Standard RFC 8693 request body parameters for Keycloak
@@ -3161,6 +3152,7 @@ class JITTokenManager:
             "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "scope": required_scope,
+            "audience": self.client_id,
         }
         
         try:
@@ -3177,18 +3169,31 @@ class JITTokenManager:
                 token_data = resp.json()
                 jit_token = token_data.get("access_token")
                 if jit_token:
-                    ttl = token_data.get("expires_in", 60)
-                    log(f"🎟️ JIT Token Issued Successfully (TTL: {ttl}s)")
+                    claims = verifier.verify(jit_token)
+                    now = time.time()
+                    from src.jit_validation import validate_jit_claims
+                    issuer_base = os.getenv("KEYCLOAK_ISSUER_URL", os.getenv("KEYCLOAK_URL", "http://keycloak:8080")).rstrip("/")
+                    expected_issuer = f"{issuer_base}/realms/{os.getenv('KEYCLOAK_REALM', 'master')}"
+                    if not validate_jit_claims(
+                        claims,
+                        expected_issuer=expected_issuer,
+                        expected_audience=self.client_id,
+                        required_scope=required_scope,
+                        expected_workload=expected_workload,
+                        now=now,
+                    ):
+                        raise RuntimeError("Exchanged token claims do not match the requested provider context")
+                    ttl = min(int(token_data.get("expires_in", claims["exp"] - now)), int(claims["exp"] - now))
+                    if ttl <= 0:
+                        raise RuntimeError("Exchanged token is expired")
+                    log(f"🎟️ JIT Token Issued and verified (TTL: {ttl}s)")
                     return jit_token
                 raise RuntimeError("Keycloak JIT token exchange returned no access token")
-            error_detail = resp.json().get("error_description", resp.text)
-            raise RuntimeError(
-                f"Keycloak JIT token exchange returned HTTP {resp.status_code}: {error_detail}"
-            )
+            raise RuntimeError(f"Keycloak JIT token exchange returned HTTP {resp.status_code}")
         except Exception as net_err:
             if isinstance(net_err, RuntimeError):
                 raise
-            raise RuntimeError(f"Keycloak JIT token exchange request failed: {net_err}") from net_err
+            raise RuntimeError("Keycloak JIT token exchange request failed") from None
 
 # Global Identity Managers
 kc_url = os.getenv("KEYCLOAK_URL") or "http://keycloak:8080"
@@ -6206,6 +6211,15 @@ async def librechat_mcp_endpoint(request: Request):
                         "required": ["path", "content"],
                         "additionalProperties": False,
                     },
+                }, {
+                    "name": "github.read_repository",
+                    "description": "Read the fixed local Runtime Shield demo repository through the credential broker.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"repository": {"type": "string", "enum": ["runtime-shield/demo"]}},
+                        "required": ["repository"],
+                        "additionalProperties": False,
+                    },
                 }],
             },
         })
@@ -6243,20 +6257,21 @@ async def librechat_mcp_endpoint(request: Request):
         )
 
     params = body.get("params")
-    if not isinstance(params, dict) or params.get("name") != "write_file":
+    if not isinstance(params, dict) or params.get("name") not in {"write_file", "github.read_repository"}:
         return JSONResponse(
             status_code=400,
             content={"jsonrpc": "2.0", "id": request_id, "error": {
-                "code": -32602, "message": "Only the write_file tool is available.",
+                "code": -32602, "message": "The requested Runtime Shield tool is unavailable.",
             }},
         )
+    requested_tool = params["name"]
 
     tool_request = {
         "jsonrpc": "2.0",
         "id": f"librechat-{uuid.uuid4().hex}",
         "method": "tools/call",
         "params": {
-            "name": "write_file",
+            "name": requested_tool,
             "arguments": params.get("arguments", {}),
         },
     }
@@ -6321,6 +6336,16 @@ async def librechat_mcp_endpoint(request: Request):
     return JSONResponse(content={"jsonrpc": "2.0", "id": request_id, "result": result})
 
 
+def _verified_scope_list(claims: dict) -> list[str]:
+    """Return only scope claims from the already signature-verified JWT."""
+    raw = claims.get("scope", claims.get("scp", []))
+    if isinstance(raw, str):
+        return sorted({item for item in raw.split() if item})
+    if isinstance(raw, (list, tuple, set)):
+        return sorted({item for item in raw if isinstance(item, str) and item})
+    return []
+
+
 @dashboard_app.post("/v1/tool/execute")
 async def execute_tool_proxy(request: Request):
     global gateway_instance, nim_guard_instance, fraud_engine_instance
@@ -6343,6 +6368,8 @@ async def execute_tool_proxy(request: Request):
     params = body.get("params", {})
     tool_name = params.get("name", "")
     tool_args = params.get("arguments", {}) or {}
+    from src.credential_tools import registered_tool
+    credential_tool = registered_tool(tool_name)
 
     # --- CENTRALIZED LLM-AGNOSTIC RUNTIME GOVERNANCE: TOOL NORMALIZATION ---
     original_tool_name = tool_name
@@ -6383,7 +6410,7 @@ async def execute_tool_proxy(request: Request):
             body["params"]["name"] = tool_name
 
     # --- ZERO-TRUST DEFAULT-DENY FOR UNKNOWN/UNSUPPORTED TOOLS ---
-    if tool_name not in tool_map and tool_name not in HONEYPOT_TOOLS:
+    if tool_name not in tool_map and tool_name not in HONEYPOT_TOOLS and not credential_tool:
         reason = f"Zero-Trust Block: Unknown or unsupported tool call '{tool_name}' denied by default (Centralized Governance)"
         log(f"🚫 {reason}")
         dashboard_state.add_event({
@@ -6608,11 +6635,13 @@ async def execute_tool_proxy(request: Request):
     policy_input = {
         "user": {
             "id": user_id or user_sub,
+            "sub": user_sub,
             "role": user_role,
-            "scopes": []  # Add actual scopes if available
+            "scopes": _verified_scope_list(claims),
         },
         "workload": {
-            "spiffe_id": spiffe_id
+            "spiffe_id": spiffe_id,
+            "id": spiffe_id,
         },
         "agent": {
             "id": spiffe_id,
@@ -6714,6 +6743,9 @@ async def execute_tool_proxy(request: Request):
             },
         )
 
+    if credential_tool and credential_tool["requires_hitl"]:
+        decision["risk_delta"] = max(10, decision.get("risk_delta", 0))
+
     # Integrate with Fraud Engine for risk score modification and deduplication
     class DummyDecision:
         def __init__(self, action, reason, name, risk_delta=None, quarantine=False):
@@ -6782,27 +6814,21 @@ async def execute_tool_proxy(request: Request):
         return JSONResponse(status_code=403, content={"error": f"Tool blocked by policy: {decision['reason']}"})
 
     jit_token = None
-    if tool_name != "fetch_url" and tool_name not in VULN_MCP_UPSTREAM:
+    required_scope = None
+    provider_name = None
+    token_to_exchange = token
+    if tool_name != "fetch_url" and tool_name not in VULN_MCP_UPSTREAM and not credential_tool:
         required_scope = scope_map.get(tool_name)
         provider_name = tool_map.get(tool_name, "unknown")
-        token_to_exchange = token
         if not token_to_exchange and local_dev_mode:
             token_to_exchange = os.getenv("KEYCLOAK_TOKEN", "").strip("'\"")
 
         if not token_to_exchange:
             raise HTTPException(status_code=401, detail="No Keycloak authentication token provided")
 
-        try:
-            log(f"🔑 REST Proxy: Performing JIT exchange for tool '{tool_name}' and provider '{provider_name}' before approval...")
-            jit_token = jit_manager.exchange_token(token_to_exchange, required_scope, provider_name)
-            log("🔑 REST Proxy: JIT exchange successful.")
-        except Exception as e:
-            log(f"❌ JIT Token exchange failed before approval: {e}")
-            return JSONResponse(status_code=403, content={"error": f"Security JIT token exchange failed: {e}"})
-
     # --- HUMAN IN THE LOOP (HITL) APPROVAL INTERCEPTION ---
     HIGH_RISK_TOOLS = {"write_file", "keycloak_revoke_user_sessions", "keycloak_quarantine_user", "ScanSecrets"}
-    is_high_risk = (
+    is_high_risk = bool(credential_tool and credential_tool["requires_hitl"]) or (
         tool_name in HIGH_RISK_TOOLS or 
         decision.get("risk_delta", 0) >= 10 or
         decision.get("quarantine", False)
@@ -6925,6 +6951,33 @@ async def execute_tool_proxy(request: Request):
                 "session_id": session_id,
                 "timestamp": time.time(),
             })
+        elif credential_tool:
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as _egress_health_client:
+                    _egress_health_response = await _egress_health_client.get(
+                        os.getenv("RUNTIME_SHIELD_EGRESS_URL", "http://credential-egress:8090").rstrip("/") + "/health"
+                    )
+                    _egress_health_response.raise_for_status()
+                dashboard_state.add_event({
+                    "action": "sandbox_verified",
+                    "tool": tool_name,
+                    "agent": spiffe_id,
+                    "req_id": req_id,
+                    "user_id": user_id,
+                    "user_role": user_role,
+                    "hitl_decision": "approve",
+                    "required_sandbox": "isolated-egress-service",
+                    "actual_execution_environment": "credential-egress",
+                    "sandbox_available": True,
+                    "execution_decision": "execute_in_isolated_egress",
+                    "reason": "Dedicated egress service health verified after HITL approval.",
+                    "severity": "info",
+                    "stage": "sandbox-enforcement",
+                    "session_id": session_id,
+                    "timestamp": time.time(),
+                })
+            except Exception:
+                return JSONResponse(status_code=503, content={"error": "Isolated credential egress is unavailable."})
         elif requires_sandbox_isolation(tool_name, _risk_delta_for_gate):
             try:
                 _sandbox_status = SandboxEnforcer.verify_for_high_risk(
@@ -6992,6 +7045,30 @@ async def execute_tool_proxy(request: Request):
                     },
                 )
         # == END SANDBOX GATE =======================================================
+
+    # Exchange only after approval and sandbox checks so the provider-bound
+    # token is fresh and cannot outlive a denied or timed-out approval.
+    if provider_name:
+        try:
+            jit_token = jit_manager.exchange_token(token_to_exchange, required_scope, provider_name)
+        except Exception:
+            log(f"JIT exchange rejected for provider {provider_name!r}; execution denied.")
+            return JSONResponse(status_code=403, content={"error": "Provider authorization failed."})
+
+    if credential_tool:
+        from src.credential_tools import execute_registered_tool
+        try:
+            result = await execute_registered_tool(tool_name, tool_args, str(req_id))
+            response_body = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"content": [{"type": "text", "text": json.dumps(result)}]},
+            }
+            safe = presidio_redact(json.dumps(response_body), is_admin=(user_role == "admin"))
+            return JSONResponse(content=json.loads(safe))
+        except Exception:
+            log(f"Credential-backed tool execution failed for registered tool {tool_name!r}.")
+            return JSONResponse(status_code=502, content={"error": "Credential-backed operation failed."})
 
     if workshop_docker_write:
         try:
@@ -7147,6 +7224,7 @@ async def execute_tool_proxy(request: Request):
         "requiredScope": required_scope,
         "requiredRole": user_role,
         "workloadSpiffeId": spiffe_id,
+        "expectedWorkloadId": os.getenv("RUNTIME_SHIELD_JIT_WORKLOAD_ID", "spiffe://runtime-shield/bridge"),
         "trustedWorkload": True,
         "source": "bridge-rest"
     }
@@ -8857,6 +8935,9 @@ setInterval(() => {
             provider_env["SPIFFE_ENABLED"] = "true" if spiffe_cfg["enabled"] else "false"
             provider_env["RUNTIME_ROLE"] = DEFAULT_ROLE
             provider_env["PROVIDER_NAME"] = provider
+            if os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER", "false").lower() == "true":
+                provider_env["HOME"] = "/tmp"
+                provider_env["TMPDIR"] = "/tmp"
             
             # Pass Spire/Spiffe variables to stdio subprocesses for workload attestation
             for k in ["SPIRE_AGENT_SOCKET", "SPIFFE_SVID_PATH", "SPIFFE_BUNDLE_PATH", "SPIFFE_BRIDGE_ID", "SPIFFE_SERVER_ID"]:
@@ -8865,19 +8946,14 @@ setInterval(() => {
                     provider_env[k] = val
             
             if provider == "keycloak-provider":
-                # Keep user-login credentials out of the provider; its Admin API
-                # client-credentials grant uses the dedicated JIT service account.
+                # The confidential client secret stays in the gateway. The provider
+                # receives only the short-lived, provider-bound JIT token per call.
                 for k in ("KEYCLOAK_URL", "KEYCLOAK_REALM", "KEYCLOAK_JWKS_URL", "KEYCLOAK_TOKEN_URL",
                           "SPIFFE_BRIDGE_ID", "SPIFFE_SERVER_ID", "SPIFFE_SVID_PATH", "SPIFFE_BUNDLE_PATH"):
                     val = os.getenv(k)
                     if val is not None:
                         provider_env[k] = val
                 provider_env["KEYCLOAK_CLIENT_ID"] = "runtime-shield-jit"
-                jit_client_secret = os.getenv("RUNTIME_SHIELD_JIT_CLIENT_SECRET")
-                if jit_client_secret:
-                    provider_env["KEYCLOAK_CLIENT_SECRET"] = jit_client_secret
-                else:
-                    log("❌ RUNTIME_SHIELD_JIT_CLIENT_SECRET is required for the Keycloak provider's service-account login.")
             elif provider == "filesystem-provider":
                 # filesystem-provider gets NO Keycloak secrets and NO NVIDIA API keys, but needs public Keycloak URL and Realm for JIT token verification!
                 for k in ["KEYCLOAK_URL", "KEYCLOAK_REALM", "KEYCLOAK_ISSUER_URL", "KEYCLOAK_CLIENT_ID"]:

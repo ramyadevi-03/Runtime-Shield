@@ -1,0 +1,7 @@
+FROM python:3.11-slim
+WORKDIR /app
+RUN pip install --no-cache-dir fastapi==0.135.2 uvicorn==0.42.0
+COPY dummy_upstream.py ./dummy_upstream.py
+USER 10001:10001
+EXPOSE 8088
+CMD ["uvicorn", "dummy_upstream:app", "--host", "0.0.0.0", "--port", "8088"]

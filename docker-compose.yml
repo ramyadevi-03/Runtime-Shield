@@ -56,9 +56,28 @@ services:
     command:
       - "run"
       - "--server"
-      - "--addr=:8182"
-    ports:
-      - "8182:8182"
+      - "--addr=0.0.0.0:8182"
+      - "/policies"
+    volumes:
+      - ./rules/runtime_shield.rego:/policies/runtime_shield.rego:ro
+      - ./rules/runtime_shield_data.json:/policies/runtime_shield/data.json:ro
+    expose:
+      - "8182"
+    networks:
+      - opa-backend
+    restart: always
+
+  opa-proxy:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./opa/opa-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+    expose:
+      - "8182"
+    networks:
+      - opa-backend
+      - opa-private
+    depends_on:
+      - opa
     restart: always
 
 
@@ -67,6 +86,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "5001:5001"
       - "9090:9090"
@@ -77,12 +98,13 @@ services:
       - KEYCLOAK_JWKS_URL=${KEYCLOAK_JWKS_URL:-https://host.docker.internal:8443/realms/master/protocol/openid-connect/certs}
       - KEYCLOAK_TOKEN_URL=${KEYCLOAK_TOKEN_URL:-https://host.docker.internal:8443/realms/master/protocol/openid-connect/token}
       - KEYCLOAK_CA_BUNDLE=/app/keycloak-tls/root-ca.pem
-      - OPA_URL=http://opa:8182/v1/data/runtime_shield/authz/decision
+      - OPA_URL=http://opa-proxy:8182/v1/data/runtime_shield/authz/decision
       - KEYCLOAK_REALM=master
       - HITL_TIMEOUT_SECONDS=${HITL_TIMEOUT_SECONDS:-180}
       - RUNTIME_SHIELD_LOGIN_CLIENT_ID=${RUNTIME_SHIELD_LOGIN_CLIENT_ID:-admin-cli}
       - RUNTIME_SHIELD_LOGIN_CLIENT_SECRET=${RUNTIME_SHIELD_LOGIN_CLIENT_SECRET:-}
       - KEYCLOAK_CLIENT_ID=runtime-shield-jit
+      - RUNTIME_SHIELD_JIT_WORKLOAD_ID=spiffe://runtime-shield/bridge
       - KEYCLOAK_CLIENT_SECRET=${RUNTIME_SHIELD_JIT_CLIENT_SECRET:?set RUNTIME_SHIELD_JIT_CLIENT_SECRET}
       - RUNTIME_SHIELD_JIT_CLIENT_SECRET=${RUNTIME_SHIELD_JIT_CLIENT_SECRET:?set RUNTIME_SHIELD_JIT_CLIENT_SECRET}
       - KEYCLOAK_ADMIN_USERNAME=${KEYCLOAK_ADMIN_USERNAME:-admin}
@@ -99,6 +121,10 @@ services:
       - RUNTIME_SHIELD_FS_PROVIDER_URL=http://filesystem-provider:8765
       - RUNTIME_SHIELD_FS_PROVIDER_TOKEN=${RUNTIME_SHIELD_FS_PROVIDER_TOKEN:?set RUNTIME_SHIELD_FS_PROVIDER_TOKEN}
       - RUNTIME_SHIELD_GATEWAY_API_KEY=${RUNTIME_SHIELD_GATEWAY_API_KEY:?set RUNTIME_SHIELD_GATEWAY_API_KEY}
+      - CREDENTIAL_BROKER_URL=http://broker:8000
+      - CREDENTIAL_BROKER_AGENT_TOKEN=agent:demo-agent:agent-runtime:${BROKER_DEV_AGENT_SECRET:?set BROKER_DEV_AGENT_SECRET}
+      - RUNTIME_SHIELD_EGRESS_URL=http://credential-egress:8090
+      - RUNTIME_SHIELD_EGRESS_EXECUTOR_TOKEN=${RUNTIME_SHIELD_EGRESS_EXECUTOR_TOKEN:?set RUNTIME_SHIELD_EGRESS_EXECUTOR_TOKEN}
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:-${NIM_API_KEY:-}}
       - NIM_BASE_URL=https://integrate.api.nvidia.com/v1
       - HF_TOKEN=${HF_TOKEN:-${HUGGINGFACE_TOKEN:-}}
@@ -111,10 +137,14 @@ services:
     networks:
       - default
       - filesystem-private
+      - opa-private
+      - credential-broker-control
+      - credential-egress-control
     depends_on:
       - keycloak
       - spire-agent
       - opa
+      - opa-proxy
       - mongodb
     restart: always
 
@@ -165,9 +195,49 @@ services:
       - mongo-data:/data/db
     restart: always
 
+  credential-egress:
+    build:
+      context: ./credential_egress
+      dockerfile: Dockerfile
+    environment:
+      - CREDENTIAL_BROKER_URL=http://broker:8000
+      - BROKER_EGRESS_TOKEN=egress:egress-runtime:agent-runtime:${BROKER_DEV_EGRESS_SECRET:?set BROKER_DEV_EGRESS_SECRET}
+      - RUNTIME_SHIELD_EGRESS_EXECUTOR_TOKEN=${RUNTIME_SHIELD_EGRESS_EXECUTOR_TOKEN:?set RUNTIME_SHIELD_EGRESS_EXECUTOR_TOKEN}
+      - DUMMY_UPSTREAM_URL=http://dummy-upstream:8088/repository
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.50
+    expose: ["8090"]
+    networks: [credential-broker-redemption, credential-egress-upstream, credential-egress-control]
+    depends_on: [dummy-upstream]
+    restart: unless-stopped
+
+  dummy-upstream:
+    build:
+      context: ./credential_egress
+      dockerfile: Dockerfile.dummy
+    environment:
+      - DUMMY_UPSTREAM_EXPECTED_TOKEN=local-dummy-github-token
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 32
+    mem_limit: 64m
+    cpus: 0.25
+    expose: ["8088"]
+    networks: [credential-egress-upstream]
+    restart: unless-stopped
+
   chatbot:
     container_name: chatbot_mcp
     image: ghcr.io/danny-avila/librechat:latest
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "3080:3080"
     environment:
@@ -190,7 +260,6 @@ services:
       - OPENID_CLIENT_SECRET=${OPENID_CLIENT_SECRET:?set OPENID_CLIENT_SECRET}
       - OPENID_SESSION_SECRET=${OPENID_SESSION_SECRET:?set OPENID_SESSION_SECRET}
       - OPENID_CALLBACK_URL=/oauth/openid/callback
-      - OPENID_SCOPE=openid profile email
       - OPENID_REUSE_TOKENS=true
       - OPENID_USE_END_SESSION_ENDPOINT=true
       - SESSION_EXPIRY=86400000
@@ -229,5 +298,27 @@ networks:
     external: true
   filesystem-private:
     name: runtime-shield-filesystem-private
+    driver: bridge
+    internal: true
+  opa-private:
+    name: runtime-shield-opa-client
+    driver: bridge
+    internal: true
+  opa-backend:
+    name: runtime-shield-opa-backend
+    driver: bridge
+    internal: true
+  credential-broker-control:
+    name: runtime-shield-broker-control
+    external: true
+  credential-broker-redemption:
+    name: runtime-shield-broker-redemption
+    external: true
+  credential-egress-upstream:
+    name: runtime-shield-egress-upstream
+    driver: bridge
+    internal: true
+  credential-egress-control:
+    name: runtime-shield-egress-control
     driver: bridge
     internal: true

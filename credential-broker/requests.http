@@ -1,0 +1,18 @@
+# Broker has no host-published port. Run these requests only from an
+# authenticated trusted container on the broker control network.
+
+@broker = http://broker:8000
+@adminToken = {{broker_admin_token}}
+
+### Liveness
+GET {{broker}}/health
+
+### Provision the local dummy value (never use a real upstream key here)
+PUT {{broker}}/v1/admin/credentials/github-production
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{"value":{"api_key":"local-dummy-github-token"}}
+
+# Lease issuance is performed by the Runtime Shield gateway after authorization
+# and HITL. Do not call /internal/v1/leases/{id}/redeem from this client.

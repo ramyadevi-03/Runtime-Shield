@@ -19,7 +19,7 @@
 3. [Multi-Layer Security Controls (What Is Actually Implemented)](#3-multi-layer-security-controls-what-is-actually-implemented)
    - [Layer 1: Infrastructure Isolation & Fail-Closed Enforcement](#layer-1-infrastructure-isolation--fail-closed-enforcement)
    - [Layer 2: Dual-Factor Identity (Keycloak OIDC + SPIFFE X.509)](#layer-2-dual-factor-identity)
-   - [Layer 3: Policy Enforcement & Semantic Cache (OPA Rego + spaCy)](#layer-3-policy-enforcement--semantic-cache)
+   - [Layer 3: Policy Enforcement (OPA Rego, no decision cache)](#layer-3-policy-enforcement)
    - [Layer 4: Tool Normalization & Behavioral Fraud Traps](#layer-4-tool-normalization--behavioral-fraud-traps)
    - [Layer 4.5: Human-In-The-Loop (HITL) Approval Gate](#layer-45-human-in-the-loop-hitl-approval-gate)
    - [Layer 5: In-Flight Privacy & Redaction (Microsoft Presidio)](#layer-5-in-flight-privacy--redaction)
@@ -187,16 +187,15 @@ To prevent silent fallback to the host, `SandboxEnforcer` acts as a mandatory ga
 
 ---
 
-### Layer 3: Policy Enforcement & Semantic Cache
+### Layer 3: Policy Enforcement
 
 1. **Open Policy Agent (OPA) with Rego (`rules/runtime_shield.rego`)**:
-   - Evaluates a structured `PolicyInput` containing user role, workload SPIFFE ID, tool name, and resource path.
+   - Evaluates a structured `PolicyInput` containing verified subject, workload, agent, scopes, tool name, and resource path.
    - Default policy is **default-deny**. Standard users can only access files located strictly inside `secure-experiment-zone/*`. Attempts to access `../../etc/passwd` or `.env` are blocked with HTTP 403.
 
-2. **Vector Semantic Cache (`SemanticCachePolicyEngine`)**:
-   - Uses **spaCy NLP** (`en_core_web_sm`) to compute high-dimensional embeddings of tool names and query intent.
-   - Computes Cosine Similarity against previous decisions (threshold $\ge 0.92$) to serve cached decisions.
-   - Invalidation: If a user's role transitions (e.g., from `user` to `admin`), cached entries for that user context are invalidated.
+2. **Authorization decision reuse is disabled**:
+   - `SemanticCachePolicyEngine` is a compatibility wrapper that sends every request to OPA. Similarity-based reuse is unsafe for authorization because it can cross user, argument, scope, workload, or policy contexts.
+   - OPA denies requests missing subject, workload, agent identity, or scopes. Policy files are mounted read-only into OPA; the gateway checks readiness without using OPA's policy/data write API.
 
 ---
 
@@ -250,7 +249,7 @@ To prevent silent fallback to the host, `SandboxEnforcer` acts as a mandatory ga
 | **Windows Sandbox Fallback** | ✅ Verified Active | `windows_sandbox.py` runs with restricted tokens and `win32job` limits. | Windows process restrictions; not container or kernel-level virtualization. |
 | **HITL Approval Engine** | ✅ Verified Active | Pending queue pauses request; dashboard UI handles Approve/Deny; 180s timeout works. | In-memory pending queue resets if gateway container restarts. |
 | **Keycloak OIDC / JWKS** | ✅ Verified Active | Discovery & JWKS endpoints active; validates RS256 signatures; admin routes require admin role. | Test tokens with symmetric HS256 permitted only if `LOCAL_DEV_MODE=true`. |
-| **OPA Rego Policy Engine** | ✅ Verified Active | Health endpoint 200; default-deny active; blocks directory traversal outside secure zone. | Semantic cache requires per-user isolation before introducing user-specific policies. |
+| **OPA Rego Policy Engine** | ✅ Verified Active | Health endpoint 200; default-deny active; decisions require identity and scope context. | Decisions are evaluated on every request; the OPA API is private to the gateway network. |
 | **Presidio PII Redaction** | ✅ Verified Active | Presidio Analyzer/Anonymizer initialized with `en_core_web_sm`; regex and NLP entity scrubbing verified. | Direct administrative views bypass redaction by design. |
 | **Behavioral Fraud Engine** | ✅ Verified Active | Cumulative risk scoring, decay, quarantine thresholds, and honeypot traps verified. | In-memory counters reset upon gateway restart. |
 
@@ -553,7 +552,7 @@ Runtime-shield-1/
 │   └── risk/                 # Behavioral fraud detection & agent risk accumulator
 │
 ├── src/
-│   ├── policy_engine.py      # OPA client & spaCy Semantic Cache implementation
+│   ├── policy_engine.py      # OPA client and no-cache authorization wrapper
 │   └── tools/                # TypeScript MCP server tools definition (tools.ts)
 │
 ├── spire/
@@ -612,3 +611,70 @@ Runtime-shield-1/
 > 1. **Human approval does not grant immunity from isolation**: Approving a dangerous action authorizes the **intent**, never direct execution on the host.
 > 2. **Fail closed on ambiguity**: If a token cannot be validated, an SVID is missing, or a sandbox container is down, the system halts and returns an explicit error.
 > 3. **Truth in telemetry**: Audit records must reflect actual execution environments (`actual_execution_environment: none` when blocked), rather than advertising unverified protections.
+
+---
+
+## Credential Broker Integration (Local Demonstration)
+
+For the complete start-to-finish local test procedure, including OpenBao setup, Keycloak client configuration, Linux hostname setup, verification, shutdown, and branch-specific push commands, see [Credential Broker Integration Testing](CREDENTIAL_BROKER_INTEGRATION_TESTING.md).
+
+The brokered GitHub tool uses only the local dummy upstream. The configured host is `dummy-upstream`; the egress container has no host port and no external network route.
+
+```mermaid
+sequenceDiagram
+  actor User as User / LibreChat
+  participant Gateway as Runtime Shield Gateway
+  participant OPA as Runtime Shield OPA
+  participant Broker as Credential Broker
+  participant Egress as Isolated Egress Executor
+  participant Bao as OpenBao KV v2
+  participant Dummy as Dummy GitHub API
+  User->>Gateway: github.read_repository + Keycloak token
+  Gateway->>OPA: verified subject/workload/scopes + canonical tool/resource
+  OPA-->>Gateway: allow/deny
+  Gateway->>Gateway: Risk gate and required HITL approval
+  Gateway->>Broker: server-derived lease request
+  Broker-->>Gateway: lease metadata only
+  Gateway->>Egress: lease ID + fixed tool/resource
+  Egress->>Broker: egress identity + lease ID
+  Broker->>Bao: AppRole-authenticated KV v2 read
+  Broker-->>Egress: credential over private redemption network
+  Egress->>Dummy: fixed allowlisted request with credential header
+  Dummy-->>Egress: repository listing
+  Egress-->>Gateway: validated listing only
+  Gateway-->>User: redacted result
+```
+
+### Local setup and request flow
+
+1. Configure the existing Runtime Shield and broker environment files. Keep them ignored and do not commit them. Generate distinct random values of at least 32 characters for the broker agent, admin, and egress development secrets. Use matching agent and egress secrets in both Compose projects; set the gateway-to-egress executor token only in Runtime Shield's environment. The broker project is included at [`credential-broker/`](credential-broker/README.md). From `Runtime-Shield/`, create its local environment file if needed with `cp credential-broker/.env.example credential-broker/.env`, then configure it. Run the OpenBao initialization/unseal, KV v2 mount, and restricted AppRole steps in that README from `credential-broker/`, then start the broker Compose stack there. This creates the private broker control and redemption networks.
+2. In `Runtime-Shield/`, set the existing required Runtime Shield variables and the integration variables listed below, then start its Compose stack. OPA has no published host port and loads read-only mounted policy/data files. The gateway can evaluate policy but does not use the OPA management write API.
+3. Provision the dummy value in OpenBao through the broker admin API from inside the broker container as shown in the broker README. Use only the explicit local dummy value there; it is not a GitHub credential and is never sent to GitHub.
+4. Run the existing Keycloak setup utility so it associates `repository:read` with the LibreChat requester client, adds the JIT audience and gateway `workload_id` mappers, and confirm `librechat.yaml` requests that scope for the Runtime Shield MCP client. Sign in with a user whose verified token has `repository:read` and whose SPIFFE identity is allowed. Call `github.read_repository` with repository `runtime-shield/demo`. OPA authorizes the signed subject, scope, and fixed LLM workload; Runtime Shield performs risk assessment and waits for dashboard HITL approval. On approval, the gateway issues a one-use, 60-second broker lease and sends only its ID to egress.
+5. The egress executor redeems immediately before calling `dummy-upstream`. The result returns through the gateway and existing output redaction. Neither the agent nor gateway receives the OpenBao value. A duplicate/expired/revoked redemption fails at the broker; use the broker concurrency tests to exercise races without bypassing the egress boundary.
+
+The broker and egress have no host-published ports. The broker is reachable by the gateway on its control network; the redemption network is shared only by broker and egress. The egress executor has a separate internal network to the dummy upstream and validates its fixed hostname, tool, repository, response shape, and authorization header. Ordinary MCP children run under an unprivileged UID in the gateway container and do not receive broker or egress credentials; this is process separation, not independent container isolation.
+
+### Integration environment variable names
+
+Runtime Shield integration: `CREDENTIAL_BROKER_URL`, `CREDENTIAL_BROKER_AGENT_TOKEN`, `RUNTIME_SHIELD_EGRESS_URL`, `RUNTIME_SHIELD_EGRESS_EXECUTOR_TOKEN`, `RUNTIME_SHIELD_JIT_WORKLOAD_ID`, `BROKER_DEV_AGENT_SECRET`, `BROKER_DEV_EGRESS_SECRET`.
+
+Egress/broker: `BROKER_EGRESS_TOKEN`, `BROKER_DEV_ADMIN_SECRET`, `BROKER_DEV_AGENT_SECRET`, `BROKER_DEV_EGRESS_SECRET`, `DUMMY_UPSTREAM_URL`, `DUMMY_UPSTREAM_EXPECTED_TOKEN`, `OPENBAO_ADDR`, `OPENBAO_MOUNT`, `OPENBAO_ROLE_ID`, `OPENBAO_SECRET_ID`, `OPA_URL`, `REGISTERED_MANIFEST_HASHES`, `DATABASE_PATH`.
+
+The development broker tokens use the broker's development-only identity parser and are not production JWTs. `RUNTIME_SHIELD_JIT_WORKLOAD_ID` identifies the expected gateway workload in Keycloak exchanged tokens. The gateway verifies Keycloak issuer, JIT audience, requested scope, expiry/issued-at, and this workload claim; the MCP provider repeats the workload check. Production broker JWTs must have issuer `JWT_ISSUER`, audience `credential-broker-agent`, `credential-broker-admin`, or `credential-broker-egress` according to role, plus non-empty `sub`, `exp`, `iat`, `workload_id`, and `roles` claims. The egress role and audience must be issued only to the dedicated egress workload. Runtime Shield's broker agent credential must be a workload identity, not an agent-supplied token. Configure production signing keys/JWKS rotation, TLS, and workload attestation outside this local Compose setup.
+
+### Boundaries and development limits
+
+- Trusted mapping in `src/credential_tools.py` fixes `github.read_repository` to alias `github-production`, operation `repository:read`, resource `runtime-shield`, the registered manifest digest, one redemption, a 60-second lease, HITL, and the `dummy-upstream` route. Caller-provided alias, operation, target, header, manifest, or lease settings are ignored.
+- Broker delegation is denied because this implementation has no trusted signed parent-chain store. The gateway uses a development broker agent identity rather than interoperating with Keycloak as a broker JWT issuer; this limits user attribution at the broker and must be replaced with an audience-bound workload token and signed user context in production.
+- Lease expiry and revocation prevent future broker redemption. They do not revoke an already redeemed static upstream API key. OpenBao KV v2 deletion soft-deletes the current version; historical versions remain until an operator destroys versions/metadata.
+- Compose egress isolation is a local network boundary, not a substitute for production network policy, TLS/mTLS, managed workload identities, durable audit storage, key rotation, and deployment attestation.
+
+### Test commands
+
+Run the gateway integration and egress unit tests from `Runtime-Shield/`, and broker lifecycle tests from `Runtime-Shield/credential-broker/`:
+
+```sh
+pytest -q test_policy_engine.py test_credential_tools.py test_credential_egress.py
+(cd credential-broker && pytest -q)
+```

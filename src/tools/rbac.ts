@@ -44,6 +44,7 @@ export interface AuthContext {
   requiredScope?: string;
   requiredRole?: string;
   workloadSpiffeId?: string;
+  expectedWorkloadId?: string;
   trustedWorkload?: boolean;
   source: "bridge";
 }
@@ -66,6 +67,9 @@ export async function verifyAuthContext(context: AuthContext): Promise<any> {
     const expectedRole = context.requiredRole;
 
     const decoded = await verifyJitToken(context.jitToken, expectedScope, expectedAudience, expectedRole);
+    if (!context.expectedWorkloadId || decoded.workload_id !== context.expectedWorkloadId) {
+        throw new Error("JIT token workload is not bound to the trusted Runtime Shield gateway");
+    }
     context.jitClaims = decoded;
     return decoded;
 }

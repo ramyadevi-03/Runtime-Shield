@@ -224,7 +224,8 @@ def configure_client_scopes(session: KeycloakSession):
         "tool:keycloak_read",
         "tool:keycloak_admin",
         "tool:keycloak_report",
-        "tool:admin_internal"
+        "tool:admin_internal",
+        "repository:read",
     ]
 
     for scope_name in required_scopes:
@@ -395,6 +396,7 @@ def configure_jit_exchange_client(session: KeycloakSession):
     jit_client_id_name = "runtime-shield-jit"
     source_client_ids = list(dict.fromkeys([
         "runtime-shield-cli",
+        os.getenv("OPENID_CLIENT_ID", "runtime-shield-librechat"),
         os.getenv("RUNTIME_SHIELD_MCP_CLIENT_ID", "runtime-shield-hitl"),
     ]))
     token_lifespans = {
@@ -446,6 +448,54 @@ def configure_jit_exchange_client(session: KeycloakSession):
         except Exception as e:
             print(f"[ERROR] Exception creating '{jit_client_id_name}': {e}")
             return
+
+    # Bind exchanged access tokens to the Runtime Shield JIT audience and
+    # gateway workload. Gateway and provider code independently verify both.
+    jit_mappers_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{jit_uuid}/protocol-mappers/models"
+    jit_mappers = [
+        {
+            "name": "runtime-shield-jit-audience",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-audience-mapper",
+            "config": {
+                "included.client.audience": jit_client_id_name,
+                "id.token.claim": "false",
+                "access.token.claim": "true",
+            },
+        },
+        {
+            "name": "runtime-shield-workload-id",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-hardcoded-claim-mapper",
+            "config": {
+                "claim.name": "workload_id",
+                "claim.value": os.getenv("RUNTIME_SHIELD_JIT_WORKLOAD_ID", "spiffe://runtime-shield/bridge"),
+                "jsonType.label": "String",
+                "id.token.claim": "false",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "false",
+            },
+        },
+    ]
+    try:
+        response = session.request("GET", jit_mappers_url, timeout=10)
+        existing_mappers = response.json() if response.status_code == 200 else []
+        by_name = {item.get("name"): item for item in existing_mappers}
+        for mapper in jit_mappers:
+            current = by_name.get(mapper["name"])
+            if current and current.get("config") == mapper["config"]:
+                continue
+            if current:
+                response = session.request("PUT", f"{jit_mappers_url}/{current['id']}", json=mapper, timeout=10)
+            else:
+                response = session.request("POST", jit_mappers_url, json=mapper, timeout=10)
+            if response.status_code not in (200, 201, 204):
+                print(f"[ERROR] Failed to configure JIT token mapper '{mapper['name']}': HTTP {response.status_code}")
+                return
+        print("[OK] JIT exchanged tokens are audience- and gateway-workload-bound")
+    except Exception as e:
+        print(f"[ERROR] Exception configuring JIT token mappers: {e}")
+        return
 
     # 2. Write its secret to .env so docker-compose.yml can reference it
     #    as ${RUNTIME_SHIELD_JIT_CLIENT_SECRET} — never hardcode this value,
@@ -546,7 +596,7 @@ def configure_jit_exchange_client(session: KeycloakSession):
     tool_scopes = [
         "tool:read_file", "tool:write_file", "tool:list_directory",
         "tool:keycloak_read", "tool:keycloak_admin", "tool:keycloak_report",
-        "tool:admin_internal"
+        "tool:admin_internal", "repository:read"
     ]
     for scope_name in tool_scopes:
         scope_uuid = existing_scopes.get(scope_name)
@@ -577,6 +627,18 @@ def configure_jit_exchange_client(session: KeycloakSession):
         except Exception as e:
             print(f"[ERROR] Exception retrieving '{source_client_id_name}': {e}")
             continue
+
+        repository_scope_uuid = existing_scopes.get("repository:read")
+        if repository_scope_uuid:
+            scope_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{src_uuid}/optional-client-scopes/{repository_scope_uuid}"
+            try:
+                scope_response = session.request("PUT", scope_url, timeout=10)
+                if scope_response.status_code not in (200, 201, 204):
+                    print(f"[ERROR] Failed to add repository:read scope to '{source_client_id_name}'")
+                    continue
+            except Exception as e:
+                print(f"[ERROR] Exception assigning repository:read to '{source_client_id_name}': {e}")
+                continue
 
         mappers_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{src_uuid}/protocol-mappers/models"
         try:

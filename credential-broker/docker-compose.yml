@@ -1,0 +1,107 @@
+services:
+  openbao:
+    image: openbao/openbao:2.2.0
+    command: ["server", "-config=/openbao/config/openbao.hcl"]
+    volumes:
+      - openbao-data:/openbao/data
+      - ./docker/openbao.hcl:/openbao/config/openbao.hcl:ro
+    depends_on:
+      openbao-data-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "bao status -address=http://127.0.0.1:8200 >/dev/null 2>&1; code=$$?; [ $$code -eq 0 ] || [ $$code -eq 2 ]"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 12
+    restart: unless-stopped
+    networks: [private]
+
+  openbao-data-init:
+    image: busybox:1.36
+    command: ["sh", "-c", "chown -R 100:1000 /openbao/data && chmod 0770 /openbao/data"]
+    user: "0:0"
+    volumes: ["openbao-data:/openbao/data"]
+    restart: "no"
+    networks: [private]
+
+  data-init:
+    image: python:3.12.10-slim
+    command: ["chown", "-R", "10001:10001", "/data"]
+    user: "0:0"
+    volumes: ["broker-data:/data"]
+    restart: "no"
+
+  opa:
+    build:
+      context: .
+      dockerfile: docker/opa.Dockerfile
+    command: ["run", "--server", "--addr=0.0.0.0:8181", "/policies"]
+    volumes: ["./policies:/policies:ro"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8181/health?bundles', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      start_period: 5s
+      retries: 12
+    restart: unless-stopped
+    networks: [private]
+
+  broker:
+    build:
+      context: .
+      target: runtime
+      args:
+        PYTHON_PACKAGE_INDEX: ${PYTHON_PACKAGE_INDEX:-https://pypi.org/simple}
+    env_file: .env
+    environment:
+      ENVIRONMENT: development
+      OPENBAO_ADDR: http://openbao:8200
+      OPENBAO_MOUNT: runtime-shield
+      OPENBAO_TOKEN: ""
+      OPA_URL: http://opa:8181/v1/data/runtime_shield/credential/allow
+      REGISTERED_MANIFEST_HASHES: sha256:ef6a79401b0d41c9773560c22bfb8d47efb591562b6a2162162c227b748999a7
+      DEV_AUTH: "true"
+      ALLOW_LOCAL_POLICY: "true"
+    volumes: ["broker-data:/data"]
+    depends_on:
+      openbao:
+        condition: service_healthy
+      opa:
+        condition: service_healthy
+      data-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+    restart: unless-stopped
+    networks: [private, credential-broker-control, credential-broker-redemption]
+
+  test:
+    build:
+      context: .
+      target: test
+      args:
+        PYTHON_PACKAGE_INDEX: ${PYTHON_PACKAGE_INDEX:-https://pypi.org/simple}
+    profiles: [test]
+    command: ["pytest", "-q", "-o", "cache_dir=/tmp/pytest-cache"]
+    environment:
+      TMPDIR: /tmp
+    restart: "no"
+
+volumes:
+  broker-data: {}
+  openbao-data: {}
+networks:
+  private: {}
+  credential-broker-control:
+    name: runtime-shield-broker-control
+    driver: bridge
+    internal: true
+  credential-broker-redemption:
+    name: runtime-shield-broker-redemption
+    driver: bridge
+    internal: true

@@ -40,9 +40,8 @@
    - [Demo 4: Directory Traversal & Honeypot Traps](#demo-4-directory-traversal--honeypot-traps)
    - [Demo 5: Outbound PII Redaction](#demo-5-outbound-pii-redaction)
    - [Reset & Teardown Procedures](#reset--teardown-procedures)
-6. [2-Day AI Security Workshop Syllabus](#6-2-day-ai-security-workshop-syllabus)
-7. [Repository File Index](#7-repository-file-index)
-8. [API & Telemetry Reference](#8-api--telemetry-reference)
+6. [Repository File Index](#7-repository-file-index)
+7. [API & Telemetry Reference](#8-api--telemetry-reference)
 
 ---
 
@@ -508,29 +507,9 @@ docker compose down
 
 ---
 
-## 6. 2-Day AI Security Workshop Syllabus
 
-A 16-hour practitioner curriculum based on Runtime Shield.
 
-### Day 1: MCP Foundations & Agentic Vulnerabilities (8 Hours)
-* **09:00 - 11:00 | Introduction to Agentic AI & MCP**: Evolution from static chat to autonomous ReAct loops; MCP JSON-RPC protocol; client-server security boundaries.
-* **11:00 - 13:00 | Building an MCP Server from Scratch**: TypeScript MCP server SDK; defining tool schemas; handling tool executions. (**Lab 1**)
-* **13:00 - 14:00 | Lunch Break**
-* **14:00 - 16:00 | Connecting MCP to an Agent Reasoning Loop**: Managing subprocesses from Python; parsing ReAct thought/action blocks; conversational memory. (**Lab 2**)
-* **16:00 - 18:00 | Agentic Vulnerabilities & Exploitation**: Indirect prompt injection; path traversal; extracting credentials from `.env`. (**Lab 3**)
-* **18:00 - 18:30 | Day 1 Wrap-up & Q&A**
-
-### Day 2: 5-Layer Defense & Runtime Shield (8 Hours)
-* **09:00 - 11:00 | Zero-Trust Runtime Governance**: Gateway proxy architecture (`bridge.py`); case normalization; default-deny policies. (**Lab 4**)
-* **11:00 - 13:00 | Cryptographic Identity & Attestation**: SPIFFE/SPIRE workload attestation; Keycloak OIDC JWKS validation; JIT token exchange. (**Lab 5**)
-* **13:00 - 14:00 | Lunch Break**
-* **14:00 - 16:00 | Policies, Honeypots & Human-In-The-Loop**: Declarative Rego policies; vector semantic caching with spaCy; behavioral risk scoring. (**Lab 6**)
-* **16:00 - 18:00 | Container Sandboxing, Privacy & Capstone**: Dedicated Docker `runc` isolation; fail-closed sandbox enforcer; Presidio PII redaction; end-to-end rehearsals. (**Lab 7**)
-* **18:00 - 18:30 | Conclusion & Roadmap**
-
----
-
-## 7. Repository File Index
+## 6. Repository File Index
 
 ```
 Runtime-shield-1/
@@ -571,7 +550,7 @@ Runtime-shield-1/
 
 ---
 
-## 8. API & Telemetry Reference
+## 7. API & Telemetry Reference
 
 ### Key Gateway Endpoints
 

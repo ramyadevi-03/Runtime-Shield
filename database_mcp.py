@@ -4,7 +4,9 @@ import sqlite3
 import os
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(PROJECT_DIR, "damn-vulnerable-llm-agent", "transactions.db")
+DB_PATH = os.environ.get("RUNTIME_SHIELD_DB_PATH") or os.path.join(
+    PROJECT_DIR, "damn-vulnerable-llm-agent", "transactions.db"
+)
 
 def initialize_database():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)

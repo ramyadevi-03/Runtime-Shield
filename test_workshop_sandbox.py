@@ -1,4 +1,7 @@
 import hashlib
+import os
+import subprocess
+import sys
 
 from workshop_sandbox import (
     WORKSHOP_DEMO_CONTENT,
@@ -113,3 +116,25 @@ def test_expected_hash_matches_exact_workshop_content():
     assert expected_content_sha256(WORKSHOP_DEMO_CONTENT) == hashlib.sha256(
         WORKSHOP_DEMO_CONTENT.encode("utf-8")
     ).hexdigest()
+
+
+def test_database_provider_uses_configured_writable_db_path(tmp_path):
+    """The database provider must be able to use a writable data directory
+    instead of the read-only project tree."""
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    db_path = tmp_path / "runtime-shield" / "transactions.db"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = project_dir
+    env["RUNTIME_SHIELD_DB_PATH"] = str(db_path)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", "import database_mcp; print(database_mcp.DB_PATH)"],
+        cwd=project_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == str(db_path)
+

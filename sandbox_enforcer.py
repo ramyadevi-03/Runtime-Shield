@@ -11,6 +11,11 @@ Design principles:
   - No silent fallbacks: if gVisor is required but absent, raise.
   - Minimal surface: one public function per concern.
   - No side-effects: this module never executes destructive commands.
+  - Behavioral verification: the bubblewrap+seccomp tier only counts as
+    available after a real sandboxed process verified the confinement
+    expectations (write outside the allowed paths fails, new .env fails,
+    network-off providers cannot create IP sockets, ...). Availability
+    checks alone are not proof.
 """
 
 from __future__ import annotations
@@ -26,6 +31,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from jail_factory import (
+    bwrap_behavior_probe,
+    bwrap_operational,
+    find_bwrap,
+    is_wsl1,
+    preflight_proc_mount_supported,
+    user_namespaces_supported,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -34,10 +48,21 @@ log = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class SandboxType(str, Enum):
-    """Ordered from most to least isolated."""
+    """Ordered from most to least isolated.
+
+    BWRAP_SECCOMP (bubblewrap namespaces + seccomp, the Linux OS-level
+    sandbox, behaviorally verified) slots between WINDOWS_JOB and CONTAINER.
+    It *does* satisfy the high-risk minimum: it enforces a read-only
+    filesystem view, writable roots limited to the policy, empty
+    capabilities, no_new_privs, network isolation, and a syscall filter. The
+    minimum is BWRAP_SECCOMP, not CONTAINER, so a verified bwrap host is not
+    blocked merely because Docker is absent. Single-mechanism tiers below it
+    (WINDOWS_JOB, NSJAIL, LANDLOCK, NONE) still fail the high-risk gate.
+    """
     GVISOR = "gvisor"          # Docker + runsc (gVisor kernel-level isolation)
     DOCKER = "docker"          # Standard Docker container (namespace isolation)
     CONTAINER = "container"    # Already running inside container (Docker/Kubernetes)
+    BWRAP_SECCOMP = "bwrap_seccomp"  # Linux bubblewrap namespaces + seccomp filter
     WINDOWS_JOB = "windows_job"  # Windows Job Object + restricted token
     NSJAIL = "nsjail"          # Linux nsjail namespace isolation
     LANDLOCK = "landlock"      # Linux Landlock kernel ruleset
@@ -71,6 +96,18 @@ class SandboxStatus:
     landlock_available: bool = False
     inside_container: bool = False
 
+    # bubblewrap + seccomp tier (Linux)
+    bwrap_found: bool = False
+    bwrap_path: Optional[str] = None
+    bwrap_version: Optional[str] = None
+    user_namespaces_supported: bool = False
+    wsl1: bool = False
+    proc_mount_supported: Optional[bool] = None
+    # Result of running a REAL sandboxed process and checking confinement
+    # (see jail_factory.bwrap_behavior_probe). None = not evaluated because
+    # the bwrap tier is not a candidate on this host.
+    behavior_probe: Optional[dict] = None
+
     # Error messages captured during probing
     docker_daemon_error: Optional[str] = None
     gvisor_check_error: Optional[str] = None
@@ -89,6 +126,13 @@ class SandboxStatus:
             "nsjail_found": self.nsjail_found,
             "landlock_available": self.landlock_available,
             "inside_container": self.inside_container,
+            "bwrap_found": self.bwrap_found,
+            "bwrap_path": self.bwrap_path,
+            "bwrap_version": self.bwrap_version,
+            "user_namespaces_supported": self.user_namespaces_supported,
+            "wsl1": self.wsl1,
+            "proc_mount_supported": self.proc_mount_supported,
+            "behavior_probe": self.behavior_probe,
             "docker_daemon_error": self.docker_daemon_error,
             "gvisor_check_error": self.gvisor_check_error,
             "effective_sandbox": self.effective_sandbox.value,
@@ -145,7 +189,10 @@ def reset_override() -> None:
 def _probe_sandbox() -> SandboxStatus:
     """Perform all sandbox probes and return a SandboxStatus snapshot.
 
-    Every probe is safe: read-only, no side-effects, short timeouts.
+    Every probe is safe: read-only, no side-effects, short timeouts. The
+    bubblewrap tier additionally runs a behavioral verification (a real
+    sandboxed process attempting the confinement escapes) before it is
+    considered operational.
     """
     st = SandboxStatus()
 
@@ -206,9 +253,41 @@ def _probe_sandbox() -> SandboxStatus:
     except ImportError:
         st.landlock_available = False
 
+    # ── bubblewrap + seccomp (Linux) ─────────────────────────────────────────
+    if sys.platform.startswith("linux"):
+        st.wsl1 = is_wsl1()
+        bwrap = find_bwrap()
+        st.bwrap_found = bwrap is not None
+        st.bwrap_path = bwrap
+        if bwrap:
+            try:
+                ver = subprocess.run(
+                    [bwrap, "--version"], capture_output=True, text=True, timeout=5
+                )
+                st.bwrap_version = (ver.stdout or "").strip() or None
+            except Exception:
+                st.bwrap_version = None
+            st.user_namespaces_supported = user_namespaces_supported()
+            if st.user_namespaces_supported:
+                try:
+                    st.proc_mount_supported = preflight_proc_mount_supported(bwrap)
+                except Exception:
+                    st.proc_mount_supported = False
+
     # ── Resolve effective sandbox (mirror JailFactory logic) ─────────────────
     if st.inside_container:
-        st.effective_sandbox = SandboxType.CONTAINER
+        # JailFactory first tries to nest bubblewrap inside the container.
+        # Report that tier when its behavioral probe passes; otherwise the
+        # container boundary plus the seccomp-only inner stage is effective.
+        if (sys.platform.startswith("linux") and st.bwrap_found
+                and st.user_namespaces_supported and not st.wsl1):
+            st.behavior_probe = bwrap_behavior_probe()
+            if bwrap_operational():
+                st.effective_sandbox = SandboxType.BWRAP_SECCOMP
+            else:
+                st.effective_sandbox = SandboxType.CONTAINER
+        else:
+            st.effective_sandbox = SandboxType.CONTAINER
     elif sys.platform == "win32":
         # JailFactory selects WindowsJailer on a Windows host, regardless of
         # Docker availability. Do not report an unused Docker runtime as active.
@@ -223,7 +302,20 @@ def _probe_sandbox() -> SandboxStatus:
         else:
             st.effective_sandbox = SandboxType.DOCKER
     elif sys.platform.startswith("linux"):
-        if st.nsjail_found:
+        # The bwrap tier is only trusted after a real sandboxed process
+        # verified the confinement expectations (behavioral probe in
+        # jail_factory). Availability checks alone are not proof.
+        if st.bwrap_found and st.user_namespaces_supported and not st.wsl1:
+            st.behavior_probe = bwrap_behavior_probe()
+            if bwrap_operational():
+                st.effective_sandbox = SandboxType.BWRAP_SECCOMP
+            elif st.nsjail_found:
+                st.effective_sandbox = SandboxType.NSJAIL
+            elif st.landlock_available:
+                st.effective_sandbox = SandboxType.LANDLOCK
+            else:
+                st.effective_sandbox = SandboxType.NONE
+        elif st.nsjail_found:
             st.effective_sandbox = SandboxType.NSJAIL
         elif st.landlock_available:
             st.effective_sandbox = SandboxType.LANDLOCK
@@ -251,12 +343,16 @@ _SANDBOX_ORDER = [
     SandboxType.LANDLOCK,
     SandboxType.NSJAIL,
     SandboxType.WINDOWS_JOB,
+    SandboxType.BWRAP_SECCOMP,
     SandboxType.CONTAINER,
     SandboxType.DOCKER,
     SandboxType.GVISOR,
 ]
 
-_MINIMUM_ISOLATION_RANK: int = _SANDBOX_ORDER.index(SandboxType.CONTAINER)
+# A verified bubblewrap+seccomp pipeline satisfies the high-risk minimum.
+# (The previous container-level minimum blocked high-risk tools on a bwrap-only
+# host with the misleading reason "Docker is not installed.")
+_MINIMUM_ISOLATION_RANK: int = _SANDBOX_ORDER.index(SandboxType.BWRAP_SECCOMP)
 
 
 def _isolation_rank(sandbox: SandboxType) -> int:
@@ -353,9 +449,27 @@ class SandboxEnforcer:
                 f"Action blocked. No command was executed on the host."
             )
 
-        # ── Fail-closed check 4: Non-Windows host Docker daemon unreachable ──
-        if sys.platform != "win32" and not status.inside_container:
-            if status.docker_binary_found and not status.docker_daemon_reachable:
+        # ── Fail-closed check 3b: BWRAP_SECCOMP must be behaviorally verified ──
+        # The tier only exists after a real sandboxed process proved the
+        # confinement expectations. Never trust a declared/overridden tier
+        # without that evidence.
+        if effective == SandboxType.BWRAP_SECCOMP:
+            probe = status.behavior_probe
+            if not probe or not probe.get("operational"):
+                reason = _build_unavailability_reason(status, tool_name)
+                _log_block(tool_name, req_id, effective, reason)
+                raise SandboxUnavailableError(
+                    f"[SANDBOX BLOCKED] Tool '{tool_name}' requires sandbox isolation, "
+                    f"but the bubblewrap+seccomp tier was not behaviorally verified. "
+                    f"{reason} Action blocked. No command was executed on the host."
+                )
+
+        # ── Fail-closed check 4: selected Docker tier is not actually usable ──
+        # Only relevant when the effective tier *is* Docker/gVisor. A verified
+        # bwrap pipeline must not be blocked because an unrelated Docker binary
+        # happens to be installed but its daemon is down.
+        if effective in (SandboxType.DOCKER, SandboxType.GVISOR):
+            if not status.docker_daemon_reachable:
                 reason = (
                     f"Docker binary found but daemon is not reachable "
                     f"({status.docker_daemon_error or 'permission denied / not running'}). "
@@ -371,10 +485,11 @@ class SandboxEnforcer:
         # ── Passed — log confirmation ─────────────────────────────────────────
         log.info(
             "[SANDBOX ENFORCER] ✅ Sandbox verified for high-risk tool '%s' "
-            "(req_id=%s, sandbox=%s, gvisor=%s, docker_reachable=%s)",
+            "(req_id=%s, sandbox=%s, gvisor=%s, docker_reachable=%s, bwrap=%s)",
             tool_name, req_id, effective.value,
             status.gvisor_configured_in_docker,
             status.docker_daemon_reachable,
+            status.bwrap_found,
         )
         return status
 
@@ -385,6 +500,8 @@ class SandboxEnforcer:
 
 def _build_unavailability_reason(status: SandboxStatus, tool_name: str) -> str:
     parts = []
+
+    # Docker family diagnostics (whether or not Docker is the effective tier).
     if not status.docker_binary_found:
         parts.append("Docker is not installed.")
     elif not status.docker_daemon_reachable:
@@ -392,15 +509,45 @@ def _build_unavailability_reason(status: SandboxStatus, tool_name: str) -> str:
             f"Docker daemon is not reachable "
             f"({status.docker_daemon_error or 'unknown error'})."
         )
-    if not status.gvisor_configured_in_docker and os.getenv("OPENSANDBOX_REQUIRE_GVISOR", "false").lower() == "true":
+    if (not status.gvisor_configured_in_docker
+            and os.getenv("OPENSANDBOX_REQUIRE_GVISOR", "false").lower() == "true"):
         parts.append("gVisor (runsc) runtime is not configured in Docker.")
+
     if sys.platform == "win32" and not status.windows_sandbox_script_found:
         parts.append("Windows sandbox script (windows_sandbox.py) not found.")
-    if not parts:
-        parts.append(
-            f"Effective sandbox '{status.effective_sandbox.value}' "
-            f"does not meet the minimum isolation requirement."
-        )
+
+    # Bubblewrap+seccomp diagnostics are reported independently of Docker: a
+    # broken Docker install previously hid why the verified bwrap tier was not
+    # selected.
+    if sys.platform.startswith("linux"):
+        if not status.bwrap_found:
+            parts.append(
+                "bubblewrap is not installed (PATH outside the working "
+                "directory was checked)."
+            )
+        elif status.wsl1:
+            parts.append("WSL1 cannot create the user namespaces bubblewrap requires.")
+        elif not status.user_namespaces_supported:
+            parts.append(
+                "user namespaces are unavailable, so the bubblewrap sandbox "
+                "cannot be constructed."
+            )
+        elif status.behavior_probe is not None and not status.behavior_probe.get("operational"):
+            probe_error = status.behavior_probe.get("skipped")
+            detail = f" ({probe_error})" if probe_error else ""
+            parts.append(
+                "the bubblewrap sandbox failed its behavioral self-test"
+                f"{detail} (a sandboxed process could perform a forbidden "
+                "action)."
+            )
+        if not status.nsjail_found and not status.landlock_available:
+            parts.append("Neither nsjail nor Landlock is available as a fallback.")
+
+    parts.append(
+        f"Effective sandbox '{status.effective_sandbox.value}' "
+        f"does not meet the minimum isolation requirement "
+        f"('{SandboxType.BWRAP_SECCOMP.value}' or stronger)."
+    )
     return " ".join(parts)
 
 

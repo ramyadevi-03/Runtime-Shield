@@ -22,6 +22,7 @@ import re
 import shutil
 import hashlib
 import uuid
+import tempfile
 from mcp_firewall.sdk import Gateway
 from mcp_firewall.dashboard.server import start_dashboard
 from mcp_firewall.dashboard.app import state as dashboard_state, app as dashboard_app
@@ -2041,212 +2042,50 @@ def format_embedded_csv_segments(text: str) -> str:
 # =========================
 # PLUGGABLE JAIL FACTORY
 # =========================
+# Jailer tiers are implemented in jail_factory.py:
+#   OpenSandboxJailer  Docker container (optional gVisor/runsc runtime)
+#   BubblewrapJailer   Linux bubblewrap namespaces + seccomp two-stage
+#                      pipeline (outer bwrap stage, inner seccomp stage)
+#   NSJailer / LandlockJailer / WindowsJailer fallback tiers
+# Security invariants (see jail_factory.py):
+#   - writable roots are allowed_paths ONLY; cwd (the project dir) is
+#     read-only, so providers cannot rewrite bridge.py, rules/ or .env
+#   - protected names (.git/.ssh/.agents/.aws/.env) cannot be created
+#     inside writable roots; secret files (project .env, keycloak-tls/,
+#     spire/certs/, ~/.ssh, docker.sock) are hidden from sandbox reads
+#   - network access follows the in-code PROVIDER_SANDBOX_POLICIES table
+#   - fail-closed on a bare host with no operational sandbox backend
 
-class BaseJailer:
-    def __init__(self, provider_name, cwd, env, allowed_paths):
-        self.provider_name = provider_name
-        self.cwd = cwd
-        self.env = env
-        self.allowed_paths = allowed_paths
+from jail_factory import JailFactory  # noqa: E402
 
-    def get_popen_kwargs(self, cmd):
-        return {
-            "cwd": self.cwd,
-            "stdin": subprocess.PIPE,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-            "text": True,
-            "encoding": "utf-8",
-            "bufsize": 1,
-            "env": self.env
-        }
+def provider_runtime_overrides(provider_name: str) -> tuple[list, dict]:
+    """Extra writable paths and environment for providers that need scratch
+    storage outside the read-only project directory.
 
-class LandlockJailer(BaseJailer):
-    def get_popen_kwargs(self, cmd):
-        kwargs = super().get_popen_kwargs(cmd)
-        if sys.platform.startswith('linux') and landlock:
-            def landlock_preexec():
-                try:
-                    rs = landlock.Ruleset()
-                    rs.allow(PROJECT_DIR)
-                    if self.allowed_paths:
-                        for p in self.allowed_paths:
-                            if os.path.exists(p):
-                                rs.allow(p)
-                    rs.apply()
-                except Exception as e:
-                    sys.stderr.write(f"[SANDBOX ERROR] Failed to apply Landlock: {e}\n")
-                    sys.exit(1)
-            kwargs["preexec_fn"] = landlock_preexec
-            log(f"🔒 Sandboxing [{self.provider_name}]: Landlock kernel ruleset initialized")
-        return kwargs
-
-class NSJailer(BaseJailer):
-    def get_popen_kwargs(self, cmd):
-        # NSJail wraps the command itself
-        nsjail_bin = shutil.which("nsjail")
-        if not nsjail_bin:
-            return super().get_popen_kwargs(cmd)
-        
-        # Build NSJail command
-        # -Mo: Read-only root
-        # -H: Set hostname
-        # -chroot: Jail directory
-        # -R: Read-only mount
-        # -B: Bind mount (read-write)
-        new_cmd = [
-            nsjail_bin, "-Mo", 
-            "--chroot", "/", 
-            "-R", "/usr", "-R", "/lib", "-R", "/lib64", "-R", "/bin",
-            "-B", self.cwd,
-            "--"
-        ] + cmd
-        
-        # Update cmd in-place (hacky but works for this factory)
-        cmd[:] = new_cmd
-        
-        log(f"🏛️ Sandboxing [{self.provider_name}]: NSJail namespace isolation active")
-        return super().get_popen_kwargs(cmd)
-
-class WindowsJailer(BaseJailer):
-    def get_popen_kwargs(self, cmd):
-        kwargs = super().get_popen_kwargs(cmd)
-        if sys.platform == 'win32':
-            sandbox_script = os.path.join(PROJECT_DIR, "windows_sandbox.py")
-            if os.path.exists(sandbox_script):
-                new_cmd = [sys.executable, sandbox_script, "--provider", self.provider_name, "--"] + cmd
-                cmd[:] = new_cmd
-                log(f"🪟 Sandboxing [{self.provider_name}]: Windows Restricted Process Group initialized (win32job + restricted token)")
-            else:
-                # FAIL-CLOSED: Refuse to run without sandboxing
-                msg = f"[SANDBOX FAIL-CLOSED] Windows sandbox script not found at {sandbox_script}. Refusing to run '{self.provider_name}' unsandboxed on host."
-                log(f"🚫 {msg}")
-                raise RuntimeError(msg)
-        return kwargs
-
-class OpenSandboxJailer(BaseJailer):
+    The database provider creates/opens a SQLite file at startup. In the
+    bubblewrap tier the project directory is read-only, and in the Docker
+    compose tier it is bind-mounted read-only into the gateway, so the legacy
+    in-project path cannot work. Give the provider one dedicated writable
+    directory instead of weakening the project mount.
     """
-    OpenSandbox: A cross-platform gVisor-based container jailer.
-    Runs commands in an isolated Docker container with the runsc (gVisor) runtime,
-    hiding host OS files and isolating the filesystem.
-    """
-    def get_popen_kwargs(self, cmd):
-        docker_bin = shutil.which("docker")
-        if not docker_bin:
-            # FAIL-CLOSED: Do not silently execute on host
-            msg = f"[OpenSandbox] docker executable not found. Cannot launch container sandbox for '{self.provider_name}'."
-            log(f"🚫 {msg}")
-            raise RuntimeError(msg)
-            
-        use_gvisor = os.getenv("OPENSANDBOX_USE_GVISOR", "true").lower() == "true"
-        require_gvisor = os.getenv("OPENSANDBOX_REQUIRE_GVISOR", "false").lower() == "true"
-        container_workspace = "/workspace"
-        
-        # Verify Docker daemon is reachable before attempting container execution
+    extra_paths: list = []
+    extra_env: dict = {}
+    if provider_name == "database-provider":
+        data_dir = (
+            os.getenv("RUNTIME_SHIELD_DB_DIR")
+            or os.path.join(tempfile.gettempdir(), "runtime-shield")
+        )
         try:
-            daemon_check = subprocess.run([docker_bin, "info"], capture_output=True, text=True, timeout=4)
-            if daemon_check.returncode != 0:
-                err_detail = (daemon_check.stderr or "").strip()[:200]
-                msg = f"[OpenSandbox] Docker daemon is not accessible: {err_detail}. Container launch aborted."
-                log(f"🚫 {msg}")
-                raise RuntimeError(msg)
-        except subprocess.TimeoutExpired:
-            msg = "[OpenSandbox] Docker daemon check timed out after 4s. Container launch aborted."
-            log(f"🚫 {msg}")
-            raise RuntimeError(msg)
-
-        volumes = [f"{self.cwd}:{container_workspace}"]
-        if self.allowed_paths:
-            for idx, path in enumerate(self.allowed_paths):
-                abs_path = os.path.abspath(path)
-                if os.path.exists(abs_path):
-                    if not abs_path.startswith(self.cwd):
-                        # Mount external paths read-only
-                        volumes.append(f"{abs_path}:/allowed_path_{idx}:ro")
-                        
-        docker_cmd = [
-            docker_bin, "run", "--rm",
-            "-i", # Keep stdin open
-        ]
-        
-        # Check if gVisor (runsc) is available in docker info
-        if use_gvisor or require_gvisor:
-            has_runsc = False
-            combined = (daemon_check.stdout + (daemon_check.stderr or "")).lower()
-            if "runsc" in combined or "gvisor" in combined:
-                has_runsc = True
-                
-            if has_runsc:
-                docker_cmd.extend(["--runtime", "runsc"])
-                log(f"🛡️ [OpenSandbox] Using gVisor (runsc) runtime for kernel-level virtualization.")
-            elif require_gvisor:
-                # FAIL-CLOSED: gVisor was explicitly required but is not available
-                msg = "[OpenSandbox] gVisor (runsc) runtime is required by OPENSANDBOX_REQUIRE_GVISOR but not configured in Docker. Aborting."
-                log(f"🚫 {msg}")
-                raise RuntimeError(msg)
-            else:
-                log(f"⚠️ [OpenSandbox] gVisor (runsc) runtime not configured in Docker. Falling back to standard container sandbox.")
-                
-        for vol in volumes:
-            docker_cmd.extend(["-v", vol])
-            
-        docker_cmd.extend(["-w", container_workspace])
-        
-        # Pass environment variables
-        for k, v in self.env.items():
-            if v is not None:
-                docker_cmd.extend(["-e", f"{k}={v}"])
-                
-        # Choose node or python image
-        if cmd and "node" in cmd[0]:
-            image = os.getenv("OPENSANDBOX_NODE_IMAGE", "node:20-slim")
+            os.makedirs(data_dir, exist_ok=True)
+        except OSError as exc:
+            log(f"⚠️ Could not create database provider data dir '{data_dir}': {exc}")
         else:
-            image = os.getenv("OPENSANDBOX_PYTHON_IMAGE", "python:3.11-slim")
-            
-        docker_cmd.append(image)
-        
-        # Map command paths
-        new_cmd_parts = []
-        for part in cmd:
-            if part.startswith(self.cwd):
-                rel = os.path.relpath(part, self.cwd)
-                rel_forward = rel.replace("\\", "/")
-                new_cmd_parts.append(f"./{rel_forward}")
-            else:
-                new_cmd_parts.append(part)
-                
-        docker_cmd.extend(new_cmd_parts)
-        cmd[:] = docker_cmd
-        
-        log(f"🐳 [OpenSandbox] Containerized isolation active: running via Docker image '{image}'")
-        return super().get_popen_kwargs(cmd)
+            extra_paths.append(os.path.abspath(data_dir))
+            extra_env["RUNTIME_SHIELD_DB_PATH"] = os.path.join(
+                os.path.abspath(data_dir), "transactions.db"
+            )
+    return extra_paths, extra_env
 
-class JailFactory:
-    @staticmethod
-    def get_jailer(provider_name, cwd, env, allowed_paths):
-        # When running inside a container (e.g. Docker / Dokploy), internal MCP servers run directly
-        if os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER", "false").lower() == "true":
-            return BaseJailer(provider_name, cwd, env, allowed_paths)
-
-        # Docker Desktop's Linux containers cannot bind-mount Windows paths reliably
-        # for stdio MCP providers; use the restricted Windows process jail instead.
-        if sys.platform == 'win32':
-            return WindowsJailer(provider_name, cwd, env, allowed_paths)
-
-        # 1. OpenSandbox is the primary cross-platform isolated runtime on host machines
-        if shutil.which("docker"):
-            return OpenSandboxJailer(provider_name, cwd, env, allowed_paths)
-            
-        # 2. Fallbacks
-        is_linux = sys.platform.startswith('linux')
-        
-        if is_linux:
-            if shutil.which("nsjail"):
-                return NSJailer(provider_name, cwd, env, allowed_paths)
-            if landlock:
-                return LandlockJailer(provider_name, cwd, env, allowed_paths)
-        
-        return BaseJailer(provider_name, cwd, env, allowed_paths)
 
 def launch_sandboxed_node(cmd, cwd, env, allowed_paths=None, provider_name="unknown"):
     """
@@ -6949,6 +6788,8 @@ async def execute_tool_proxy(request: Request):
                     "sandbox_type": _sandbox_status.effective_sandbox.value,
                     "docker_reachable": _sandbox_status.docker_daemon_reachable,
                     "gvisor_available": _sandbox_status.gvisor_configured_in_docker,
+                    "bwrap_available": _sandbox_status.bwrap_found,
+                    "user_namespaces_supported": _sandbox_status.user_namespaces_supported,
                     "reason": "Sandbox verified after HITL approval. Execution authorised.",
                     "severity": "info",
                     "stage": "sandbox-enforcement",
@@ -7337,9 +7178,21 @@ def main():
     WORKSPACE_DIR = os.path.join(PROJECT_DIR, "secure-experiment-zone")
 
     if not os.path.exists(WORKSPACE_DIR):
-        os.makedirs(WORKSPACE_DIR)
+        try:
+            os.makedirs(WORKSPACE_DIR)
+        except OSError as _ws_err:
+            log(f"⚠️ Could not create workspace dir '{WORKSPACE_DIR}' "
+                f"(read-only workspace mount is expected in Docker): {_ws_err}")
 
-    os.makedirs(os.path.join(WORKSPACE_DIR, "claude-desktop"), exist_ok=True)
+    # In the Docker deployment the workspace is bind-mounted READ-ONLY into the
+    # gateway (docker-compose.yml) — writes belong to the dedicated
+    # filesystem-provider container. Never let this startup nicety crash the
+    # bridge on a read-only filesystem (EROFS).
+    try:
+        os.makedirs(os.path.join(WORKSPACE_DIR, "claude-desktop"), exist_ok=True)
+    except OSError as _ws_err:
+        log(f"⚠️ Could not create '{WORKSPACE_DIR}/claude-desktop' "
+            f"(read-only workspace mount is expected in Docker): {_ws_err}")
 
     server_cmd = ["node", NODE_SERVER_PATH]
 
@@ -8857,6 +8710,11 @@ setInterval(() => {
             provider_env["SPIFFE_ENABLED"] = "true" if spiffe_cfg["enabled"] else "false"
             provider_env["RUNTIME_ROLE"] = DEFAULT_ROLE
             provider_env["PROVIDER_NAME"] = provider
+            # Local development relies on the HS256 mock-JIT path implemented
+            # by the provider wrappers (src/tools/rbac.ts). Propagate the
+            # explicit dev switch so the sandboxed provider accepts the
+            # bridge-minted mock token; production leaves it unset/false.
+            provider_env["LOCAL_DEV_MODE"] = os.getenv("LOCAL_DEV_MODE", "false")
             
             # Pass Spire/Spiffe variables to stdio subprocesses for workload attestation
             for k in ["SPIRE_AGENT_SOCKET", "SPIFFE_SVID_PATH", "SPIFFE_BUNDLE_PATH", "SPIFFE_BRIDGE_ID", "SPIFFE_SERVER_ID"]:
@@ -8885,11 +8743,13 @@ setInterval(() => {
                     if val is not None:
                         provider_env[k] = val
             
+            extra_paths, extra_env = provider_runtime_overrides(provider)
+            provider_env.update(extra_env)
             proc = launch_sandboxed_node(
                 cmd,
                 cwd=PROJECT_DIR,
                 env=provider_env,
-                allowed_paths=[WORKSPACE_DIR],
+                allowed_paths=[WORKSPACE_DIR] + extra_paths,
                 provider_name=provider
             )
             mcp_processes[provider] = proc

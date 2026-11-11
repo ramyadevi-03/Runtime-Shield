@@ -26,7 +26,7 @@
 4. [Runtime Verification & Truth Table](#4-runtime-verification--truth-table)
    - [Component Verification Status](#component-verification-status)
    - [Isolation Reality: gVisor vs. Dedicated Docker runc vs. Windows Sandbox](#isolation-reality-gvisor-vs-dedicated-docker-runc-vs-windows-sandbox)
-   - [Automated Security Test Suite (9/9 Passed)](#automated-security-test-suite)
+   - [Automated Security Test Suite (62 Passed)](#automated-security-test-suite)
 5. [Hands-On Workshop & Live Demonstration Runbook](#5-hands-on-workshop--live-demonstration-runbook)
    - [Prerequisites](#prerequisites)
    - [Step 1: Clone & Local Setup](#step-1-clone--local-setup)
@@ -54,10 +54,11 @@
 1. **Human-In-The-Loop (HITL) Gate**: High-risk tool calls (`write_file`, session revocation, or `risk_delta >= 10`) are paused in memory and held until an administrator explicitly reviews and approves them in the dashboard (or times out after 180s).
 2. **Fail-Closed Sandbox Enforcement**: Human approval authorizes **intent**, not host execution. If an approved high-risk operation requires container isolation and that container or runtime is unreachable, the gateway **blocks execution with HTTP 503** and emits a `sandbox_block` audit event. **No command runs on the host**.
 3. **Dedicated Docker `runc` Filesystem Isolation**: The workshop file-write demonstration runs inside a dedicated, heavily locked-down Docker `runc` container (`filesystem_provider.py`) running as non-root (`UID 10001:10001`), read-only rootfs, dropped capabilities, `no-new-privileges`, seccomp mode 2, private bridge network with no default route, and exactly one writable bind-mount: `secure-experiment-zone/`.
-4. **Keycloak OIDC & JWKS Validation**: Bearer tokens are cryptographically validated against Keycloak's dynamic public signing keys (`KEYCLOAK_JWKS_URL`). Admin-only endpoints require verified admin role claims.
-5. **Declarative Policy (OPA Rego)**: Open Policy Agent enforces default-deny. Access outside `secure-experiment-zone/*` is rejected.
-6. **Egress Privacy (Microsoft Presidio)**: Outbound tool responses pass through Presidio Analyzer and Anonymizer (`en_core_web_sm`), scrubbing credit cards, emails, SSNs, and phone numbers.
-7. **Automated Test Suite**: 9 out of 9 focused security unit tests pass in `0.13s`, verifying all fail-closed branches.
+4. **Linux Host Sandbox (bubblewrap + seccomp)**: On a Linux host without Docker, MCP stdio providers run inside a bubblewrap namespace sandbox (user/pid/ipc/net namespaces, read-only root filesystem, `--cap-drop ALL`) plus a seccomp syscall filter that denies networking syscalls — the same two-stage pipeline OpenAI Codex uses for its Linux sandbox. Writable roots are `allowed_paths` only (the project directory stays read-only). Protected workspace names (`.git`, `.ssh`, `.agents`, `.aws`, `.env`) are masked even when they do not exist yet, so a sandboxed process cannot plant a new `.env` or `.git/hooks` inside a writable root; mounts that would cross a writable symlink fail closed. Secret material is hidden from sandbox reads (project `.env`, `keycloak-tls/`, `spire/certs/`, `~/.ssh`, `~/.aws`, `docker.sock`; the SPIRE agent socket stays visible while SPIFFE is enabled). Network access is granted per provider from the in-code `PROVIDER_SANDBOX_POLICIES` table (only `keycloak-provider` needs it; AF_VSOCK and io_uring stay denied even then). On x86_64 the filter also rejects x32-ABI syscall numbers (`>= 0x40000000`), which share the x86_64 audit architecture and would otherwise bypass the number-matched deny rules. The tier activates only after a behavioral self-test (`python jail_factory.py --self-test`) proves the confinement holds.
+5. **Keycloak OIDC & JWKS Validation**: Bearer tokens are cryptographically validated against Keycloak's dynamic public signing keys (`KEYCLOAK_JWKS_URL`). Admin-only endpoints require verified admin role claims.
+6. **Declarative Policy (OPA Rego)**: Open Policy Agent enforces default-deny. Access outside `secure-experiment-zone/*` is rejected.
+7. **Egress Privacy (Microsoft Presidio)**: Outbound tool responses pass through Presidio Analyzer and Anonymizer (`en_core_web_sm`), scrubbing credit cards, emails, SSNs, and phone numbers.
+8. **Automated Test Suite**: 62 focused security tests pass (53 sandbox-specific), verifying every fail-closed branch, the jailer tier ordering, the per-provider network policy, entry-for-entry parity of the seccomp deny list with Codex's `seccomp.rs`, the x32 syscall gate, helper-flag injection resistance, synthetic-mount cleanup, canonical symlink/`--chdir` handling, registry protection, signal forwarding, socket/FIFO deny masking with alias de-duplication, the generated gateway seccomp profile, bridge-level and live Docker-tier confinement, the in-container container+seccomp fallback, and (on Linux hosts with bubblewrap) live behavioral confinement: a sandboxed provider cannot overwrite `bridge.py`, `rules/` or `.env`, cannot create protected names inside writable roots, cannot read deny-masked secrets, cannot touch `/etc`, cannot open IP sockets, and fails with `EPERM` (not merely an error) on `ptrace`, `process_vm_readv` and `io_uring_setup`.
 
 ### What Is NOT Operational :
 * **gVisor (`runsc`)**: `runsc` is **not installed** on this Windows host. Generic gVisor execution is **not active**. When `OPENSANDBOX_REQUIRE_GVISOR=true`, the gateway does not execute tools in gVisor; it correctly **fails closed and returns HTTP 503**.
@@ -164,7 +165,10 @@ To prevent silent fallback to the host, `SandboxEnforcer` acts as a mandatory ga
 * **No Host Execution**: The gateway catches this error, emits a `sandbox_block` event (`actual_execution_environment: none`), and immediately returns HTTP 503 to the client.
 
 #### 3. Pluggable Jail Factory (`jail_factory.py`)
-* `OpenSandboxJailer`: Builds `docker run` commands with volume bounds. Raises `RuntimeError` if Docker is unavailable.
+* `OpenSandboxJailer`: Hardened `docker run` tier. The project directory is mounted **read-only**; only `allowed_paths` are writable. The container root is read-only, `--cap-drop ALL`, `no-new-privileges:true`, a non-root runtime user, memory/CPU/PID limits, a private `/tmp`, and `--network none` for providers whose policy denies network. Raises `RuntimeError` if Docker is unavailable.
+* `BubblewrapJailer`: Linux bubblewrap namespaces + seccomp, run through the exact Codex two-stage pipeline (outer bwrap mount/namespace view, inner `PR_SET_NO_NEW_PRIVS` + seccomp + empty-capability check). The project directory is read-only; writable roots are `allowed_paths` only; protected metadata and deny-read masks are applied in the same order as Codex.
+* `ContainerSeccompJailer`: Used inside a container when nested bubblewrap is unavailable. The container boundary provides filesystem isolation; the Codex inner stage still enforces `no_new_privs`, empty effective/permitted capabilities, and the per-provider network seccomp filter. Reported honestly as the CONTAINER tier.
+* `NSJailer` / `LandlockJailer`: Linux fallback tiers; both fail closed rather than run unsandboxed.
 * `WindowsJailer`: Executes `windows_sandbox.py` using Windows Job Objects (`win32job`) and restricted tokens. Raises `RuntimeError` if the sandbox script is missing.
 * `BaseJailer`: Unisolated execution, restricted strictly to safe/internal operations.
 
@@ -244,7 +248,7 @@ To prevent silent fallback to the host, `SandboxEnforcer` acts as a mandatory ga
 
 | Component | Status | Verified Operational Evidence | Technical Limitations / Scope |
 |---|---|---|---|
-| **SandboxEnforcer (Fail-Closed Gate)** | ✅ Verified Active | Post-approval gate checks sandbox health; blocks execution with 503 if unavailable; passes 9/9 automated tests. | Enforces fail-closed blocking; does not synthesize missing host runtimes. |
+| **SandboxEnforcer (Fail-Closed Gate)** | ✅ Verified Active | Post-approval gate checks sandbox health; blocks execution with 503 if unavailable; passes the full 62-test security suite. | Enforces fail-closed blocking; does not synthesize missing host runtimes. |
 | **Dedicated Docker `runc` Provider** | ✅ Verified Active | Container runs healthy; inspected UID 10001, read-only rootfs, dropped capabilities, seccomp mode 2, internal network. | Uses Docker `runc`, not gVisor. Shares host Linux kernel; single host bind-mount. |
 | **gVisor (`runsc`) Runtime** | ❌ Unavailable | Code supports `--runtime runsc` in `OpenSandboxJailer`. | `runsc` is not installed on this host. Requests requiring gVisor fail closed (HTTP 503). |
 | **Windows Sandbox Fallback** | ✅ Verified Active | `windows_sandbox.py` runs with restricted tokens and `win32job` limits. | Windows process restrictions; not container or kernel-level virtualization. |
@@ -258,14 +262,41 @@ To prevent silent fallback to the host, `SandboxEnforcer` acts as a mandatory ga
 
 ### Isolation Reality: gVisor vs. Dedicated Docker runc vs. Windows Sandbox
 
-| Security Property | gVisor (`runsc`) | Dedicated Docker Provider (`filesystem_provider.py`) | Windows Process Jail (`windows_sandbox.py`) | Base Jailer (`BaseJailer`) |
+| Security Property | gVisor (`runsc`) | Dedicated Docker Provider (`filesystem_provider.py`) | Windows Process Jail (`windows_sandbox.py`) | Container Seccomp Jailer (`ContainerSeccompJailer`) |
 |---|---|---|---|---|
-| **Kernel Virtualization** | ✅ Yes (User-space Sentry kernel) | ❌ No (Shares host Linux kernel) | ❌ No (Runs on host NT kernel) | ❌ No (Host execution) |
-| **Filesystem Isolation** | ✅ Container rootfs | ✅ Read-only rootfs + single mount | ⚠️ Windows ACLs only | ❌ None |
-| **Network Isolation** | ✅ Configurable | ✅ Internal network, no default route | ❌ Inherited host network | ❌ Inherited host network |
-| **Privilege Dropping** | ✅ Dropped | ✅ UID 10001, CapDrop ALL, no-new-privs | ✅ Stripped Admin SID | ❌ Inherited process tokens |
-| **Operational Today?** | ❌ Not installed on host | ✅ Running, verified healthy | ✅ Operational on Windows host | ⚠️ Fallback only |
-| **Workshop Role** | Future target | **Current workshop isolation demo** | Host fallback | In-container default |
+| **Kernel Virtualization** | ✅ Yes (User-space Sentry kernel) | ❌ No (Shares host Linux kernel) | ❌ No (Runs on host NT kernel) | ❌ No (Shares the gateway container kernel) |
+| **Filesystem Isolation** | ✅ Container rootfs | ✅ Read-only rootfs + single mount | ⚠️ Windows ACLs only | ✅ Container boundary |
+| **Network Isolation** | ✅ Configurable | ✅ Internal network, no default route | ❌ Inherited host network | ✅ Seccomp denies IP/VM sockets when the policy says off |
+| **Privilege Dropping** | ✅ Dropped | ✅ UID 10001, CapDrop ALL, no-new-privs | ✅ Stripped Admin SID | ✅ `no_new_privs` + empty effective/permitted capability check |
+| **Operational Today?** | ❌ Not installed on host | ✅ Running, verified healthy | ✅ Operational on Windows host | ✅ In-container fallback |
+| **Workshop Role** | Future target | **Current workshop isolation demo** | Host fallback | In-container fallback |
+
+**Deliberate in-container decision.** When the bridge itself runs inside the Docker image,
+`JailFactory` first attempts to nest the bubblewrap+seccomp sandbox *inside* the container
+(defense in depth). The image installs bubblewrap via `apt`, but Docker's default seccomp
+profile usually denies unprivileged user namespaces, so the behavioral self-test decides:
+
+* **Self-test passes** (container started with a seccomp profile permitting
+  `unshare`/`clone(CLONE_NEWUSER)`): every provider is additionally confined with
+  namespaces + seccomp inside the container, and the log says so.
+* **Self-test fails** (default Docker profile): the container boundary still provides
+  filesystem isolation, and `ContainerSeccompJailer` adds the Codex inner stage
+  (`no_new_privs`, empty effective/permitted-capability verification, and the
+  per-provider network seccomp filter). This fallback is **logged explicitly as the
+  CONTAINER isolation tier** — never silent, and never reported as a stronger sandbox
+  than it is. The fail-closed gate for high-risk tools requires a behaviorally verified
+  bubblewrap+seccomp pipeline (`BWRAP_SECCOMP`) or stronger; the hardened container tier
+  satisfies that minimum.
+
+**Docker tier hardening (`OpenSandboxJailer`).** The project directory is mounted
+read-only at `/workspace`; only `allowed_paths` are reopened writable. The container
+runs with a read-only root filesystem, `--cap-drop ALL`, `no-new-privileges`, a
+non-root UID/GID, resource limits, and `--network none` when the provider policy
+denies network. Existing project secrets and protected metadata under writable roots
+are over-mounted with `/dev/null` or an empty read-only tmpfs. The host workspace
+must be writable by uid `10001` (`chown -R 10001:10001 secure-experiment-zone`), and
+the database provider writes its SQLite file to `RUNTIME_SHIELD_DB_DIR` instead of the
+read-only project tree.
 
 ---
 
@@ -278,22 +309,22 @@ python -m pytest test_sandbox_security.py -v -s
 ```
 
 ```text
-============================= test session starts =============================
-platform win32 -- Python 3.13.5, pytest-9.0.3, pluggy-1.6.0
-collected 9 items
+$ python -m pytest -q
+62 passed
 
-test_sandbox_security.py::TestSandboxSecurity::test_hitl_approval_and_required_sandbox_available PASSED
-test_sandbox_security.py::TestSandboxSecurity::test_hitl_approval_and_docker_unavailable PASSED
-test_sandbox_security.py::TestSandboxSecurity::test_hitl_approval_and_gvisor_required_but_unavailable PASSED
-test_sandbox_security.py::TestSandboxSecurity::test_hitl_approval_and_sandbox_startup_failure PASSED
-test_sandbox_security.py::TestSandboxSecurity::test_hitl_approval_and_sandbox_execution_failure PASSED
-test_sandbox_security.py::TestSandboxSecurity::test_hitl_rejection_blocks_execution PASSED
-test_sandbox_security.py::TestSandboxSecurity::test_hitl_timeout_fails_closed PASSED
-test_sandbox_security.py::TestSandboxSecurity::test_low_risk_operation_without_mandatory_sandbox PASSED
-test_sandbox_security.py::TestSandboxSecurity::test_attempted_host_fallback_is_strictly_blocked PASSED
-
-============================== 9 passed in 0.13s ==============================
+$ python jail_factory.py --self-test
+{"operational": true, "skipped": null, "checks": {
+  "open_bridge_py": "denied", "create_in_rules_dir": "denied",
+  "create_env_file": "denied", "write_etc": "denied",
+  "inet_socket": "denied", "unix_socketpair": "succeeded",
+  "write_allowed_path": "succeeded", "create_in_writable_root": "denied",
+  "capabilities_empty": "succeeded", "read_denied_secret": "denied",
+  "ptrace_syscall": "eperm", "process_vm_readv_syscall": "eperm",
+  "io_uring_setup_syscall": "eperm"}}
 ```
+
+The live behavioral checks only run on a host with bubblewrap and unprivileged
+user namespaces; elsewhere they are reported as skipped rather than passed.
 
 ---
 

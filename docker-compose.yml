@@ -67,10 +67,27 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # --- Container hardening (was: root, default caps, no seccomp opt-in) ----
+    # Runs as the image's non-root user (uid/gid 10001, see Dockerfile).
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      # Never allow privilege escalation via setuid/setgid binaries.
+      - no-new-privileges:true
+      # Shipped profile: Docker's default seccomp profile + the minimal
+      # relaxations required by nested bubblewrap where the host permits it
+      # (unshare / clone(CLONE_NEWUSER) / mount set inside a user namespace).
+      - seccomp:./gateway-seccomp.json
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2.0
+    # Published on loopback only: chatbot/OPA/keycloak reach the gateway over
+    # the internal compose networks; host access stays on 127.0.0.1.
     ports:
-      - "5001:5001"
-      - "9090:9090"
-      - "5002:5002"
+      - "127.0.0.1:5001:5001"
+      - "127.0.0.1:9090:9090"
+      - "127.0.0.1:5002:5002"
     environment:
       - KEYCLOAK_URL=http://keycloak:8080
       - KEYCLOAK_ISSUER_URL=${KEYCLOAK_ISSUER_URL:-https://host.docker.internal:8443}
@@ -87,12 +104,16 @@ services:
       - RUNTIME_SHIELD_JIT_CLIENT_SECRET=${RUNTIME_SHIELD_JIT_CLIENT_SECRET:?set RUNTIME_SHIELD_JIT_CLIENT_SECRET}
       - KEYCLOAK_ADMIN_USERNAME=${KEYCLOAK_ADMIN_USERNAME:-admin}
       - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD:?set KEYCLOAK_ADMIN_PASSWORD}
-      - LOCAL_DEV_MODE=false
+      - LOCAL_DEV_MODE=${LOCAL_DEV_MODE:-false}
       - SPIFFE_ENABLED=true
       - SPIFFE_BRIDGE_ID=spiffe://runtime-shield/bridge
       - SPIFFE_SERVER_ID=spiffe://runtime-shield/secure-runtime-shield
       - ALLOWED_SPIFFE_IDS=spiffe://runtime-shield/agent,spiffe://runtime-shield/dashboard,spiffe://runtime-shield/bridge,spiffe://runtime-shield/secure-runtime-shield,spiffe://runtime-shield/llm-agent
       - SPIRE_AGENT_SOCKET=/run/spire/sockets/agent.sock
+      # API key required by the dashboard's mutating endpoints
+      # (mcp_firewall/dashboard/app.py). Falls back to
+      # RUNTIME_SHIELD_GATEWAY_API_KEY when unset.
+      - DASHBOARD_API_KEY=${DASHBOARD_API_KEY:-}
       - SPIFFE_SVID_PATH=/app/spire/certs/bridge.crt
       - SPIFFE_BUNDLE_PATH=/app/spire/certs/ca.crt
       - SPIFFE_HEADER_ONLY_FALLBACK=false

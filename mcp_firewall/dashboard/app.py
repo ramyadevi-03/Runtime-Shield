@@ -5,9 +5,28 @@ import time
 import os
 import logging
 from typing import Any, List, Dict
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+import secrets
 import telemetry
+
+# ── Dashboard mutating-endpoint API key ──────────────────────────────────────
+# POST/DELETE endpoints below can REGISTER AND LAUNCH MCP provider processes,
+# so they must never be callable anonymously (the dashboard is published on
+# port 9090). The key is DASHBOARD_API_KEY, falling back to the already
+# required RUNTIME_SHIELD_GATEWAY_API_KEY. Send it as `X-API-Key: <key>`.
+def _require_api_key(request: Request) -> None:
+    expected = (os.getenv("DASHBOARD_API_KEY", "").strip()
+                or os.getenv("RUNTIME_SHIELD_GATEWAY_API_KEY", "").strip())
+    provided = request.headers.get("X-API-Key", "").strip()
+    if not expected:
+        # Fail closed: no key configured -> refuse every mutating call.
+        raise HTTPException(status_code=503, detail="DASHBOARD_API_KEY is not configured; mutating endpoints are disabled.")
+    if not provided or not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Valid X-API-Key header required for this endpoint.")
+
+def api_key_dependency(request: Request) -> None:
+    _require_api_key(request)
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -152,13 +171,13 @@ async def get_policy_status():
 async def index():
     return HTMLResponse(DASHBOARD_HTML)
 
-@app.post("/api/events")
+@app.post("/api/events", dependencies=[Depends(api_key_dependency)])
 async def receive_event(event: Dict[str, Any]):
     await manager.broadcast_event(event)
     return {"status": "ok"}
 
-@app.post("/api/events/clear")
-@app.get("/api/events/clear")
+@app.post("/api/events/clear", dependencies=[Depends(api_key_dependency)])
+@app.get("/api/events/clear", dependencies=[Depends(api_key_dependency)])
 async def clear_events_endpoint():
     telemetry.clear_events()
     return {"status": "cleared", "message": "Telemetry history cleared successfully"}
@@ -168,7 +187,7 @@ async def get_registry():
     import telemetry
     return {"status": "ok", "mcps": telemetry.get_mcp_registry()}
 
-@app.post("/api/registry/mcps")
+@app.post("/api/registry/mcps", dependencies=[Depends(api_key_dependency)])
 async def add_registry(payload: Dict[str, Any]):
     import telemetry
     import uuid
@@ -244,7 +263,7 @@ async def add_registry(payload: Dict[str, Any]):
 
     return {"status": "ok", "mcp_id": mcp_id}
 
-@app.delete("/api/registry/mcps/{mcp_id}")
+@app.delete("/api/registry/mcps/{mcp_id}", dependencies=[Depends(api_key_dependency)])
 async def remove_registry(mcp_id: str):
     import telemetry
     import sys
@@ -303,7 +322,7 @@ async def get_recommendations(status: str = None):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-@app.patch("/api/memory/recommendations/{rec_id}")
+@app.patch("/api/memory/recommendations/{rec_id}", dependencies=[Depends(api_key_dependency)])
 async def update_recommendation(rec_id: str, payload: Dict[str, Any]):
     """Approve or reject a recommendation. Body: {status: 'APPLIED', applied_to: 'yaml'}"""
     try:
@@ -340,7 +359,7 @@ async def get_risk_state():
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-@app.post("/api/memory/consolidate")
+@app.post("/api/memory/consolidate", dependencies=[Depends(api_key_dependency)])
 async def trigger_consolidation():
     """Trigger an immediate consolidation cycle (admin use)."""
     import asyncio, sys
@@ -402,7 +421,7 @@ async def migration_check(from_engine: str = "yaml", to_engine: str = "opa"):
 
 # ════════════════════════════════════════════════════════════════════
 
-@app.post("/api/registry/mcps/{provider_name}/sync")
+@app.post("/api/registry/mcps/{provider_name}/sync", dependencies=[Depends(api_key_dependency)])
 async def sync_mcp(provider_name: str):
     import sys
     bridge = sys.modules.get('bridge') or sys.modules.get('__main__')
@@ -920,7 +939,7 @@ DASHBOARD_HTML = """
 
         async function applyRec(recId, status) {
             try {
-                const res = await fetch('/api/memory/recommendations/' + recId, {
+                const res = await mutatingFetch('/api/memory/recommendations/' + recId, {
                     method: 'PATCH',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({status, applied_to: status === 'APPLIED' ? 'yaml' : 'none'})
@@ -936,7 +955,7 @@ DASHBOARD_HTML = """
             btn.textContent = '⏳ Running…';
             btn.disabled = true;
             try {
-                const res = await fetch('/api/memory/consolidate', {method:'POST'});
+                const res = await mutatingFetch('/api/memory/consolidate', {method:'POST'});
                 const data = await res.json();
                 btn.textContent = data.status === 'ok' ? '✅ Done!' : '❌ Error';
                 setTimeout(() => {
@@ -1011,6 +1030,27 @@ DASHBOARD_HTML = """
             riskChart.update('none');
         }
 
+        // Mutating dashboard calls require X-API-Key (DASHBOARD_API_KEY).
+        // The key is prompted once per browser session and kept in sessionStorage.
+        function dashboardApiKey() {
+            let k = sessionStorage.getItem('dashboardApiKey');
+            if (!k) {
+                k = prompt('Gateway API key (X-API-Key) required for this action:');
+                if (k) sessionStorage.setItem('dashboardApiKey', k);
+            }
+            return k;
+        }
+        async function mutatingFetch(url, opts = {}) {
+            opts.headers = Object.assign({}, opts.headers || {}, { 'X-API-Key': dashboardApiKey() || '' });
+            const res = await fetch(url, opts);
+            if (res.status === 401 || res.status === 503) {
+                sessionStorage.removeItem('dashboardApiKey');
+                alert('Unauthorized: a valid X-API-Key (DASHBOARD_API_KEY) is required for this action.');
+                throw new Error('dashboard api key rejected');
+            }
+            return res;
+        }
+
         function switchNav(el) {
             const view = el.getAttribute('data-view');
             document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
@@ -1074,7 +1114,7 @@ DASHBOARD_HTML = """
         }
 
         function syncRemoteMcp(name) {
-            fetch(`/api/registry/mcps/${name}/sync`, { method: 'POST' })
+            mutatingFetch(`/api/registry/mcps/${name}/sync`, { method: 'POST' })
                 .then(r => r.json())
                 .then(data => {
                     alert(data.message || data.status);
@@ -1084,7 +1124,7 @@ DASHBOARD_HTML = """
 
         function deleteMcp(id) {
             if (confirm('Are you sure you want to unregister this MCP server?')) {
-                fetch(`/api/registry/mcps/${id}`, { method: 'DELETE' })
+                mutatingFetch(`/api/registry/mcps/${id}`, { method: 'DELETE' })
                     .then(r => r.json())
                     .then(data => {
                         if (data.status === 'ok') {
@@ -1133,7 +1173,7 @@ DASHBOARD_HTML = """
                 payload.args = argsRaw ? argsRaw.split(',').map(x => x.trim()) : [];
             }
 
-            fetch('/api/registry/mcps', {
+            mutatingFetch('/api/registry/mcps', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)

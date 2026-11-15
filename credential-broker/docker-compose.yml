@@ -78,7 +78,14 @@ services:
       start_period: 10s
       retries: 5
     restart: unless-stopped
-    networks: [private, credential-broker-control, credential-broker-redemption]
+    networks:
+      private: {}
+      credential-broker-control:
+        aliases:
+          - broker
+      credential-broker-redemption:
+        aliases:
+          - broker
 
   test:
     build:

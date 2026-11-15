@@ -616,7 +616,7 @@ Runtime-shield-1/
 
 ## Credential Broker Integration (Local Demonstration)
 
-For the complete start-to-finish local test procedure, including OpenBao setup, Keycloak client configuration, Linux hostname setup, verification, shutdown, and branch-specific push commands, see [Credential Broker Integration Testing](CREDENTIAL_BROKER_INTEGRATION_TESTING.md).
+For the complete start-to-finish local test procedure, including OpenBao setup, Keycloak client configuration, Linux hostname setup, verification, shutdown, and branch-specific push commands, see [Credential Broker Integration Testing](CREDENTIAL_BROKER_INTEGRATION_TESTING.md). For detailed documentation of all integration fixes and architectural changes applied to this repository, see [Integration Changelog & Fixes](CHANGELOG_INTEGRATION_FIXES.md).
 
 The brokered GitHub tool uses only the local dummy upstream. The configured host is `dummy-upstream`; the egress container has no host port and no external network route.
 

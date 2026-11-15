@@ -1809,6 +1809,12 @@ def redact_outbound_pii(text: str, user_role: str, user_id: str, tool: str) -> s
     return redacted
 
 
+def presidio_redact(text: str, is_admin: bool = False) -> str:
+    if is_admin:
+        return text
+    return redact_pii_with_presidio(text, is_raw=True, skip_headers=False)
+
+
 def resolve_workspace_file_path(target_path: str) -> Path:
     normalized_path = target_path.replace("\\", "/").strip()
     if not normalized_path or normalized_path.startswith("/") or re.match(r"^[A-Za-z]:", normalized_path):
@@ -2496,8 +2502,12 @@ def get_spiffe_config():
 def decode_header_cert(cert_val: str) -> str:
     if not cert_val:
         return ""
+    if cert_val.strip().startswith("${") and cert_val.strip().endswith("}"):
+        return ""
     import urllib.parse
     decoded = urllib.parse.unquote(cert_val)
+    if decoded.strip().startswith("${") and decoded.strip().endswith("}"):
+        return ""
     if "-----BEGIN CERTIFICATE-----" in decoded:
         cert_val = decoded
     if "\\n" in cert_val:
@@ -2821,7 +2831,17 @@ def verify_svid_cryptographically(spiffe_id: str, cert_pem: str | None = None) -
     Returns dict: {valid: bool, reason: str}
     Falls back to allowlist-only check when no cert is provided (offline mode).
     """
-    if not cert_pem:
+    if not cert_pem or (isinstance(cert_pem, str) and cert_pem.strip().startswith("${") and cert_pem.strip().endswith("}")):
+        cert_name = spiffe_id.split("/")[-1] if spiffe_id else ""
+        local_cert_path = os.path.join(PROJECT_DIR, "spire", "certs", f"{cert_name}.crt")
+        if os.path.exists(local_cert_path):
+            try:
+                with open(local_cert_path, "r", encoding="utf-8") as f:
+                    cert_pem = f.read()
+            except Exception:
+                pass
+
+    if not cert_pem or (isinstance(cert_pem, str) and cert_pem.strip().startswith("${") and cert_pem.strip().endswith("}")):
         fallback_allowed = os.getenv("SPIFFE_HEADER_ONLY_FALLBACK", "false").lower() == "true"
         if fallback_allowed:
             if spiffe_id in get_allowed_spiffe_ids():
@@ -3681,6 +3701,263 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             }
         })
 
+    is_repo_request = not is_title_generation_request and (
+        "read_repository" in prompt_lower
+        or "github.read_repository" in prompt_lower
+        or (any(w in prompt_lower for w in ["repository", "repo", "github"]) and any(w in prompt_lower for w in ["read", "call", "fetch", "get", "show", "view", "list", "inspect", "access"]))
+    )
+
+    if is_repo_request:
+        available_tools = []
+        for tool in body.get("tools", []):
+            function = tool.get("function", {}) if isinstance(tool, dict) else {}
+            name = function.get("name", "")
+            if isinstance(name, str):
+                normalized_name = name.lower().replace("-", "_").replace(".", "_")
+                if "read_repository" in normalized_name or "read_repo" in normalized_name or ("github" in normalized_name and "repo" in normalized_name):
+                    available_tools.append(name)
+        if not available_tools:
+            for tool in body.get("tools", []):
+                function = tool.get("function", {}) if isinstance(tool, dict) else {}
+                name = function.get("name", "")
+                if "github" in name.lower() or "repository" in name.lower():
+                    available_tools.append(name)
+        if not available_tools:
+            available_tools = ["github.read_repository"]
+
+        repo_match = re.search(r'(?:repository|repo|for)\s+([a-zA-Z0-9_\-\.]+/[a-zA-Z0-9_\-\.]+)', latest_prompt, re.IGNORECASE)
+        if repo_match:
+            target_repo = repo_match.group(1).strip()
+        else:
+            slash_match = re.search(r'([a-zA-Z0-9_\-\.]+/[a-zA-Z0-9_\-\.]+)', latest_prompt)
+            target_repo = slash_match.group(1).strip() if slash_match else "runtime-shield/demo"
+
+        latest_user_index = max(
+            (index for index, message in enumerate(messages) if message.get("role") == "user"),
+            default=-1,
+        )
+        matching_repo_call_ids = set()
+        for message in messages[latest_user_index + 1:]:
+            if message.get("role") != "assistant":
+                continue
+            for tool_call in message.get("tool_calls", []):
+                function = tool_call.get("function", {})
+                tool_name = function.get("name", "").lower().replace("-", "_").replace(".", "_")
+                if "read_repository" not in tool_name and "github" not in tool_name and "repo" not in tool_name:
+                    continue
+                try:
+                    arguments = function.get("arguments", {})
+                    if isinstance(arguments, str):
+                        arguments = json.loads(arguments)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                call_repo = str(arguments.get("repository", "")).strip()
+                if (
+                    call_repo == target_repo
+                    and tool_call.get("id")
+                ):
+                    matching_repo_call_ids.add(tool_call["id"])
+
+        failed_repo_call = False
+        repo_error_message = ""
+        for message in messages[latest_user_index + 1:]:
+            if message.get("role") != "tool" or message.get("tool_call_id") not in matching_repo_call_ids:
+                continue
+            result_content = message.get("content", "")
+            if isinstance(result_content, list):
+                result_content = " ".join(
+                    item.get("text", "") for item in result_content if isinstance(item, dict)
+                )
+            elif not isinstance(result_content, str):
+                result_content = json.dumps(result_content)
+
+            res_lower = result_content.lower()
+            if "error" in res_lower or "denied" in res_lower or "unauthorized" in res_lower:
+                failed_repo_call = True
+                repo_error_message = result_content
+                break
+
+            parsed_result = None
+            try:
+                parsed_result = json.loads(result_content)
+            except Exception:
+                pass
+
+            sanitized_content = result_content.replace("local-dummy-github-token", "[REDACTED_SECRET]")
+
+            if parsed_result and isinstance(parsed_result, dict) and "content" in parsed_result:
+                files_list = parsed_result.get("content", [])
+                formatted_files = "\n".join(f"- `{f.get('name', f)}`" for f in files_list) if isinstance(files_list, list) else str(files_list)
+                success_message = f"Successfully read repository `{target_repo}` via Credential Broker:\n\n**Repository Content:**\n{formatted_files}"
+            else:
+                success_message = f"Successfully read repository `{target_repo}` via Credential Broker:\n\n```json\n{sanitized_content}\n```"
+
+            completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+            created = int(time.time())
+            model_name = body.get("model", "runtime-shield-agent")
+            if body.get("stream"):
+                async def completed_repo_chunks():
+                    for chunk in (
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": success_message},
+                                "finish_reason": None,
+                            }],
+                        },
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        },
+                    ):
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(completed_repo_chunks(), media_type="text/event-stream")
+
+            return JSONResponse(content={
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": success_message},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
+
+        if failed_repo_call:
+            failure_message = f"The github.read_repository tool execution failed: {repo_error_message}"
+            completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+            created = int(time.time())
+            model_name = body.get("model", "runtime-shield-agent")
+            if body.get("stream"):
+                async def failed_repo_chunks():
+                    for chunk in (
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": failure_message},
+                                "finish_reason": None,
+                            }],
+                        },
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        },
+                    ):
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(failed_repo_chunks(), media_type="text/event-stream")
+
+            return JSONResponse(content={
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": failure_message},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
+
+        if available_tools and target_repo:
+            tool_name = available_tools[0]
+            call_id = f"call_{uuid.uuid4().hex}"
+            arguments = json.dumps({"repository": target_repo})
+            completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+            created = int(time.time())
+            model_name = body.get("model", "runtime-shield-agent")
+
+            if body.get("stream"):
+                async def repo_tool_call_chunks():
+                    chunks = [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {"name": tool_name, "arguments": ""},
+                                }],
+                            },
+                            "finish_reason": None,
+                        },
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "function": {"arguments": arguments},
+                                }],
+                            },
+                            "finish_reason": None,
+                        },
+                        {"index": 0, "delta": {}, "finish_reason": "tool_calls"},
+                    ]
+                    for chunk in chunks:
+                        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_name, 'choices': [chunk]})}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(repo_tool_call_chunks(), media_type="text/event-stream")
+
+            return JSONResponse(content={
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": tool_name, "arguments": arguments},
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
+
+        missing_requirements = []
+        if not available_tools:
+            missing_requirements.append(
+                "select or enable the Runtime Shield HITL MCP server in this chat or agent"
+            )
+        if not target_repo:
+            missing_requirements.append("specify the repository (e.g. runtime-shield/demo)")
+        return JSONResponse(status_code=400, content={
+            "error": {
+                "message": "Cannot submit the repository read for approval: " + "; ".join(missing_requirements) + ".",
+                "type": "tool_configuration_error",
+                "code": "read_repository_unavailable",
+            }
+        })
+
     # Settle Turn boundaries to prevent state leakage/re-entry from previous turns in conversation history
     last_final_answer_idx = -1
     for i, msg in enumerate(messages):
@@ -4066,7 +4343,8 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
     # 1. Deterministic intent parsing (always computed first for Zero-Trust auditing)
     det_fetch = any(w in raw_query_lower for w in ["fetch", "url", "http://", "https://", "send", "endpoint", "webhook"])
     det_list = (any(w in raw_query_lower for w in ["list", "dir", "folder"]) and any(w in raw_query_lower for w in ["file", "sandbox", "experiment", "zone"]))
-    det_file = any(w in raw_query_lower for w in ["file", "read", "sandbox", "readme", "txt", "csv", "experiment"]) and not det_fetch
+    det_repo = any(w in raw_query_lower for w in ["github", "repository", "read_repository", "repo"])
+    det_file = any(w in raw_query_lower for w in ["file", "read", "sandbox", "readme", "txt", "csv", "experiment"]) and not det_fetch and not det_repo
     det_bank = any(w in raw_query_lower for w in ["transaction", "money", "salary", "balance", "bank"])
     det_greet = any(w in raw_query_lower for w in ["hi", "hello", "hey", "hola"]) and len(raw_query_lower) < 15
     
@@ -4150,7 +4428,7 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
         
         if intent == "ListDirectory":
             is_list_query = True
-        elif intent == "ReadFile":
+        elif intent == "ReadFile" and not det_repo:
             is_file_query = True
         elif intent == "GetUserTransactions":
             is_banking_query = True
@@ -4177,6 +4455,10 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             is_list_query = True
         elif det_file:
             is_file_query = True
+        elif det_repo:
+            text = "To read GitHub repositories, please enable the **Runtime Shield HITL** MCP server and call `github.read_repository` for `runtime-shield/demo`."
+            formatted = format_final_answer(text)
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
         elif det_bank:
             is_banking_query = True
         elif any(w in raw_query_lower for w in ["keycloak", "users"]) and any(w in raw_query_lower for w in ["list", "show"]):
@@ -5384,9 +5666,10 @@ async def chat_completions_proxy(request: Request):
         elif _re.search(r'\b(read|open|view|show|cat)\s+(?:the\s+file\s+)?([^\s]+)', query_lower):
             m = _re.search(r'\b(read|open|view|show|cat)\s+(?:the\s+file\s+)?([^\s]+)', query_lower)
             candidate = m.group(2).strip().strip('"').strip("'")
-            if candidate and candidate not in ("users", "transactions", "sessions", "drills", "the", "a", "my", "your"):
-                prompt_canonical_tool = "read_file"
-                prompt_target_path = candidate
+            if candidate and candidate not in ("users", "transactions", "sessions", "drills", "the", "a", "my", "your", "repository", "repo", "github", "tool"):
+                if "repository" not in query_lower and "github" not in query_lower and "read_repository" not in query_lower:
+                    prompt_canonical_tool = "read_file"
+                    prompt_target_path = candidate
         
         # Filesystem list_directory matching
         elif _re.search(r'\b(list|dir|show)\s+(?:files|directory|folder)\s*(in\s+)?([^\s]*)', query_lower):
@@ -5397,6 +5680,11 @@ async def chat_completions_proxy(request: Request):
         # Active connections matching
         elif "getactiveconnections" in query_lower or "active connections" in query_lower or "active_connections" in query_lower:
             prompt_canonical_tool = "GetActiveConnections"
+
+    # Repository / GitHub tool requests must not be misclassified as local filesystem reads
+    if prompt_canonical_tool == "read_file" and ("repository" in query_lower or "github" in query_lower or "read_repository" in query_lower):
+        prompt_canonical_tool = None
+        prompt_target_path = ""
 
     if prompt_canonical_tool:
         spiffe_id_ctx = "spiffe://runtime-shield/workload/chat-completion"
@@ -7066,8 +7354,8 @@ async def execute_tool_proxy(request: Request):
             }
             safe = presidio_redact(json.dumps(response_body), is_admin=(user_role == "admin"))
             return JSONResponse(content=json.loads(safe))
-        except Exception:
-            log(f"Credential-backed tool execution failed for registered tool {tool_name!r}.")
+        except Exception as exc:
+            log(f"Credential-backed tool execution failed for registered tool {tool_name!r}: {type(exc).__name__}: {exc}")
             return JSONResponse(status_code=502, content={"error": "Credential-backed operation failed."})
 
     if workshop_docker_write:

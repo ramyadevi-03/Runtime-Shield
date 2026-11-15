@@ -18,6 +18,10 @@ services:
     volumes:
       - keycloak-data:/opt/keycloak/data
       - ./keycloak-tls:/opt/keycloak/conf/tls:ro
+    networks:
+      default:
+        aliases:
+          - host.docker.internal
     restart: always
 
 
@@ -86,8 +90,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     ports:
       - "5001:5001"
       - "9090:9090"
@@ -130,6 +132,8 @@ services:
       - HF_TOKEN=${HF_TOKEN:-${HUGGINGFACE_TOKEN:-}}
       - MONGO_URI=mongodb://mongodb:27017/LibreChat
     volumes:
+      - ./bridge.py:/app/bridge.py:ro
+      - ./src:/app/src:ro
       - spire-agent-socket:/run/spire/sockets:ro
       - ./spire/certs:/app/spire/certs:ro
       - ./keycloak-tls/root-ca.pem:/app/keycloak-tls/root-ca.pem:ro
@@ -212,6 +216,8 @@ services:
     mem_limit: 128m
     cpus: 0.50
     expose: ["8090"]
+    volumes:
+      - ./credential_egress/app.py:/app/app.py:ro
     networks: [credential-broker-redemption, credential-egress-upstream, credential-egress-control]
     depends_on: [dummy-upstream]
     restart: unless-stopped
@@ -236,8 +242,6 @@ services:
   chatbot:
     container_name: chatbot_mcp
     image: ghcr.io/danny-avila/librechat:latest
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     ports:
       - "3080:3080"
     environment:
@@ -254,17 +258,21 @@ services:
       - ALLOW_REGISTRATION=true
       - ALLOW_EMAIL_LOGIN=true
       - ALLOW_SOCIAL_LOGIN=true
-      - ALLOW_SOCIAL_REGISTRATION=false
+      - ALLOW_SOCIAL_REGISTRATION=true
       - OPENID_ISSUER=${OPENID_ISSUER:-https://host.docker.internal:8443/realms/master}
       - OPENID_CLIENT_ID=${OPENID_CLIENT_ID:-runtime-shield-librechat}
       - OPENID_CLIENT_SECRET=${OPENID_CLIENT_SECRET:?set OPENID_CLIENT_SECRET}
       - OPENID_SESSION_SECRET=${OPENID_SESSION_SECRET:?set OPENID_SESSION_SECRET}
+      - OPENID_SCOPE=${OPENID_SCOPE:-openid profile email}
       - OPENID_CALLBACK_URL=/oauth/openid/callback
       - OPENID_REUSE_TOKENS=true
       - OPENID_USE_END_SESSION_ENDPOINT=true
+      - OPENID_DISCOVERY_RETRY_ATTEMPTS=5
+      - DEBUG_OPENID_REQUESTS=true
       - SESSION_EXPIRY=86400000
       - REFRESH_TOKEN_EXPIRY=604800000
       - NODE_EXTRA_CA_CERTS=/app/keycloak-tls/root-ca.pem
+      - NODE_TLS_REJECT_UNAUTHORIZED=0
       - SPIFFE_LLM_ID=spiffe://runtime-shield/llm-agent
       - RUNTIME_SHIELD_MCP_CLIENT_ID=${RUNTIME_SHIELD_MCP_CLIENT_ID:-runtime-shield-hitl}
       - RUNTIME_SHIELD_MCP_CLIENT_SECRET=${RUNTIME_SHIELD_MCP_CLIENT_SECRET:?set RUNTIME_SHIELD_MCP_CLIENT_SECRET}

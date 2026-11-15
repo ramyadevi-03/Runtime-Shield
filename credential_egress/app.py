@@ -38,7 +38,6 @@ async def health():
 
 @app.post("/execute")
 async def execute(body: ExecuteRequest, authorization: str | None = Header(default=None)):
-    _validate_configuration()
     if authorization != f"Bearer {EXECUTOR_TOKEN}":
         raise HTTPException(401, "Executor authentication failed")
     # The executor repeats the gateway's tool and resource checks. It never
@@ -47,13 +46,30 @@ async def execute(body: ExecuteRequest, authorization: str | None = Header(defau
         raise HTTPException(403, "Tool or resource is not allowed")
 
     try:
+        _validate_configuration()
+        candidate_broker_urls = [BROKER_URL]
+        if "http://broker:8000" in BROKER_URL:
+            candidate_broker_urls.append(BROKER_URL.replace("http://broker:8000", "http://credential-broker-broker-1:8000"))
+
         async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
-            redemption = await client.post(
-                f"{BROKER_URL}/internal/v1/leases/{body.lease_id}/redeem",
-                headers={"Authorization": f"Bearer {BROKER_EGRESS_TOKEN}"},
-            )
+            redemption = None
+            last_conn_err = None
+            for b_url in candidate_broker_urls:
+                try:
+                    redemption = await client.post(
+                        f"{b_url}/internal/v1/leases/{body.lease_id}/redeem",
+                        headers={"Authorization": f"Bearer {BROKER_EGRESS_TOKEN}"},
+                    )
+                    break
+                except (httpx.ConnectError, httpx.ConnectTimeout) as conn_err:
+                    last_conn_err = conn_err
+                    continue
+
+            if redemption is None:
+                raise HTTPException(502, f"Credential broker unreachable: {last_conn_err}")
+
             if redemption.status_code != 200:
-                raise HTTPException(409, "Credential lease cannot be redeemed")
+                raise HTTPException(409, f"Credential lease cannot be redeemed: HTTP {redemption.status_code}")
             credential = redemption.json().get("credential")
             if not isinstance(credential, dict) or not isinstance(credential.get("api_key"), str):
                 raise HTTPException(502, "Credential unavailable")

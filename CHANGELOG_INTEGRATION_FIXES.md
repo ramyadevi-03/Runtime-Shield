@@ -6,10 +6,10 @@ This document records all modifications and fixes applied to complete the integr
 
 ## 1. Keycloak Token Lifespan Details
 
-* **Previous Lifespan**: **300 seconds (5 minutes)**.  
-  This was Keycloak's default setting for `accessTokenLifespan`.
+* **Standard Lifespan**: **300 seconds (5 minutes)**.  
+  Maintained at Keycloak's default setting for `accessTokenLifespan`.
 * **Issue Encountered**: During multi-step end-to-end testing, if more than 5 minutes elapsed between logging in or authorizing the MCP server and executing the tool call, Keycloak access tokens expired. When LibreChat subsequently sent the expired bearer token to Gateway, the gateway rejected it with `401 {"error":"Invalid or expired Keycloak authentication token"}`.
-* **Updated Lifespan**: Set to **3600 seconds (1 hour)** in `configure_keycloak.py` (both at the realm level and specifically on the `runtime-shield-hitl` client). 1 hour provides ample time for testing without leaving tokens open indefinitely.
+* **Resolution**: Instead of expanding access token lifetime, the standard OAuth `offline_access` scope was added to `librechat.yaml`. This enables LibreChat to automatically obtain and use refresh tokens to renew expired access tokens seamlessly, while preserving Keycloak's secure 5-minute (300s) access token lifetime.
 
 ---
 
@@ -26,7 +26,7 @@ This document records all modifications and fixes applied to complete the integr
 3. **Protocol Mapper 500 Fix**:
    - Fixed payload format for PUT protocol mappers by including the mapper ID and comparing config dictionaries properly.
 4. **Token Lifespan Management**:
-   - Configured `accessTokenLifespan = 3600` (1 hour) on the realm and `access.token.lifespan = 3600` on the `runtime-shield-hitl` client.
+   - Enforced default `accessTokenLifespan = 300` (5 minutes) on the realm and client, adhering to short-lived access token best practices.
 
 ### B. Gateway & Mock LLM Dispatching (`bridge.py`)
 1. **SPIFFE SVID Header Parsing**:
@@ -56,8 +56,8 @@ This document records all modifications and fixes applied to complete the integr
    - Ensured `http://gateway:5001`, `https://host.docker.internal:8443`, and `http://keycloak:8080` are allowed MCP domains.
 
 ### D. Docker Compose (`docker-compose.yml`)
-1. **Local SSL Trust in LibreChat**:
-   - Added `NODE_TLS_REJECT_UNAUTHORIZED=0` to `chatbot` container so Node.js native `fetch` (Undici) trusts Keycloak's local self-signed CA certificate.
+1. **Local CA Certificate Trust**:
+   - Mounted `./keycloak-tls/root-ca.pem` and configured `NODE_EXTRA_CA_CERTS=/app/keycloak-tls/root-ca.pem` in `chatbot` so Node.js strictly verifies TLS certificates against the local Keycloak CA without disabling certificate validation.
 2. **Direct Container Networking (`host.docker.internal`)**:
    - Configured `host.docker.internal` as a network alias directly on the `keycloak` container in the `default` network.
    - Removed broken `extra_hosts: "host.docker.internal:host-gateway"` from Linux containers to prevent dropped packets on the host `docker0` bridge.

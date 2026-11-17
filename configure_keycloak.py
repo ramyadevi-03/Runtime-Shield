@@ -754,14 +754,14 @@ def configure_frontend_url(session: KeycloakSession):
     if "attributes" not in realm_rep or realm_rep["attributes"] is None:
         realm_rep["attributes"] = {}
     realm_rep["attributes"]["frontendUrl"] = frontend_url
-    realm_rep["accessTokenLifespan"] = 3600
-    realm_rep["ssoSessionIdleTimeout"] = 3600
-    realm_rep["ssoSessionMaxLifespan"] = 3600
+    realm_rep["accessTokenLifespan"] = 300
+    realm_rep["ssoSessionIdleTimeout"] = 1800
+    realm_rep["ssoSessionMaxLifespan"] = 36000
 
     try:
         r = session.request("PUT", realm_url, json=realm_rep, timeout=10)
         if r.status_code in [200, 204]:
-            print(f"[OK] Set realm Frontend URL to '{frontend_url}' and access token lifespan to 1h (3600s)")
+            print(f"[OK] Set realm Frontend URL to '{frontend_url}' and access token lifespan to 5m (300s)")
         else:
             raise RuntimeError(f"Failed to set realm Frontend URL: HTTP {r.status_code}")
     except Exception as e:
@@ -1027,8 +1027,8 @@ def configure_librechat_oidc_client(session: KeycloakSession) -> None:
     _ensure_group_mapper(session, mcp_client)
 
     mcp_attrs = mcp_client.get("attributes", {}) or {}
-    if mcp_attrs.get("access.token.lifespan") != "3600":
-        mcp_attrs["access.token.lifespan"] = "3600"
+    if mcp_attrs.get("access.token.lifespan") != "300":
+        mcp_attrs["access.token.lifespan"] = "300"
         mcp_client["attributes"] = mcp_attrs
         session.request(
             "PUT",
@@ -1036,7 +1036,7 @@ def configure_librechat_oidc_client(session: KeycloakSession) -> None:
             json=mcp_client,
             timeout=10,
         )
-        print(f"[OK] Set access.token.lifespan to 3600 (1h) for '{mcp_client_id}'")
+        print(f"[OK] Set access.token.lifespan to default 300s (5m) for '{mcp_client_id}'")
 
     secret_response = session.request(
         "GET",

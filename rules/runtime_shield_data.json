@@ -1,6 +1,20 @@
 {
   "rules": [
     {
+      "name": "allow-github-repository-read",
+      "tool": "github.read_repository",
+      "action": "allow",
+      "message": "Credential-backed repository read is permitted for the registered demo workload.",
+      "priority": "",
+      "risk_delta": 0,
+      "required_scopes": ["repository:read"],
+      "required_workloads": ["spiffe://runtime-shield/llm-agent"],
+      "required_agents": ["spiffe://runtime-shield/llm-agent"],
+      "match": {
+        "repository": "runtime-shield/demo"
+      }
+    },
+    {
       "name": "block-traversal",
       "tool": "read_file|list_directory|write_file",
       "action": "deny",

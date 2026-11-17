@@ -39,6 +39,14 @@ from jail_factory import (
 class TestSandboxSecurity:
     """Automated security tests for Runtime Shield Sandbox fail-closed behavior."""
 
+    def test_gateway_container_provider_drops_uid_and_is_not_called_isolated(self):
+        with patch("os.path.exists", return_value=True), patch.dict(os.environ, {"DOCKER_CONTAINER": "false"}):
+            jailer = JailFactory.get_jailer("keycloak-provider", os.getcwd(), {"PATH": "/usr/bin"}, [])
+        kwargs = jailer.get_popen_kwargs(["node", "provider.js"])
+        assert jailer.isolation == "none"
+        assert kwargs.get("user") == 65534
+        assert kwargs.get("group") == 65534
+
     def teardown_method(self):
         """Clean up test overrides and environment variables after each test."""
         SandboxEnforcer.reset_override()

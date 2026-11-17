@@ -224,7 +224,8 @@ def configure_client_scopes(session: KeycloakSession):
         "tool:keycloak_read",
         "tool:keycloak_admin",
         "tool:keycloak_report",
-        "tool:admin_internal"
+        "tool:admin_internal",
+        "repository:read",
     ]
 
     for scope_name in required_scopes:
@@ -395,6 +396,7 @@ def configure_jit_exchange_client(session: KeycloakSession):
     jit_client_id_name = "runtime-shield-jit"
     source_client_ids = list(dict.fromkeys([
         "runtime-shield-cli",
+        os.getenv("OPENID_CLIENT_ID", "runtime-shield-librechat"),
         os.getenv("RUNTIME_SHIELD_MCP_CLIENT_ID", "runtime-shield-hitl"),
     ]))
     token_lifespans = {
@@ -446,6 +448,55 @@ def configure_jit_exchange_client(session: KeycloakSession):
         except Exception as e:
             print(f"[ERROR] Exception creating '{jit_client_id_name}': {e}")
             return
+
+    # Bind exchanged access tokens to the Runtime Shield JIT audience and
+    # gateway workload. Gateway and provider code independently verify both.
+    jit_mappers_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{jit_uuid}/protocol-mappers/models"
+    jit_mappers = [
+        {
+            "name": "runtime-shield-jit-audience",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-audience-mapper",
+            "config": {
+                "included.client.audience": jit_client_id_name,
+                "id.token.claim": "false",
+                "access.token.claim": "true",
+            },
+        },
+        {
+            "name": "runtime-shield-workload-id",
+            "protocol": "openid-connect",
+            "protocolMapper": "oidc-hardcoded-claim-mapper",
+            "config": {
+                "claim.name": "workload_id",
+                "claim.value": os.getenv("RUNTIME_SHIELD_JIT_WORKLOAD_ID", "spiffe://runtime-shield/bridge"),
+                "jsonType.label": "String",
+                "id.token.claim": "false",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "false",
+            },
+        },
+    ]
+    try:
+        response = session.request("GET", jit_mappers_url, timeout=10)
+        existing_mappers = response.json() if response.status_code == 200 else []
+        by_name = {item.get("name"): item for item in existing_mappers}
+        for mapper in jit_mappers:
+            current = by_name.get(mapper["name"])
+            if current and all(current.get("config", {}).get(k) == v for k, v in mapper["config"].items()):
+                continue
+            if current:
+                payload = {**current, **mapper, "id": current["id"]}
+                response = session.request("PUT", f"{jit_mappers_url}/{current['id']}", json=payload, timeout=10)
+            else:
+                response = session.request("POST", jit_mappers_url, json=mapper, timeout=10)
+            if response.status_code not in (200, 201, 204):
+                print(f"[ERROR] Failed to configure JIT token mapper '{mapper['name']}': HTTP {response.status_code} {response.text}")
+                return
+        print("[OK] JIT exchanged tokens are audience- and gateway-workload-bound")
+    except Exception as e:
+        print(f"[ERROR] Exception configuring JIT token mappers: {e}")
+        return
 
     # 2. Write its secret to .env so docker-compose.yml can reference it
     #    as ${RUNTIME_SHIELD_JIT_CLIENT_SECRET} — never hardcode this value,
@@ -546,7 +597,7 @@ def configure_jit_exchange_client(session: KeycloakSession):
     tool_scopes = [
         "tool:read_file", "tool:write_file", "tool:list_directory",
         "tool:keycloak_read", "tool:keycloak_admin", "tool:keycloak_report",
-        "tool:admin_internal"
+        "tool:admin_internal", "repository:read"
     ]
     for scope_name in tool_scopes:
         scope_uuid = existing_scopes.get(scope_name)
@@ -577,6 +628,18 @@ def configure_jit_exchange_client(session: KeycloakSession):
         except Exception as e:
             print(f"[ERROR] Exception retrieving '{source_client_id_name}': {e}")
             continue
+
+        repository_scope_uuid = existing_scopes.get("repository:read")
+        if repository_scope_uuid:
+            scope_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{src_uuid}/optional-client-scopes/{repository_scope_uuid}"
+            try:
+                scope_response = session.request("PUT", scope_url, timeout=10)
+                if scope_response.status_code not in (200, 201, 204):
+                    print(f"[ERROR] Failed to add repository:read scope to '{source_client_id_name}'")
+                    continue
+            except Exception as e:
+                print(f"[ERROR] Exception assigning repository:read to '{source_client_id_name}': {e}")
+                continue
 
         mappers_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{src_uuid}/protocol-mappers/models"
         try:
@@ -691,11 +754,14 @@ def configure_frontend_url(session: KeycloakSession):
     if "attributes" not in realm_rep or realm_rep["attributes"] is None:
         realm_rep["attributes"] = {}
     realm_rep["attributes"]["frontendUrl"] = frontend_url
+    realm_rep["accessTokenLifespan"] = 300
+    realm_rep["ssoSessionIdleTimeout"] = 1800
+    realm_rep["ssoSessionMaxLifespan"] = 36000
 
     try:
         r = session.request("PUT", realm_url, json=realm_rep, timeout=10)
         if r.status_code in [200, 204]:
-            print(f"[OK] Set realm Frontend URL to '{frontend_url}'")
+            print(f"[OK] Set realm Frontend URL to '{frontend_url}' and access token lifespan to 5m (300s)")
         else:
             raise RuntimeError(f"Failed to set realm Frontend URL: HTTP {r.status_code}")
     except Exception as e:
@@ -921,12 +987,56 @@ def configure_librechat_oidc_client(session: KeycloakSession) -> None:
     mcp_client_id = os.getenv("RUNTIME_SHIELD_MCP_CLIENT_ID", "runtime-shield-hitl")
     mcp_client = _get_client(session, mcp_client_id)
     if mcp_client is None:
-        raise RuntimeError(
-            f"Runtime Shield MCP OAuth client '{mcp_client_id}' was not found; "
-            "no Runtime Shield/JIT client was created or overwritten."
+        mcp_redirect_uri = "http://localhost:3080/api/mcp/runtime-shield-hitl/oauth/callback"
+        create_resp = session.request(
+            "POST",
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients",
+            json={
+                "clientId": mcp_client_id,
+                "name": "Runtime Shield HITL MCP",
+                "enabled": True,
+                "protocol": "openid-connect",
+                "publicClient": False,
+                "standardFlowEnabled": True,
+                "directAccessGrantsEnabled": False,
+                "serviceAccountsEnabled": False,
+                "redirectUris": [mcp_redirect_uri],
+                "webOrigins": ["http://localhost:3080"],
+            },
+            timeout=10,
         )
+        if create_resp.status_code != 201:
+            raise RuntimeError(
+                f"Runtime Shield MCP OAuth client '{mcp_client_id}' was not found and could not be created: "
+                f"HTTP {create_resp.status_code} {create_resp.text}"
+            )
+        print(f"[OK] Created dedicated MCP client '{mcp_client_id}'")
+        mcp_client = _get_client(session, mcp_client_id)
+        if mcp_client is None:
+            raise RuntimeError(f"Client '{mcp_client_id}' created but could not be retrieved.")
+
+        mcp_secret_resp = session.request(
+            "GET",
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{mcp_client['id']}/client-secret",
+            timeout=10,
+        )
+        if mcp_secret_resp.status_code == 200 and mcp_secret_resp.json().get("value"):
+            set_key(DOTENV_PATH, "RUNTIME_SHIELD_MCP_CLIENT_SECRET", mcp_secret_resp.json()["value"], quote_mode="never")
+            print(f"[OK] Wrote RUNTIME_SHIELD_MCP_CLIENT_SECRET to {DOTENV_PATH}")
     _ensure_realm_roles_scope(session, mcp_client)
     _ensure_group_mapper(session, mcp_client)
+
+    mcp_attrs = mcp_client.get("attributes", {}) or {}
+    if mcp_attrs.get("access.token.lifespan") != "300":
+        mcp_attrs["access.token.lifespan"] = "300"
+        mcp_client["attributes"] = mcp_attrs
+        session.request(
+            "PUT",
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{mcp_client['id']}",
+            json=mcp_client,
+            timeout=10,
+        )
+        print(f"[OK] Set access.token.lifespan to default 300s (5m) for '{mcp_client_id}'")
 
     secret_response = session.request(
         "GET",
@@ -938,9 +1048,9 @@ def configure_librechat_oidc_client(session: KeycloakSession) -> None:
             f"Could not retrieve the LibreChat client secret: HTTP {secret_response.status_code}"
         )
 
-    public_url = os.getenv(
-        "KEYCLOAK_PUBLIC_URL",
-        "https://host.docker.internal:8443",
+    public_url = (
+        os.getenv("KEYCLOAK_PUBLIC_URL")
+        or "https://host.docker.internal:8443"
     ).rstrip("/")
     env_values = {
         "KEYCLOAK_PUBLIC_URL": public_url,
@@ -1008,6 +1118,7 @@ def configure_jit_exchange_only():
         print("[ERROR] Could not acquire a Keycloak admin token. No JIT changes were made.")
         sys.exit(1)
 
+    configure_client_scopes(session)
     configure_jit_exchange_client(session)
     print("\n[OK] Keycloak JIT exchange setup complete.")
 

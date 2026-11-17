@@ -1809,6 +1809,12 @@ def redact_outbound_pii(text: str, user_role: str, user_id: str, tool: str) -> s
     return redacted
 
 
+def presidio_redact(text: str, is_admin: bool = False) -> str:
+    if is_admin:
+        return text
+    return redact_pii_with_presidio(text, is_raw=True, skip_headers=False)
+
+
 def resolve_workspace_file_path(target_path: str) -> Path:
     normalized_path = target_path.replace("\\", "/").strip()
     if not normalized_path or normalized_path.startswith("/") or re.match(r"^[A-Za-z]:", normalized_path):
@@ -2048,9 +2054,11 @@ class BaseJailer:
         self.cwd = cwd
         self.env = env
         self.allowed_paths = allowed_paths
+        self.isolation = "none"
+        self.drop_privileges = False
 
     def get_popen_kwargs(self, cmd):
-        return {
+        kwargs = {
             "cwd": self.cwd,
             "stdin": subprocess.PIPE,
             "stdout": subprocess.PIPE,
@@ -2060,6 +2068,9 @@ class BaseJailer:
             "bufsize": 1,
             "env": self.env
         }
+        if self.drop_privileges and os.name == "posix":
+            kwargs.update({"user": 65534, "group": 65534, "extra_groups": []})
+        return kwargs
 
 class LandlockJailer(BaseJailer):
     def get_popen_kwargs(self, cmd):
@@ -2224,9 +2235,12 @@ class OpenSandboxJailer(BaseJailer):
 class JailFactory:
     @staticmethod
     def get_jailer(provider_name, cwd, env, allowed_paths):
-        # When running inside a container (e.g. Docker / Dokploy), internal MCP servers run directly
+        # A shared gateway container is not independent provider isolation.
         if os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER", "false").lower() == "true":
-            return BaseJailer(provider_name, cwd, env, allowed_paths)
+            log(f"⚠️ Provider {provider_name} is running without independent process/container isolation")
+            jailer = BaseJailer(provider_name, cwd, env, allowed_paths)
+            jailer.drop_privileges = True
+            return jailer
 
         # Docker Desktop's Linux containers cannot bind-mount Windows paths reliably
         # for stdio MCP providers; use the restricted Windows process jail instead.
@@ -2488,8 +2502,12 @@ def get_spiffe_config():
 def decode_header_cert(cert_val: str) -> str:
     if not cert_val:
         return ""
+    if cert_val.strip().startswith("${") and cert_val.strip().endswith("}"):
+        return ""
     import urllib.parse
     decoded = urllib.parse.unquote(cert_val)
+    if decoded.strip().startswith("${") and decoded.strip().endswith("}"):
+        return ""
     if "-----BEGIN CERTIFICATE-----" in decoded:
         cert_val = decoded
     if "\\n" in cert_val:
@@ -2813,7 +2831,17 @@ def verify_svid_cryptographically(spiffe_id: str, cert_pem: str | None = None) -
     Returns dict: {valid: bool, reason: str}
     Falls back to allowlist-only check when no cert is provided (offline mode).
     """
-    if not cert_pem:
+    if not cert_pem or (isinstance(cert_pem, str) and cert_pem.strip().startswith("${") and cert_pem.strip().endswith("}")):
+        cert_name = spiffe_id.split("/")[-1] if spiffe_id else ""
+        local_cert_path = os.path.join(PROJECT_DIR, "spire", "certs", f"{cert_name}.crt")
+        if os.path.exists(local_cert_path):
+            try:
+                with open(local_cert_path, "r", encoding="utf-8") as f:
+                    cert_pem = f.read()
+            except Exception:
+                pass
+
+    if not cert_pem or (isinstance(cert_pem, str) and cert_pem.strip().startswith("${") and cert_pem.strip().endswith("}")):
         fallback_allowed = os.getenv("SPIFFE_HEADER_ONLY_FALLBACK", "false").lower() == "true"
         if fallback_allowed:
             if spiffe_id in get_allowed_spiffe_ids():
@@ -3132,26 +3160,9 @@ class JITTokenManager:
         Exchanges a broad user token for a short-lived, downscoped JIT token.
         Implements RFC 8693 (Token Exchange).
         """
-        # 1. Check if token is a Google OIDC token or HS256 mock/federated token
-        try:
-            unverified_header = jwt.get_unverified_header(user_token)
-            alg = unverified_header.get("alg")
-            unverified_claims = jwt.decode(user_token, options={"verify_signature": False, "verify_exp": False, "verify_aud": False})
-            iss = unverified_claims.get("iss", "")
-            
-            # Mock downscoping is permitted only in explicitly enabled local development.
-            if os.getenv("LOCAL_DEV_MODE", "false").lower() == "true" and (
-                alg == "HS256" or "accounts.google.com" in iss or "external-idp" in iss
-            ):
-                jit_claims = unverified_claims.copy()
-                jit_claims["scope"] = required_scope or "openid"
-                jit_claims["exp"] = time.time() + 60
-                mock_jit = jwt.encode(jit_claims, "secret", algorithm="HS256")
-                log(f"🎟️ JIT Federated/Google Token Downscoped Successfully for Scope '{required_scope}'")
-                return mock_jit
-        except Exception as ex:
-            log(f"⚠️ Failed federated JIT downscope check: {ex}")
-
+        if not required_scope:
+            raise RuntimeError("Provider scope is not configured")
+        expected_workload = os.getenv("RUNTIME_SHIELD_JIT_WORKLOAD_ID", "spiffe://runtime-shield/bridge")
         log(f"🔄 JIT: Exchanging user token for downscoped '{required_scope}' token (Audience: {self.client_id})")
         
         # 2. Standard RFC 8693 request body parameters for Keycloak
@@ -3161,6 +3172,7 @@ class JITTokenManager:
             "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "scope": required_scope,
+            "audience": self.client_id,
         }
         
         try:
@@ -3177,18 +3189,31 @@ class JITTokenManager:
                 token_data = resp.json()
                 jit_token = token_data.get("access_token")
                 if jit_token:
-                    ttl = token_data.get("expires_in", 60)
-                    log(f"🎟️ JIT Token Issued Successfully (TTL: {ttl}s)")
+                    claims = verifier.verify(jit_token)
+                    now = time.time()
+                    from src.jit_validation import validate_jit_claims
+                    issuer_base = os.getenv("KEYCLOAK_ISSUER_URL", os.getenv("KEYCLOAK_URL", "http://keycloak:8080")).rstrip("/")
+                    expected_issuer = f"{issuer_base}/realms/{os.getenv('KEYCLOAK_REALM', 'master')}"
+                    if not validate_jit_claims(
+                        claims,
+                        expected_issuer=expected_issuer,
+                        expected_audience=self.client_id,
+                        required_scope=required_scope,
+                        expected_workload=expected_workload,
+                        now=now,
+                    ):
+                        raise RuntimeError("Exchanged token claims do not match the requested provider context")
+                    ttl = min(int(token_data.get("expires_in", claims["exp"] - now)), int(claims["exp"] - now))
+                    if ttl <= 0:
+                        raise RuntimeError("Exchanged token is expired")
+                    log(f"🎟️ JIT Token Issued and verified (TTL: {ttl}s)")
                     return jit_token
                 raise RuntimeError("Keycloak JIT token exchange returned no access token")
-            error_detail = resp.json().get("error_description", resp.text)
-            raise RuntimeError(
-                f"Keycloak JIT token exchange returned HTTP {resp.status_code}: {error_detail}"
-            )
+            raise RuntimeError(f"Keycloak JIT token exchange returned HTTP {resp.status_code}")
         except Exception as net_err:
             if isinstance(net_err, RuntimeError):
                 raise
-            raise RuntimeError(f"Keycloak JIT token exchange request failed: {net_err}") from net_err
+            raise RuntimeError("Keycloak JIT token exchange request failed") from None
 
 # Global Identity Managers
 kc_url = os.getenv("KEYCLOAK_URL") or "http://keycloak:8080"
@@ -3676,6 +3701,263 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             }
         })
 
+    is_repo_request = not is_title_generation_request and (
+        "read_repository" in prompt_lower
+        or "github.read_repository" in prompt_lower
+        or (any(w in prompt_lower for w in ["repository", "repo", "github"]) and any(w in prompt_lower for w in ["read", "call", "fetch", "get", "show", "view", "list", "inspect", "access"]))
+    )
+
+    if is_repo_request:
+        available_tools = []
+        for tool in body.get("tools", []):
+            function = tool.get("function", {}) if isinstance(tool, dict) else {}
+            name = function.get("name", "")
+            if isinstance(name, str):
+                normalized_name = name.lower().replace("-", "_").replace(".", "_")
+                if "read_repository" in normalized_name or "read_repo" in normalized_name or ("github" in normalized_name and "repo" in normalized_name):
+                    available_tools.append(name)
+        if not available_tools:
+            for tool in body.get("tools", []):
+                function = tool.get("function", {}) if isinstance(tool, dict) else {}
+                name = function.get("name", "")
+                if "github" in name.lower() or "repository" in name.lower():
+                    available_tools.append(name)
+        if not available_tools:
+            available_tools = ["github.read_repository"]
+
+        repo_match = re.search(r'(?:repository|repo|for)\s+([a-zA-Z0-9_\-\.]+/[a-zA-Z0-9_\-\.]+)', latest_prompt, re.IGNORECASE)
+        if repo_match:
+            target_repo = repo_match.group(1).strip()
+        else:
+            slash_match = re.search(r'([a-zA-Z0-9_\-\.]+/[a-zA-Z0-9_\-\.]+)', latest_prompt)
+            target_repo = slash_match.group(1).strip() if slash_match else "runtime-shield/demo"
+
+        latest_user_index = max(
+            (index for index, message in enumerate(messages) if message.get("role") == "user"),
+            default=-1,
+        )
+        matching_repo_call_ids = set()
+        for message in messages[latest_user_index + 1:]:
+            if message.get("role") != "assistant":
+                continue
+            for tool_call in message.get("tool_calls", []):
+                function = tool_call.get("function", {})
+                tool_name = function.get("name", "").lower().replace("-", "_").replace(".", "_")
+                if "read_repository" not in tool_name and "github" not in tool_name and "repo" not in tool_name:
+                    continue
+                try:
+                    arguments = function.get("arguments", {})
+                    if isinstance(arguments, str):
+                        arguments = json.loads(arguments)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                call_repo = str(arguments.get("repository", "")).strip()
+                if (
+                    call_repo == target_repo
+                    and tool_call.get("id")
+                ):
+                    matching_repo_call_ids.add(tool_call["id"])
+
+        failed_repo_call = False
+        repo_error_message = ""
+        for message in messages[latest_user_index + 1:]:
+            if message.get("role") != "tool" or message.get("tool_call_id") not in matching_repo_call_ids:
+                continue
+            result_content = message.get("content", "")
+            if isinstance(result_content, list):
+                result_content = " ".join(
+                    item.get("text", "") for item in result_content if isinstance(item, dict)
+                )
+            elif not isinstance(result_content, str):
+                result_content = json.dumps(result_content)
+
+            res_lower = result_content.lower()
+            if "error" in res_lower or "denied" in res_lower or "unauthorized" in res_lower:
+                failed_repo_call = True
+                repo_error_message = result_content
+                break
+
+            parsed_result = None
+            try:
+                parsed_result = json.loads(result_content)
+            except Exception:
+                pass
+
+            sanitized_content = result_content.replace("local-dummy-github-token", "[REDACTED_SECRET]")
+
+            if parsed_result and isinstance(parsed_result, dict) and "content" in parsed_result:
+                files_list = parsed_result.get("content", [])
+                formatted_files = "\n".join(f"- `{f.get('name', f)}`" for f in files_list) if isinstance(files_list, list) else str(files_list)
+                success_message = f"Successfully read repository `{target_repo}` via Credential Broker:\n\n**Repository Content:**\n{formatted_files}"
+            else:
+                success_message = f"Successfully read repository `{target_repo}` via Credential Broker:\n\n```json\n{sanitized_content}\n```"
+
+            completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+            created = int(time.time())
+            model_name = body.get("model", "runtime-shield-agent")
+            if body.get("stream"):
+                async def completed_repo_chunks():
+                    for chunk in (
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": success_message},
+                                "finish_reason": None,
+                            }],
+                        },
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        },
+                    ):
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(completed_repo_chunks(), media_type="text/event-stream")
+
+            return JSONResponse(content={
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": success_message},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
+
+        if failed_repo_call:
+            failure_message = f"The github.read_repository tool execution failed: {repo_error_message}"
+            completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+            created = int(time.time())
+            model_name = body.get("model", "runtime-shield-agent")
+            if body.get("stream"):
+                async def failed_repo_chunks():
+                    for chunk in (
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": failure_message},
+                                "finish_reason": None,
+                            }],
+                        },
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        },
+                    ):
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(failed_repo_chunks(), media_type="text/event-stream")
+
+            return JSONResponse(content={
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": failure_message},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
+
+        if available_tools and target_repo:
+            tool_name = available_tools[0]
+            call_id = f"call_{uuid.uuid4().hex}"
+            arguments = json.dumps({"repository": target_repo})
+            completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+            created = int(time.time())
+            model_name = body.get("model", "runtime-shield-agent")
+
+            if body.get("stream"):
+                async def repo_tool_call_chunks():
+                    chunks = [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {"name": tool_name, "arguments": ""},
+                                }],
+                            },
+                            "finish_reason": None,
+                        },
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "function": {"arguments": arguments},
+                                }],
+                            },
+                            "finish_reason": None,
+                        },
+                        {"index": 0, "delta": {}, "finish_reason": "tool_calls"},
+                    ]
+                    for chunk in chunks:
+                        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_name, 'choices': [chunk]})}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(repo_tool_call_chunks(), media_type="text/event-stream")
+
+            return JSONResponse(content={
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": tool_name, "arguments": arguments},
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
+
+        missing_requirements = []
+        if not available_tools:
+            missing_requirements.append(
+                "select or enable the Runtime Shield HITL MCP server in this chat or agent"
+            )
+        if not target_repo:
+            missing_requirements.append("specify the repository (e.g. runtime-shield/demo)")
+        return JSONResponse(status_code=400, content={
+            "error": {
+                "message": "Cannot submit the repository read for approval: " + "; ".join(missing_requirements) + ".",
+                "type": "tool_configuration_error",
+                "code": "read_repository_unavailable",
+            }
+        })
+
     # Settle Turn boundaries to prevent state leakage/re-entry from previous turns in conversation history
     last_final_answer_idx = -1
     for i, msg in enumerate(messages):
@@ -4061,7 +4343,8 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
     # 1. Deterministic intent parsing (always computed first for Zero-Trust auditing)
     det_fetch = any(w in raw_query_lower for w in ["fetch", "url", "http://", "https://", "send", "endpoint", "webhook"])
     det_list = (any(w in raw_query_lower for w in ["list", "dir", "folder"]) and any(w in raw_query_lower for w in ["file", "sandbox", "experiment", "zone"]))
-    det_file = any(w in raw_query_lower for w in ["file", "read", "sandbox", "readme", "txt", "csv", "experiment"]) and not det_fetch
+    det_repo = any(w in raw_query_lower for w in ["github", "repository", "read_repository", "repo"])
+    det_file = any(w in raw_query_lower for w in ["file", "read", "sandbox", "readme", "txt", "csv", "experiment"]) and not det_fetch and not det_repo
     det_bank = any(w in raw_query_lower for w in ["transaction", "money", "salary", "balance", "bank"])
     det_greet = any(w in raw_query_lower for w in ["hi", "hello", "hey", "hola"]) and len(raw_query_lower) < 15
     
@@ -4145,7 +4428,7 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
         
         if intent == "ListDirectory":
             is_list_query = True
-        elif intent == "ReadFile":
+        elif intent == "ReadFile" and not det_repo:
             is_file_query = True
         elif intent == "GetUserTransactions":
             is_banking_query = True
@@ -4172,6 +4455,10 @@ async def handle_mock_llm_response(body: dict, user_id: str, user_role: str, use
             is_list_query = True
         elif det_file:
             is_file_query = True
+        elif det_repo:
+            text = "To read GitHub repositories, please enable the **Runtime Shield HITL** MCP server and call `github.read_repository` for `runtime-shield/demo`."
+            formatted = format_final_answer(text)
+            return StreamingResponse(yield_response_chunks(formatted), media_type="text/event-stream")
         elif det_bank:
             is_banking_query = True
         elif any(w in raw_query_lower for w in ["keycloak", "users"]) and any(w in raw_query_lower for w in ["list", "show"]):
@@ -5379,9 +5666,10 @@ async def chat_completions_proxy(request: Request):
         elif _re.search(r'\b(read|open|view|show|cat)\s+(?:the\s+file\s+)?([^\s]+)', query_lower):
             m = _re.search(r'\b(read|open|view|show|cat)\s+(?:the\s+file\s+)?([^\s]+)', query_lower)
             candidate = m.group(2).strip().strip('"').strip("'")
-            if candidate and candidate not in ("users", "transactions", "sessions", "drills", "the", "a", "my", "your"):
-                prompt_canonical_tool = "read_file"
-                prompt_target_path = candidate
+            if candidate and candidate not in ("users", "transactions", "sessions", "drills", "the", "a", "my", "your", "repository", "repo", "github", "tool"):
+                if "repository" not in query_lower and "github" not in query_lower and "read_repository" not in query_lower:
+                    prompt_canonical_tool = "read_file"
+                    prompt_target_path = candidate
         
         # Filesystem list_directory matching
         elif _re.search(r'\b(list|dir|show)\s+(?:files|directory|folder)\s*(in\s+)?([^\s]*)', query_lower):
@@ -5392,6 +5680,11 @@ async def chat_completions_proxy(request: Request):
         # Active connections matching
         elif "getactiveconnections" in query_lower or "active connections" in query_lower or "active_connections" in query_lower:
             prompt_canonical_tool = "GetActiveConnections"
+
+    # Repository / GitHub tool requests must not be misclassified as local filesystem reads
+    if prompt_canonical_tool == "read_file" and ("repository" in query_lower or "github" in query_lower or "read_repository" in query_lower):
+        prompt_canonical_tool = None
+        prompt_target_path = ""
 
     if prompt_canonical_tool:
         spiffe_id_ctx = "spiffe://runtime-shield/workload/chat-completion"
@@ -6206,6 +6499,15 @@ async def librechat_mcp_endpoint(request: Request):
                         "required": ["path", "content"],
                         "additionalProperties": False,
                     },
+                }, {
+                    "name": "github.read_repository",
+                    "description": "Read the fixed local Runtime Shield demo repository through the credential broker.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"repository": {"type": "string", "enum": ["runtime-shield/demo"]}},
+                        "required": ["repository"],
+                        "additionalProperties": False,
+                    },
                 }],
             },
         })
@@ -6243,20 +6545,21 @@ async def librechat_mcp_endpoint(request: Request):
         )
 
     params = body.get("params")
-    if not isinstance(params, dict) or params.get("name") != "write_file":
+    if not isinstance(params, dict) or params.get("name") not in {"write_file", "github.read_repository"}:
         return JSONResponse(
             status_code=400,
             content={"jsonrpc": "2.0", "id": request_id, "error": {
-                "code": -32602, "message": "Only the write_file tool is available.",
+                "code": -32602, "message": "The requested Runtime Shield tool is unavailable.",
             }},
         )
+    requested_tool = params["name"]
 
     tool_request = {
         "jsonrpc": "2.0",
         "id": f"librechat-{uuid.uuid4().hex}",
         "method": "tools/call",
         "params": {
-            "name": "write_file",
+            "name": requested_tool,
             "arguments": params.get("arguments", {}),
         },
     }
@@ -6321,6 +6624,16 @@ async def librechat_mcp_endpoint(request: Request):
     return JSONResponse(content={"jsonrpc": "2.0", "id": request_id, "result": result})
 
 
+def _verified_scope_list(claims: dict) -> list[str]:
+    """Return only scope claims from the already signature-verified JWT."""
+    raw = claims.get("scope", claims.get("scp", []))
+    if isinstance(raw, str):
+        return sorted({item for item in raw.split() if item})
+    if isinstance(raw, (list, tuple, set)):
+        return sorted({item for item in raw if isinstance(item, str) and item})
+    return []
+
+
 @dashboard_app.post("/v1/tool/execute")
 async def execute_tool_proxy(request: Request):
     global gateway_instance, nim_guard_instance, fraud_engine_instance
@@ -6343,6 +6656,8 @@ async def execute_tool_proxy(request: Request):
     params = body.get("params", {})
     tool_name = params.get("name", "")
     tool_args = params.get("arguments", {}) or {}
+    from src.credential_tools import registered_tool
+    credential_tool = registered_tool(tool_name)
 
     # --- CENTRALIZED LLM-AGNOSTIC RUNTIME GOVERNANCE: TOOL NORMALIZATION ---
     original_tool_name = tool_name
@@ -6383,7 +6698,7 @@ async def execute_tool_proxy(request: Request):
             body["params"]["name"] = tool_name
 
     # --- ZERO-TRUST DEFAULT-DENY FOR UNKNOWN/UNSUPPORTED TOOLS ---
-    if tool_name not in tool_map and tool_name not in HONEYPOT_TOOLS:
+    if tool_name not in tool_map and tool_name not in HONEYPOT_TOOLS and not credential_tool:
         reason = f"Zero-Trust Block: Unknown or unsupported tool call '{tool_name}' denied by default (Centralized Governance)"
         log(f"🚫 {reason}")
         dashboard_state.add_event({
@@ -6608,11 +6923,13 @@ async def execute_tool_proxy(request: Request):
     policy_input = {
         "user": {
             "id": user_id or user_sub,
+            "sub": user_sub,
             "role": user_role,
-            "scopes": []  # Add actual scopes if available
+            "scopes": _verified_scope_list(claims),
         },
         "workload": {
-            "spiffe_id": spiffe_id
+            "spiffe_id": spiffe_id,
+            "id": spiffe_id,
         },
         "agent": {
             "id": spiffe_id,
@@ -6714,6 +7031,9 @@ async def execute_tool_proxy(request: Request):
             },
         )
 
+    if credential_tool and credential_tool["requires_hitl"]:
+        decision["risk_delta"] = max(10, decision.get("risk_delta", 0))
+
     # Integrate with Fraud Engine for risk score modification and deduplication
     class DummyDecision:
         def __init__(self, action, reason, name, risk_delta=None, quarantine=False):
@@ -6782,27 +7102,21 @@ async def execute_tool_proxy(request: Request):
         return JSONResponse(status_code=403, content={"error": f"Tool blocked by policy: {decision['reason']}"})
 
     jit_token = None
-    if tool_name != "fetch_url" and tool_name not in VULN_MCP_UPSTREAM:
+    required_scope = None
+    provider_name = None
+    token_to_exchange = token
+    if tool_name != "fetch_url" and tool_name not in VULN_MCP_UPSTREAM and not credential_tool:
         required_scope = scope_map.get(tool_name)
         provider_name = tool_map.get(tool_name, "unknown")
-        token_to_exchange = token
         if not token_to_exchange and local_dev_mode:
             token_to_exchange = os.getenv("KEYCLOAK_TOKEN", "").strip("'\"")
 
         if not token_to_exchange:
             raise HTTPException(status_code=401, detail="No Keycloak authentication token provided")
 
-        try:
-            log(f"🔑 REST Proxy: Performing JIT exchange for tool '{tool_name}' and provider '{provider_name}' before approval...")
-            jit_token = jit_manager.exchange_token(token_to_exchange, required_scope, provider_name)
-            log("🔑 REST Proxy: JIT exchange successful.")
-        except Exception as e:
-            log(f"❌ JIT Token exchange failed before approval: {e}")
-            return JSONResponse(status_code=403, content={"error": f"Security JIT token exchange failed: {e}"})
-
     # --- HUMAN IN THE LOOP (HITL) APPROVAL INTERCEPTION ---
     HIGH_RISK_TOOLS = {"write_file", "keycloak_revoke_user_sessions", "keycloak_quarantine_user", "ScanSecrets"}
-    is_high_risk = (
+    is_high_risk = bool(credential_tool and credential_tool["requires_hitl"]) or (
         tool_name in HIGH_RISK_TOOLS or 
         decision.get("risk_delta", 0) >= 10 or
         decision.get("quarantine", False)
@@ -6925,6 +7239,33 @@ async def execute_tool_proxy(request: Request):
                 "session_id": session_id,
                 "timestamp": time.time(),
             })
+        elif credential_tool:
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as _egress_health_client:
+                    _egress_health_response = await _egress_health_client.get(
+                        os.getenv("RUNTIME_SHIELD_EGRESS_URL", "http://credential-egress:8090").rstrip("/") + "/health"
+                    )
+                    _egress_health_response.raise_for_status()
+                dashboard_state.add_event({
+                    "action": "sandbox_verified",
+                    "tool": tool_name,
+                    "agent": spiffe_id,
+                    "req_id": req_id,
+                    "user_id": user_id,
+                    "user_role": user_role,
+                    "hitl_decision": "approve",
+                    "required_sandbox": "isolated-egress-service",
+                    "actual_execution_environment": "credential-egress",
+                    "sandbox_available": True,
+                    "execution_decision": "execute_in_isolated_egress",
+                    "reason": "Dedicated egress service health verified after HITL approval.",
+                    "severity": "info",
+                    "stage": "sandbox-enforcement",
+                    "session_id": session_id,
+                    "timestamp": time.time(),
+                })
+            except Exception:
+                return JSONResponse(status_code=503, content={"error": "Isolated credential egress is unavailable."})
         elif requires_sandbox_isolation(tool_name, _risk_delta_for_gate):
             try:
                 _sandbox_status = SandboxEnforcer.verify_for_high_risk(
@@ -6992,6 +7333,30 @@ async def execute_tool_proxy(request: Request):
                     },
                 )
         # == END SANDBOX GATE =======================================================
+
+    # Exchange only after approval and sandbox checks so the provider-bound
+    # token is fresh and cannot outlive a denied or timed-out approval.
+    if provider_name:
+        try:
+            jit_token = jit_manager.exchange_token(token_to_exchange, required_scope, provider_name)
+        except Exception:
+            log(f"JIT exchange rejected for provider {provider_name!r}; execution denied.")
+            return JSONResponse(status_code=403, content={"error": "Provider authorization failed."})
+
+    if credential_tool:
+        from src.credential_tools import execute_registered_tool
+        try:
+            result = await execute_registered_tool(tool_name, tool_args, str(req_id))
+            response_body = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"content": [{"type": "text", "text": json.dumps(result)}]},
+            }
+            safe = presidio_redact(json.dumps(response_body), is_admin=(user_role == "admin"))
+            return JSONResponse(content=json.loads(safe))
+        except Exception as exc:
+            log(f"Credential-backed tool execution failed for registered tool {tool_name!r}: {type(exc).__name__}: {exc}")
+            return JSONResponse(status_code=502, content={"error": "Credential-backed operation failed."})
 
     if workshop_docker_write:
         try:
@@ -7147,6 +7512,7 @@ async def execute_tool_proxy(request: Request):
         "requiredScope": required_scope,
         "requiredRole": user_role,
         "workloadSpiffeId": spiffe_id,
+        "expectedWorkloadId": os.getenv("RUNTIME_SHIELD_JIT_WORKLOAD_ID", "spiffe://runtime-shield/bridge"),
         "trustedWorkload": True,
         "source": "bridge-rest"
     }
@@ -8857,6 +9223,9 @@ setInterval(() => {
             provider_env["SPIFFE_ENABLED"] = "true" if spiffe_cfg["enabled"] else "false"
             provider_env["RUNTIME_ROLE"] = DEFAULT_ROLE
             provider_env["PROVIDER_NAME"] = provider
+            if os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER", "false").lower() == "true":
+                provider_env["HOME"] = "/tmp"
+                provider_env["TMPDIR"] = "/tmp"
             
             # Pass Spire/Spiffe variables to stdio subprocesses for workload attestation
             for k in ["SPIRE_AGENT_SOCKET", "SPIFFE_SVID_PATH", "SPIFFE_BUNDLE_PATH", "SPIFFE_BRIDGE_ID", "SPIFFE_SERVER_ID"]:
@@ -8865,19 +9234,14 @@ setInterval(() => {
                     provider_env[k] = val
             
             if provider == "keycloak-provider":
-                # Keep user-login credentials out of the provider; its Admin API
-                # client-credentials grant uses the dedicated JIT service account.
+                # The confidential client secret stays in the gateway. The provider
+                # receives only the short-lived, provider-bound JIT token per call.
                 for k in ("KEYCLOAK_URL", "KEYCLOAK_REALM", "KEYCLOAK_JWKS_URL", "KEYCLOAK_TOKEN_URL",
                           "SPIFFE_BRIDGE_ID", "SPIFFE_SERVER_ID", "SPIFFE_SVID_PATH", "SPIFFE_BUNDLE_PATH"):
                     val = os.getenv(k)
                     if val is not None:
                         provider_env[k] = val
                 provider_env["KEYCLOAK_CLIENT_ID"] = "runtime-shield-jit"
-                jit_client_secret = os.getenv("RUNTIME_SHIELD_JIT_CLIENT_SECRET")
-                if jit_client_secret:
-                    provider_env["KEYCLOAK_CLIENT_SECRET"] = jit_client_secret
-                else:
-                    log("❌ RUNTIME_SHIELD_JIT_CLIENT_SECRET is required for the Keycloak provider's service-account login.")
             elif provider == "filesystem-provider":
                 # filesystem-provider gets NO Keycloak secrets and NO NVIDIA API keys, but needs public Keycloak URL and Realm for JIT token verification!
                 for k in ["KEYCLOAK_URL", "KEYCLOAK_REALM", "KEYCLOAK_ISSUER_URL", "KEYCLOAK_CLIENT_ID"]:

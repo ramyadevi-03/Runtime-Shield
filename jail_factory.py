@@ -36,9 +36,11 @@ class BaseJailer:
         self.cwd = cwd
         self.env = env
         self.allowed_paths = allowed_paths
+        self.isolation = "none"
+        self.drop_privileges = False
 
     def get_popen_kwargs(self, cmd: list) -> dict:
-        return {
+        kwargs = {
             "cwd": self.cwd,
             "stdin": subprocess.PIPE,
             "stdout": subprocess.PIPE,
@@ -48,6 +50,9 @@ class BaseJailer:
             "bufsize": 1,
             "env": self.env,
         }
+        if self.drop_privileges and os.name == "posix":
+            kwargs.update({"user": 65534, "group": 65534, "extra_groups": []})
+        return kwargs
 
 
 class LandlockJailer(BaseJailer):
@@ -216,9 +221,12 @@ class JailFactory:
 
     @staticmethod
     def get_jailer(provider_name: str, cwd: str, env: dict, allowed_paths: list | None) -> BaseJailer:
-        # When running inside a container, internal MCP servers run directly
+        # A shared gateway container is not independent provider isolation.
         if os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER", "false").lower() == "true":
-            return BaseJailer(provider_name, cwd, env, allowed_paths)
+            log.warning("Provider %s is running without independent process/container isolation", provider_name)
+            jailer = BaseJailer(provider_name, cwd, env, allowed_paths)
+            jailer.drop_privileges = True
+            return jailer
 
         # Docker Desktop's Linux containers cannot bind-mount Windows paths reliably
         # for stdio MCP providers; use the restricted Windows process jail instead.
